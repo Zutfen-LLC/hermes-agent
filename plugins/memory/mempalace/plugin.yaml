@@ -1,0 +1,4 @@
+name: mempalace
+version: 1.0.0
+description: "MemPalace — local-first structured memory palace with semantic search, knowledge graph, and pre-compaction context preservation."
+pip_dependencies: []
