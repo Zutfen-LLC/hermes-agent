@@ -9,9 +9,13 @@ diary support. This plugin provides:
 - **Pre-compaction context preservation**: on_pre_compress extracts key
   facts from messages about to be compacted and saves them as drawers,
   preventing context loss during Hermes' context window compression.
+- **Smart routing**: extracted content is automatically categorized into the
+  right wing/room based on configurable pattern rules (not dumped into a
+  single catch-all). User-defined rules override defaults.
 - **Semantic search**: query past memories across wings/rooms.
 - **Turn sync**: persist important conversation turns as drawers.
 - **Memory write mirroring**: built-in memory writes are mirrored to the palace.
+- **Reclassification**: mp_reclassify tool to re-categorize misplaced drawers.
 - **Session diary**: write diary entries for long-term agent self-reflection.
 
 Requires: mempalace package installed (pip install mempalace-mcp).
@@ -19,6 +23,9 @@ Config: MEMPALACE_PALACE_PATH (default: ~/.mempalace/palace).
 
 The palace path is also configurable via config.yaml under mempalace: or
 as the --palace argument when running the MCP server.
+
+Routing rules are configurable under mempalace.routing_rules in config.yaml.
+Each rule has: patterns (list of regex), wing, room. First match wins.
 """
 
 from __future__ import annotations
@@ -27,11 +34,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -346,8 +354,145 @@ def _extract_pre_compress_content(messages: List[Dict[str, Any]], max_chars: int
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas
+# Content routing — smart categorization into wings/rooms
 # ---------------------------------------------------------------------------
+
+# Default routing rules. Each rule: (compiled_patterns, wing, room).
+# First match wins. These are broad heuristics — user rules in config.yaml
+# are checked FIRST and take priority.
+DEFAULT_ROUTING_RULES: List[Tuple[List[re.Pattern], str, str]] = [
+    # Infrastructure / ops patterns
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\bops-supervisor\b', r'\bDISCORD_ALLOWED_USERS\b',
+            r'\bhermes-gateway\b', r'\bsystemctl\b.*\buser\b',
+            r'\brate.limit\b.*\bgithub\b', r'\bproxmox\b',
+            r'\bVMID\s+\d+', r'\bvmbr0\b',
+        ]],
+        "wing_ops", "incidents",
+    ),
+    # Configuration changes
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\.env\b', r'config\.yaml\b', r'config\.json\b',
+            r'\.env\.', r'settings\.(yaml|json|toml)',
+        ]],
+        "wing_ops", "config-changes",
+    ),
+    # Deployment / CI/CD
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\bdeploy', r'\bCI\b', r'\bCD\b', r'\bgit push\b',
+            r'\bgithub.actions\b', r'\bdocker\b.*\bbuild\b',
+            r'\bsystemd\b.*\bservice\b',
+        ]],
+        "wing_ops", "deployments",
+    ),
+    # Database changes
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\bsqlite\b', r'\bpostgres\b', r'\bmigration\b',
+            r'\bschema\b.*\bchange', r'\bALTER TABLE\b',
+        ]],
+        "wing_ops", "database",
+    ),
+    # Security / auth
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\bSSH\b.*\bkey\b', r'\bapi.key\b', r'\btoken\b',
+            r'\bcredential', r'\bauth\b', r'\bpassword\b',
+            r'\bpermission\b', r'\bfirewall\b',
+        ]],
+        "wing_ops", "security",
+    ),
+    # Memory provider plugin development
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\bmemory.provider\b', r'\bon_pre_compress\b',
+            r'\bMemoryProvider\b', r'\bmempalace\b.*\bplugin\b',
+        ]],
+        "wing_hermes-dev", "plugin-development",
+    ),
+    # Pipeline / automation
+    (
+        [re.compile(p, re.IGNORECASE) for p in [
+            r'\bpipeline\b', r'\bbacklog-to-supervisor\b',
+            r'\bwiki.*\bingest', r'\bbridge\s+script\b',
+            r'\bcron\s+job\b', r'\bdispatch\b',
+        ]],
+        "wing_ops", "pipeline-architecture",
+    ),
+]
+
+
+def _compile_user_rules(rules_config: List[dict]) -> List[Tuple[List[re.Pattern], str, str]]:
+    """Compile user-defined routing rules from config.yaml.
+
+    Expected format:
+      routing_rules:
+        - patterns: ["regex1", "regex2"]
+          wing: "my_project"
+          room: "my_room"
+    """
+    compiled = []
+    for rule in rules_config:
+        patterns = rule.get("patterns", [])
+        wing = rule.get("wing", "")
+        room = rule.get("room", "")
+        if not patterns or not wing or not room:
+            continue
+        try:
+            compiled_patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
+            compiled.append((compiled_patterns, wing, room))
+        except re.error as e:
+            logger.warning("Skipping invalid routing rule pattern: %s", e)
+    return compiled
+
+
+def _route_content(
+    content: str,
+    user_rules: Optional[List[Tuple[List[re.Pattern], str, str]]] = None,
+) -> Tuple[str, str]:
+    """Route content to the best wing/room based on pattern matching.
+
+    Returns (wing, room) tuple. Falls back to ("wing_hermes", "pre-compress").
+
+    User rules are checked first (they take priority), then defaults.
+    """
+    # Check user rules first
+    if user_rules:
+        for patterns, wing, room in user_rules:
+            for pat in patterns:
+                if pat.search(content):
+                    return (wing, room)
+
+    # Check default rules
+    for patterns, wing, room in DEFAULT_ROUTING_RULES:
+        for pat in patterns:
+            if pat.search(content):
+                return (wing, room)
+
+    return ("wing_hermes", "pre-compress")
+
+
+def _list_wing_rooms(palace_path: str) -> Dict[str, List[str]]:
+    """Get all wings and their rooms from existing drawer metadata."""
+    col = _get_collection(palace_path)
+    if not col:
+        return {}
+
+    try:
+        result = col.get(include=["metadatas"])
+        wings_rooms: Dict[str, set] = {}
+        if result and result.get("metadatas"):
+            for meta in result["metadatas"]:
+                wing = meta.get("wing", "")
+                room = meta.get("room", "")
+                if wing:
+                    wings_rooms.setdefault(wing, set()).add(room)
+        return {k: sorted(v) for k, v in wings_rooms.items()}
+    except Exception:
+        return {}
 
 SEARCH_SCHEMA = {
     "name": "mp_search",
@@ -415,6 +560,43 @@ STATUS_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
+RECLASSIFY_SCHEMA = {
+    "name": "mp_reclassify",
+    "description": (
+        "Move a drawer from one wing/room to another. Use to re-categorize "
+        "memories that were auto-routed incorrectly. Takes a drawer ID, "
+        "new wing, and new room."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "drawer_id": {
+                "type": "string",
+                "description": "The drawer ID to move (from mp_search results).",
+            },
+            "wing": {
+                "type": "string",
+                "description": "New wing to move the drawer to.",
+            },
+            "room": {
+                "type": "string",
+                "description": "New room to move the drawer to.",
+            },
+        },
+        "required": ["drawer_id", "wing", "room"],
+    },
+}
+
+ROUTES_SCHEMA = {
+    "name": "mp_routes",
+    "description": (
+        "List all active routing rules and the existing wing/room taxonomy. "
+        "Shows user-defined rules (from config) and default rules, plus "
+        "which wings/rooms already have drawers."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -429,6 +611,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._sync_thread: Optional[threading.Thread] = None
         self._flush_thread: Optional[threading.Thread] = None
+        self._user_routing_rules: List[Tuple[List[re.Pattern], str, str]] = []
 
     @property
     def name(self) -> str:
@@ -474,6 +657,15 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 configured_path = mp_config.get("palace_path", "")
                 if configured_path:
                     self._palace_path = os.path.expanduser(configured_path)
+
+                # Load user routing rules
+                rules_config = mp_config.get("routing_rules", [])
+                if rules_config:
+                    self._user_routing_rules = _compile_user_rules(rules_config)
+                    logger.info(
+                        "MemPalace loaded %d user routing rules",
+                        len(self._user_routing_rules),
+                    )
             except Exception:
                 pass
 
@@ -533,12 +725,18 @@ class MemPalaceMemoryProvider(MemoryProvider):
         """Persist important conversation turns as drawers (non-blocking).
 
         Only files substantive turns (>50 chars user input) to avoid noise.
-        Stores in wing_hermes/room_turns.
+        Content is routed to appropriate wing/room based on pattern rules.
         """
         self._turn_count += 1
 
         if len(user_content.strip()) < 50:
             return
+
+        combined = (
+            f"User: {user_content[:1500]}\n"
+            f"Assistant: {assistant_content[:1500]}"
+        )
+        wing, room = _route_content(combined, self._user_routing_rules)
 
         # Wait for previous sync
         if self._sync_thread and self._sync_thread.is_alive():
@@ -546,16 +744,15 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                combined = (
+                drawer_content = (
                     f"[Turn {self._turn_count} | {datetime.now().isoformat()}]\n"
-                    f"User: {user_content[:1500]}\n"
-                    f"Assistant: {assistant_content[:1500]}"
+                    f"{combined}"
                 )
                 _add_drawer(
                     self._palace_path,
-                    wing="wing_hermes",
-                    room="turns",
-                    content=combined,
+                    wing=wing,
+                    room=room,
+                    content=drawer_content,
                     added_by="hermes-plugin:sync_turn",
                 )
             except Exception as e:
@@ -573,6 +770,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
         important context from the conversation is preserved in the palace
         before Hermes' context compressor summarizes and discards old messages.
 
+        Content is smart-routed to the appropriate wing/room based on
+        configurable pattern rules (not dumped into a single catch-all).
+
         The extraction is non-blocking (runs in a background thread) so it
         doesn't add latency to the compression process.
         """
@@ -582,6 +782,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
         content = _extract_pre_compress_content(messages)
         if not content or len(content) < 100:
             return ""
+
+        # Smart route the content to the right wing/room
+        wing, room = _route_content(content, self._user_routing_rules)
 
         # Wait for previous flush
         if self._flush_thread and self._flush_thread.is_alive():
@@ -598,15 +801,15 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 )
                 result = _add_drawer(
                     self._palace_path,
-                    wing="wing_hermes",
-                    room="pre-compress",
+                    wing=wing,
+                    room=room,
                     content=drawer_content,
                     added_by="hermes-plugin:on_pre_compress",
                 )
                 if result.get("success"):
                     logger.info(
-                        "MemPalace pre-compression flush: %d messages saved to %s",
-                        len(messages),
+                        "MemPalace pre-compression flush: %d messages → %s/%s (%s)",
+                        len(messages), wing, room,
                         result.get("drawer_id", "?")[:40],
                     )
                 else:
@@ -681,7 +884,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         t.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, FILE_SCHEMA, STATUS_SCHEMA]
+        return [SEARCH_SCHEMA, FILE_SCHEMA, STATUS_SCHEMA, RECLASSIFY_SCHEMA, ROUTES_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "mp_search":
@@ -690,6 +893,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
             return self._tool_file(args)
         elif tool_name == "mp_status":
             return self._tool_status()
+        elif tool_name == "mp_reclassify":
+            return self._tool_reclassify(args)
+        elif tool_name == "mp_routes":
+            return self._tool_routes()
         return tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
@@ -769,6 +976,109 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not result.get("success"):
             return tool_error(result.get("error", "Status check failed"))
         return json.dumps({"status": result})
+
+    def _tool_reclassify(self, args: dict) -> str:
+        """Move a drawer to a different wing/room by re-upserting with new metadata."""
+        drawer_id = args.get("drawer_id", "")
+        new_wing = args.get("wing", "")
+        new_room = args.get("room", "")
+
+        if not drawer_id or not new_wing or not new_room:
+            return tool_error("drawer_id, wing, and room are required")
+
+        try:
+            _sanitize_name(new_wing, "wing")
+            _sanitize_name(new_room, "room")
+        except ValueError as e:
+            return tool_error(str(e))
+
+        col = _get_collection(self._palace_path, create=True)
+        if not col:
+            return tool_error("Cannot access palace database")
+
+        # Fetch existing drawer
+        try:
+            existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+        except Exception as e:
+            return tool_error(f"Failed to fetch drawer: {e}")
+
+        if not existing or not existing.get("ids") or not existing["ids"]:
+            return tool_error(f"Drawer not found: {drawer_id}")
+
+        doc = existing["documents"][0] if existing["documents"] else ""
+        old_meta = existing["metadatas"][0] if existing["metadatas"] else {}
+        old_wing = old_meta.get("wing", "?")
+        old_room = old_meta.get("room", "?")
+
+        # Generate new deterministic ID based on new wing/room + content
+        new_id = (
+            f"drawer_{new_wing}_{new_room}_"
+            f"{hashlib.sha256((new_wing + new_room + doc).encode()).hexdigest()[:24]}"
+        )
+
+        # Delete old drawer, upsert new one
+        try:
+            col.delete(ids=[drawer_id])
+        except Exception:
+            pass  # best effort
+
+        new_meta = {
+            **old_meta,
+            "wing": new_wing,
+            "room": new_room,
+            "reclassified_at": datetime.now().isoformat(),
+            "original_wing": old_wing,
+            "original_room": old_room,
+            "reclassified_by": "hermes-plugin:mp_reclassify",
+        }
+
+        try:
+            col.upsert(
+                ids=[new_id],
+                documents=[doc],
+                metadatas=[new_meta],
+            )
+            return json.dumps({
+                "result": f"Moved {drawer_id[:30]}... from {old_wing}/{old_room} → {new_wing}/{new_room}",
+                "new_drawer_id": new_id,
+            })
+        except Exception as e:
+            return tool_error(f"Failed to reclassify: {e}")
+
+    def _tool_routes(self) -> str:
+        """List active routing rules and wing/room taxonomy."""
+        lines = ["## Active Routing Rules\n"]
+
+        # User rules
+        if self._user_routing_rules:
+            lines.append("### User-defined rules (checked first):\n")
+            for i, (patterns, wing, room) in enumerate(self._user_routing_rules, 1):
+                pats = ", ".join(p.pattern for p in patterns[:3])
+                if len(patterns) > 3:
+                    pats += f", +{len(patterns)-3} more"
+                lines.append(f"{i}. `{pats}` → **{wing}/{room}**")
+        else:
+            lines.append("### User-defined rules: (none — add to config.yaml under mempalace.routing_rules)\n")
+
+        # Default rules
+        lines.append("\n### Default rules:\n")
+        for i, (patterns, wing, room) in enumerate(DEFAULT_ROUTING_RULES, 1):
+            pats = ", ".join(p.pattern for p in patterns[:3])
+            if len(patterns) > 3:
+                pats += f", +{len(patterns)-3} more"
+            lines.append(f"{i}. `{pats}` → **{wing}/{room}**")
+
+        lines.append("\n### Unmatched content → wing_hermes/pre-compress")
+
+        # Existing taxonomy
+        wings = _list_wing_rooms(self._palace_path)
+        if wings:
+            lines.append("\n\n## Existing Wing/Room Taxonomy\n")
+            for wing in sorted(wings.keys()):
+                rooms = wings[wing]
+                lines.append(f"- **{wing}**: {', '.join(rooms)}")
+
+        return json.dumps({"result": "\n".join(lines)})
 
 
 # ---------------------------------------------------------------------------

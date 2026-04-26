@@ -16,13 +16,18 @@ from plugins.memory.mempalace import (
     SEARCH_SCHEMA,
     FILE_SCHEMA,
     STATUS_SCHEMA,
+    RECLASSIFY_SCHEMA,
+    ROUTES_SCHEMA,
     MemPalaceMemoryProvider,
     _extract_pre_compress_content,
     _sanitize_name,
+    _route_content,
+    _compile_user_rules,
     _add_drawer,
     _search,
     _status,
     register,
+    DEFAULT_ROUTING_RULES,
 )
 
 
@@ -200,6 +205,8 @@ class TestProviderLifecycle:
         assert "mp_search" in names
         assert "mp_file" in names
         assert "mp_status" in names
+        assert "mp_reclassify" in names
+        assert "mp_routes" in names
 
     def test_config_schema(self, provider):
         schema = provider.get_config_schema()
@@ -283,6 +290,155 @@ class TestToolHandlers:
     def test_unknown_tool(self, initialized_provider):
         result = initialized_provider.handle_tool_call("mp_unknown", {})
         assert "Unknown tool" in result
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+class TestRouteContent:
+    def test_fallback_to_pre_compress(self):
+        wing, room = _route_content("random text about nothing specific")
+        assert wing == "wing_hermes"
+        assert room == "pre-compress"
+
+    def test_routes_ops_supervisor(self):
+        content = "Fixed ops-supervisor rate limit issue in dispatch_once()"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "incidents"
+
+    def test_routes_discord_gateway(self):
+        content = "hermes-gateway was crashing due to DISCORD_ALLOWED_USERS"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "incidents"
+
+    def test_routes_config_changes(self):
+        content = "Updated config.yaml and .env for the new provider"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "config-changes"
+
+    def test_routes_proxmox(self):
+        content = "Created VM with VMID 120 on proxmox host"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "incidents"
+
+    def test_routes_deployments(self):
+        content = "git push and deploy to production via docker build"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "deployments"
+
+    def test_routes_ssh_keys(self):
+        content = "Generated SSH key for GitHub authentication"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "security"
+
+    def test_routes_pipeline(self):
+        content = "Created backlog-to-supervisor bridge script and cron job for wiki ingest"
+        wing, room = _route_content(content)
+        assert wing == "wing_ops"
+        assert room == "pipeline-architecture"
+
+    def test_routes_memory_provider(self):
+        content = "Implementing on_pre_compress hook in MemoryProvider for mempalace plugin"
+        wing, room = _route_content(content)
+        assert wing == "wing_hermes-dev"
+        assert room == "plugin-development"
+
+    def test_user_rules_take_priority(self):
+        user_rules = _compile_user_rules([{
+            "patterns": ["atlas"],
+            "wing": "wing_atlas",
+            "room": "changes",
+        }])
+        content = "Fixed atlas repo checkout issue"
+        wing, room = _route_content(content, user_rules=user_rules)
+        assert wing == "wing_atlas"
+        assert room == "changes"
+
+    def test_user_rules_no_match_falls_to_defaults(self):
+        user_rules = _compile_user_rules([{
+            "patterns": ["very-specific-thing"],
+            "wing": "wing_custom",
+            "room": "stuff",
+        }])
+        content = "Fixed ops-supervisor rate limit"
+        wing, room = _route_content(content, user_rules=user_rules)
+        # Should hit default rule for ops-supervisor
+        assert wing == "wing_ops"
+        assert room == "incidents"
+
+    def test_compile_user_rules_skips_invalid(self):
+        rules = _compile_user_rules([
+            {"patterns": ["valid"], "wing": "w", "room": "r"},
+            {"patterns": ["(unclosed"], "wing": "w", "room": "r"},  # bad regex
+            {"patterns": [], "wing": "w", "room": "r"},  # empty
+        ])
+        assert len(rules) == 1
+
+    def test_first_match_wins(self):
+        user_rules = _compile_user_rules([
+            {"patterns": ["SSH"], "wing": "wing_a", "room": "first"},
+            {"patterns": ["SSH"], "wing": "wing_b", "room": "second"},
+        ])
+        content = "SSH key setup"
+        wing, room = _route_content(content, user_rules=user_rules)
+        assert wing == "wing_a"
+
+
+class TestReclassifyTool:
+    def test_reclassify_moves_drawer(self, initialized_provider):
+        with patch("plugins.memory.mempalace._get_collection") as mock_gc:
+            mock_col = MagicMock()
+            # Simulate existing drawer
+            mock_col.get.return_value = {
+                "ids": ["drawer_old_old_old_abc123"],
+                "documents": ["test content about SSH keys"],
+                "metadatas": [{"wing": "wing_hermes", "room": "pre-compress", "added_by": "test"}],
+            }
+            mock_col.delete.return_value = None
+            mock_col.upsert.return_value = None
+            mock_gc.return_value = mock_col
+
+            result = json.loads(initialized_provider.handle_tool_call("mp_reclassify", {
+                "drawer_id": "drawer_old_old_old_abc123",
+                "wing": "wing_ops",
+                "room": "security",
+            }))
+            assert "Moved" in result["result"]
+            assert "wing_ops" in result["result"]
+            assert "security" in result["result"]
+
+    def test_reclassify_missing_args(self, initialized_provider):
+        result = initialized_provider.handle_tool_call("mp_reclassify", {
+            "drawer_id": "drawer_abc",
+        })
+        assert "required" in result.lower()
+
+
+class TestRoutesTool:
+    def test_routes_lists_rules(self, initialized_provider):
+        with patch("plugins.memory.mempalace._get_collection") as mock_gc:
+            mock_col = MagicMock()
+            mock_col.get.return_value = {
+                "metadatas": [
+                    {"wing": "wing_ops", "room": "incidents"},
+                    {"wing": "wing_ops", "room": "incidents"},
+                    {"wing": "wing_hermes", "room": "pre-compress"},
+                ],
+            }
+            mock_gc.return_value = mock_col
+
+            result = json.loads(initialized_provider.handle_tool_call("mp_routes", {}))
+            assert "result" in result
+            text = result["result"]
+            assert "Default rules" in text
+            assert "wing_ops" in text
 
 
 # ---------------------------------------------------------------------------
