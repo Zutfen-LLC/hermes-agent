@@ -69,7 +69,7 @@ The following scenarios are **not** considered security breaches:
 ### Skills & Supply Chain
 - **Skill installation:** Review Skills Guard reports (`tools/skills_guard.py`) before installing third-party skills. The audit log at `~/.hermes/skills/.hub/audit.log` tracks every install and removal.
 - **MCP safety:** OSV malware checking runs automatically for `npx`/`uvx` packages before MCP server processes are spawned.
-- **CI/CD:** GitHub Actions are pinned to full commit SHAs. The `supply-chain-audit.yml` workflow blocks PRs containing `.pth` files or suspicious `base64`+`exec` patterns.
+- **CI/CD:** GitHub Actions are pinned to full commit SHAs. Treat install hooks, `.pth` files, and obfuscated command execution as high-risk changes during review.
 
 ### Credential Storage
 - API keys and tokens belong exclusively in `~/.hermes/.env` — never in `config.yaml` or checked into version control.
