@@ -41,6 +41,7 @@ def _install_stub_module(name: str, attrs: dict[str, object] | None = None, *, p
     if name in sys.modules:
         return
     module = types.ModuleType(name)
+    module.__hermes_test_stub__ = True
     if package:
         module.__path__ = []  # type: ignore[attr-defined]
     if attrs:
@@ -83,8 +84,15 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         top_level = fullname.split(".", 1)[0]
         if top_level in self._BLOCKED_IMPORTS:
             return importlib.machinery.ModuleSpec(fullname, self, is_package=False)
+        if top_level in sys.stdlib_module_names:
+            return None
         if top_level in self._PROJECT_TOP_LEVELS:
             return None
+        if "." in fullname:
+            parent_name = fullname.rsplit(".", 1)[0]
+            parent = sys.modules.get(parent_name)
+            if not getattr(parent, "__hermes_test_stub__", False):
+                return None
         return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
 
     def create_module(self, spec):
@@ -95,6 +103,7 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if top_level in self._BLOCKED_IMPORTS:
             raise ImportError(f"No module named {module.__name__!r}")
         module.__dict__.setdefault("__path__", [])
+        module.__dict__["__hermes_test_stub__"] = True
 
         def _stub_attr(name):
             if name == "__version__":
