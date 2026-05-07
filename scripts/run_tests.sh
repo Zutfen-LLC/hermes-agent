@@ -44,6 +44,17 @@ PYTHON="$VENV/bin/python"
 # ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
 if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
   echo "→ installing pytest-split into $VENV"
+  if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+    if ! "$PYTHON" -m ensurepip --upgrade >/dev/null 2>&1; then
+      if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "$PYTHON" --quiet pip
+      else
+        echo "error: pip is missing from $VENV and could not be bootstrapped" >&2
+        exit 1
+      fi
+    fi
+  fi
+
   "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
 fi
 
