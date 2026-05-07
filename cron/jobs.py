@@ -88,6 +88,48 @@ def _secure_file(path: Path):
         pass
 
 
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _usage_snapshot(usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not usage:
+        return None
+
+    snapshot = dict(usage)
+    snapshot["prompt_tokens"] = _coerce_int(snapshot.get("prompt_tokens"))
+    snapshot["completion_tokens"] = _coerce_int(snapshot.get("completion_tokens"))
+    snapshot["total_tokens"] = _coerce_int(snapshot.get("total_tokens"))
+    if "estimated_cost_usd" in snapshot and snapshot["estimated_cost_usd"] is not None:
+        snapshot["estimated_cost_usd"] = _coerce_float(snapshot.get("estimated_cost_usd"))
+    return snapshot
+
+
+def _accumulate_usage_totals(existing: Optional[Dict[str, Any]], usage: Dict[str, Any]) -> Dict[str, Any]:
+    totals = dict(existing or {})
+    totals["runs"] = _coerce_int(totals.get("runs")) + 1
+    totals["prompt_tokens"] = _coerce_int(totals.get("prompt_tokens")) + _coerce_int(usage.get("prompt_tokens"))
+    totals["completion_tokens"] = _coerce_int(totals.get("completion_tokens")) + _coerce_int(usage.get("completion_tokens"))
+    totals["total_tokens"] = _coerce_int(totals.get("total_tokens")) + _coerce_int(usage.get("total_tokens"))
+
+    if usage.get("estimated_cost_usd") is not None:
+        totals["estimated_cost_usd"] = _coerce_float(totals.get("estimated_cost_usd")) + _coerce_float(usage.get("estimated_cost_usd"))
+    elif "estimated_cost_usd" in totals and totals["estimated_cost_usd"] is None:
+        totals["estimated_cost_usd"] = 0.0
+
+    return totals
+
+
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     CRON_DIR.mkdir(parents=True, exist_ok=True)
@@ -701,7 +743,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 usage: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
@@ -721,6 +764,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+
+                usage_snapshot = _usage_snapshot(usage)
+                if usage_snapshot is not None:
+                    job["last_usage"] = usage_snapshot
+                    job["usage_totals"] = _accumulate_usage_totals(job.get("usage_totals"), usage_snapshot)
+                else:
+                    job.pop("last_usage", None)
                 
                 # Increment completed count
                 if job.get("repeat"):

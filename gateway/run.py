@@ -5325,6 +5325,9 @@ class GatewayRunner:
         if canonical == "compress":
             return await self._handle_compress_command(event)
 
+        if canonical == "cca-remember":
+            return await self._handle_cca_remember_command(event)
+
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
@@ -9999,6 +10002,62 @@ class GatewayRunner:
         if last_assistant:
             response += f"\n\nLast Hermes message:\n{last_assistant}"
         return response
+
+    async def _handle_cca_remember_command(self, event: MessageEvent) -> str:
+        """Handle /cca-remember command -- route memory across all durable stores."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+
+        if not history or len(history) < 2:
+            return "Not enough conversation to remember yet."
+
+        try:
+            from run_agent import AIAgent
+
+            session_key = self._session_key_for_source(source)
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+            )
+            if not runtime_kwargs.get("api_key"):
+                return "No provider configured -- cannot remember yet."
+
+            msgs = [
+                {"role": m.get("role"), "content": m.get("content")}
+                for m in history
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+
+            tmp_agent = AIAgent(
+                **runtime_kwargs,
+                model=model,
+                max_iterations=4,
+                quiet_mode=True,
+                skip_memory=False,
+                session_id=session_entry.session_id,
+            )
+            try:
+                tmp_agent._print_fn = lambda *a, **kw: None
+                result = tmp_agent.route_memory_session(
+                    msgs,
+                    invocation_mode="manual",
+                    source_event="cca-remember",
+                )
+            finally:
+                self._cleanup_agent_resources(tmp_agent)
+
+            summary = result.get("summary", "memory routed")
+            failed = result.get("failed") or []
+            lines = [f"🧠 {summary}"]
+            for item in failed:
+                destination = item.get("destination", "?")
+                error = item.get("error", "unknown error")
+                lines.append(f"! {destination}: {error}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning("Manual memory routing failed: %s", e)
+            return f"Memory routing failed: {e}"
 
     async def _handle_title_command(self, event: MessageEvent) -> str:
         """Handle /title command — set or show the current session's title."""

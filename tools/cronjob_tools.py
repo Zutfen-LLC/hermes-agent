@@ -251,6 +251,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("last_usage"):
+        result["last_usage"] = job["last_usage"]
+    if job.get("usage_totals"):
+        result["usage_totals"] = job["usage_totals"]
     return result
 
 

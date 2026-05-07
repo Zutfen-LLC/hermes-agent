@@ -851,6 +851,46 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return "\n".join(parts)
 
 
+def _format_usage_section(usage: Optional[dict], totals: Optional[dict] = None) -> str:
+    """Render a compact markdown usage summary for cron output files."""
+    if not usage:
+        return ""
+
+    def _fmt_int(value: object) -> str:
+        try:
+            return f"{int(value):,}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _fmt_cost(value: object) -> str:
+        try:
+            return f"${float(value):,.6f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    lines = ["## Usage", ""]
+    lines.append(f"- Prompt tokens: {_fmt_int(usage.get('prompt_tokens'))}")
+    lines.append(f"- Completion tokens: {_fmt_int(usage.get('completion_tokens'))}")
+    lines.append(f"- Total tokens: {_fmt_int(usage.get('total_tokens'))}")
+    if usage.get("estimated_cost_usd") is not None:
+        lines.append(f"- Estimated cost: {_fmt_cost(usage.get('estimated_cost_usd'))}")
+    if usage.get("cost_status"):
+        lines.append(f"- Cost status: {usage.get('cost_status')}")
+    if usage.get("cost_source"):
+        lines.append(f"- Cost source: {usage.get('cost_source')}")
+
+    if totals:
+        lines.extend(["", "### Cumulative usage", ""])
+        lines.append(f"- Runs: {_fmt_int(totals.get('runs'))}")
+        lines.append(f"- Prompt tokens: {_fmt_int(totals.get('prompt_tokens'))}")
+        lines.append(f"- Completion tokens: {_fmt_int(totals.get('completion_tokens'))}")
+        lines.append(f"- Total tokens: {_fmt_int(totals.get('total_tokens'))}")
+        if totals.get("estimated_cost_usd") is not None:
+            lines.append(f"- Estimated cost: {_fmt_cost(totals.get('estimated_cost_usd'))}")
+
+    return "\n".join(lines) + "\n"
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1346,6 +1386,25 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+
+        usage = None
+        if isinstance(result, dict):
+            usage = {
+                key: result.get(key)
+                for key in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "estimated_cost_usd",
+                    "cost_status",
+                    "cost_source",
+                )
+                if result.get(key) is not None
+            }
+            if usage:
+                job["_last_usage"] = usage
+
+        usage_section = _format_usage_section(usage)
         
         output = f"""# Cron Job: {job_name}
 
@@ -1360,7 +1419,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 ## Response
 
 {logged_response}
-"""
+{usage_section}"""
         
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
@@ -1536,7 +1595,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                mark_job_run(job["id"], success, error, delivery_error=delivery_error, usage=job.get("_last_usage"))
                 return True
 
             except Exception as e:

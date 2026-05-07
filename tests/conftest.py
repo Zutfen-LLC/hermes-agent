@@ -21,15 +21,124 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import logging
+import contextlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import os
 import re
 import signal
 import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+
+def _install_stub_module(name: str, attrs: dict[str, object] | None = None, *, package: bool = False) -> None:
+    if name in sys.modules:
+        return
+    module = types.ModuleType(name)
+    if package:
+        module.__path__ = []  # type: ignore[attr-defined]
+    if attrs:
+        for key, value in attrs.items():
+            setattr(module, key, value)
+    sys.modules[name] = module
+
+
+def _stub_class(name: str):
+    return type(name, (), {"__init__": lambda self, *a, **k: None})
+
+
+class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Fallback import hook that stubs missing third-party dependencies.
+
+    Real project modules are deliberately excluded so a missing local import
+    still fails loudly instead of silently masking a regression.
+    """
+
+    _PROJECT_TOP_LEVELS = {
+        "agent",
+        "cli",
+        "gateway",
+        "hermes_cli",
+        "hermes_constants",
+        "run_agent",
+        "tests",
+        "tools",
+        "utils",
+    }
+
+    def find_spec(self, fullname: str, path=None, target=None):
+        top_level = fullname.split(".", 1)[0]
+        if top_level in self._PROJECT_TOP_LEVELS:
+            return None
+        return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+
+    def create_module(self, spec):
+        return None  # use default module creation
+
+    def exec_module(self, module):
+        module.__dict__.setdefault("__path__", [])
+
+        def _stub_attr(name):
+            if name == "__version__":
+                return "0.0"
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return _stub_class(name)
+
+        module.__dict__.setdefault("__getattr__", _stub_attr)
+
+
+def _install_optional_dependency_stubs() -> None:
+    if importlib.util.find_spec("openai") is None:
+        _install_stub_module("openai", {"OpenAI": _stub_class("OpenAI")})
+    if importlib.util.find_spec("yaml") is None:
+        _install_stub_module("yaml", {"safe_load": lambda *a, **k: {}, "safe_dump": lambda *a, **k: ""})
+    if importlib.util.find_spec("fire") is None:
+        _install_stub_module("fire", {"Fire": lambda *a, **k: None})
+    if importlib.util.find_spec("dotenv") is None:
+        _install_stub_module("dotenv", {"load_dotenv": lambda *a, **k: None})
+
+    if importlib.util.find_spec("prompt_toolkit") is None:
+        _install_stub_module("prompt_toolkit", {"print_formatted_text": lambda *a, **k: None}, package=True)
+        _install_stub_module("prompt_toolkit.auto_suggest", {"AutoSuggest": _stub_class("AutoSuggest"), "Suggestion": _stub_class("Suggestion")})
+        _install_stub_module("prompt_toolkit.completion", {"Completer": _stub_class("Completer"), "Completion": _stub_class("Completion")})
+        _install_stub_module("prompt_toolkit.history", {"FileHistory": _stub_class("FileHistory"), "History": _stub_class("History")})
+        _install_stub_module("prompt_toolkit.patch_stdout", {"patch_stdout": lambda *a, **k: contextlib.nullcontext()})
+        _install_stub_module("prompt_toolkit.application", {"Application": _stub_class("Application")})
+        _install_stub_module("prompt_toolkit.layout", {
+            "Layout": _stub_class("Layout"),
+            "HSplit": _stub_class("HSplit"),
+            "Window": _stub_class("Window"),
+            "FormattedTextControl": _stub_class("FormattedTextControl"),
+            "ConditionalContainer": _stub_class("ConditionalContainer"),
+        })
+        _install_stub_module("prompt_toolkit.layout.processors", {
+            "Processor": _stub_class("Processor"),
+            "Transformation": _stub_class("Transformation"),
+            "PasswordProcessor": _stub_class("PasswordProcessor"),
+            "ConditionalProcessor": _stub_class("ConditionalProcessor"),
+        })
+        _install_stub_module("prompt_toolkit.filters", {"Condition": lambda *a, **k: (lambda f: f)})
+        _install_stub_module("prompt_toolkit.layout.dimension", {"Dimension": _stub_class("Dimension")})
+        _install_stub_module("prompt_toolkit.layout.menus", {"CompletionsMenu": _stub_class("CompletionsMenu")})
+        _install_stub_module("prompt_toolkit.widgets", {"TextArea": _stub_class("TextArea")})
+        _install_stub_module("prompt_toolkit.key_binding", {"KeyBindings": _stub_class("KeyBindings")})
+        _install_stub_module("prompt_toolkit.formatted_text", {"ANSI": str})
+        _install_stub_module("prompt_toolkit.cursor_shapes", {"CursorShape": types.SimpleNamespace(BLOCK=None)})
+
+
+if not any(isinstance(finder, _StubFinder) for finder in sys.meta_path):
+    sys.meta_path.append(_StubFinder())
+
+
+_install_optional_dependency_stubs()
+
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
