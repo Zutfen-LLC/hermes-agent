@@ -41,6 +41,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Create virtualenv
+        run: uv venv .venv --python 3.11
+
       - name: Install ruff + ty
         run: |
           uv tool install ruff
@@ -101,6 +107,7 @@ jobs:
 
       - name: Generate diff summary
         run: |
+          source .venv/bin/activate
           python scripts/lint_diff.py \
             --base-ruff .lint-reports/base/ruff.json \
             --head-ruff .lint-reports/head/ruff.json \

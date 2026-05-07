@@ -3,7 +3,7 @@
 # `pytest` directly to guarantee your local run matches CI behavior.
 #
 # What this script enforces:
-#   * -n 4 xdist workers (CI has 4 cores; -n auto diverges locally)
+#   * -n 4 xdist workers (matches CI capacity more predictably than auto)
 #   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
 #   * Credential env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running `pytest` outside of
@@ -79,9 +79,8 @@ export LC_ALL=C.UTF-8
 export PYTHONHASHSEED=0
 
 # ── Worker count ────────────────────────────────────────────────────────────
-# CI uses `-n auto` on ubuntu-latest which gives 4 workers. A 20-core
-# workstation with `-n auto` gets 20 workers and exposes test-ordering
-# flakes that CI will never see. Pin to 4 so local matches CI.
+# Pin to 4 so local matches the canonical CI runner behavior instead of
+# depending on xdist auto-detection.
 WORKERS="${HERMES_TEST_WORKERS:-4}"
 
 # ── Run pytest ──────────────────────────────────────────────────────────────
@@ -94,7 +93,8 @@ ARGS=("$@")
 echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
 
-# -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
+# -o "addopts=" clears pyproject.toml's default pytest options so our
+# explicit worker count and markers win.
 exec "$PYTHON" -m pytest \
   -o "addopts=" \
   -n "$WORKERS" \
