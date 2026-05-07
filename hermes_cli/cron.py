@@ -38,6 +38,20 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _format_tokens(value):
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _format_cost(value):
+    try:
+        return f"${float(value):,.6f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
@@ -108,6 +122,31 @@ def cron_list(show_all: bool = False):
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")
+
+        last_usage = job.get("last_usage") or {}
+        if last_usage:
+            cost = last_usage.get("estimated_cost_usd")
+            cost_part = f"  cost={_format_cost(cost)}" if cost is not None else ""
+            print(
+                "    Last usage: "
+                f"prompt={_format_tokens(last_usage.get('prompt_tokens'))} "
+                f"completion={_format_tokens(last_usage.get('completion_tokens'))} "
+                f"total={_format_tokens(last_usage.get('total_tokens'))}"
+                f"{cost_part}"
+            )
+
+        usage_totals = job.get("usage_totals") or {}
+        if usage_totals:
+            cost = usage_totals.get("estimated_cost_usd")
+            cost_part = f"  cost={_format_cost(cost)}" if cost is not None else ""
+            print(
+                "    Usage total: "
+                f"runs={_format_tokens(usage_totals.get('runs'))} "
+                f"prompt={_format_tokens(usage_totals.get('prompt_tokens'))} "
+                f"completion={_format_tokens(usage_totals.get('completion_tokens'))} "
+                f"total={_format_tokens(usage_totals.get('total_tokens'))}"
+                f"{cost_part}"
+            )
 
         delivery_err = job.get("last_delivery_error")
         if delivery_err:

@@ -6558,6 +6558,8 @@ class HermesCLI:
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "cca-remember":
+            self._handle_cca_remember_command(cmd_original)
         elif canonical == "usage":
             self._show_usage()
         elif canonical == "insights":
@@ -7685,6 +7687,33 @@ class HermesCLI:
 
             except Exception as e:
                 print(f"  ❌ Compression failed: {e}")
+
+    def _handle_cca_remember_command(self, cmd_original: str = ""):
+        """Manually route the current session through native memory, MemPalace, and cca-lite."""
+        if not self.conversation_history:
+            print("(._.) Not enough conversation to remember yet.")
+            return
+
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        try:
+            result = self.agent.route_memory_session(
+                list(self.conversation_history),
+                invocation_mode="manual",
+                source_event="cca-remember",
+            )
+            summary = result.get("summary", "memory routed")
+            print(f"  🧠 {summary}")
+            failed = result.get("failed") or []
+            if failed:
+                for item in failed:
+                    destination = item.get("destination", "?")
+                    error = item.get("error", "unknown error")
+                    print(f"     ! {destination}: {error}")
+        except Exception as e:
+            print(f"  ❌ Memory routing failed: {e}")
 
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""

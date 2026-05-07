@@ -4651,19 +4651,53 @@ class AIAgent:
             "budget_max": self.iteration_budget.max_total,
         }
 
+    def route_memory_session(
+        self,
+        messages: list = None,
+        *,
+        invocation_mode: str = "manual",
+        source_event: str = "",
+        candidate_window: int | None = None,
+    ) -> dict:
+        """Route a session slice through native memory, MemPalace, and cca-lite."""
+        try:
+            from agent.memory_router import route_memory_candidates
+            try:
+                from hermes_cli.config import load_config
+                config = load_config()
+            except Exception:
+                config = {}
+            return route_memory_candidates(
+                invocation_mode=invocation_mode,  # type: ignore[arg-type]
+                session_id=self.session_id or "",
+                messages=messages or [],
+                memory_store=self._memory_store,
+                source_event=source_event,
+                candidate_window=candidate_window,
+                config=config,
+            )
+        except Exception as exc:
+            logger.debug("memory routing failed: %s", exc)
+            return {
+                "ok": False,
+                "mode": invocation_mode,
+                "session_id": self.session_id or "",
+                "routed": [],
+                "suppressed": [],
+                "failed": [{"destination": "router", "error": str(exc)}],
+                "summary": f"memory routing failed: {exc}",
+            }
+
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
 
-        This calls on_session_end() then shutdown_all() on the memory
-        manager, and on_session_end() on the context engine.
+        This routes memory one last time, then shuts down the memory manager
+        and context engine.
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        self.route_memory_session(messages or [], invocation_mode="session_end", source_event="shutdown")
         if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception:
-                pass
             try:
                 self._memory_manager.shutdown_all()
             except Exception:
@@ -4683,12 +4717,7 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if not self._memory_manager:
-            return
-        try:
-            self._memory_manager.on_session_end(messages or [])
-        except Exception:
-            pass
+        self.route_memory_session(messages or [], invocation_mode="session_end", source_event="session_rotate")
 
     def _sync_external_memory_for_turn(
         self,
@@ -9167,12 +9196,12 @@ class AIAgent:
             focus_topic,
         )
 
-        # Notify external memory provider before compression discards context
-        if self._memory_manager:
-            try:
-                self._memory_manager.on_pre_compress(messages)
-            except Exception:
-                pass
+        # Route durable memory before compression discards context.
+        self.route_memory_session(
+            messages,
+            invocation_mode="pre_compress",
+            source_event="compression",
+        )
 
         try:
             compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)

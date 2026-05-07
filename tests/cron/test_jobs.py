@@ -349,6 +349,32 @@ class TestMarkJobRun:
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
 
+    def test_usage_is_persisted_and_accumulated(self, tmp_cron_dir):
+        job = create_job(prompt="Measure me", schedule="every 1h")
+        usage = {
+            "prompt_tokens": 12,
+            "completion_tokens": 34,
+            "total_tokens": 46,
+            "estimated_cost_usd": 0.00123,
+            "cost_status": "estimated",
+            "cost_source": "test",
+        }
+        mark_job_run(job["id"], success=True, usage=usage)
+        updated = get_job(job["id"])
+        assert updated["last_usage"]["total_tokens"] == 46
+        assert updated["last_usage"]["estimated_cost_usd"] == 0.00123
+        assert updated["usage_totals"]["runs"] == 1
+        assert updated["usage_totals"]["prompt_tokens"] == 12
+        assert updated["usage_totals"]["completion_tokens"] == 34
+        assert updated["usage_totals"]["total_tokens"] == 46
+        assert updated["usage_totals"]["estimated_cost_usd"] == 0.00123
+
+        mark_job_run(job["id"], success=True, usage=usage)
+        updated = get_job(job["id"])
+        assert updated["usage_totals"]["runs"] == 2
+        assert updated["usage_totals"]["total_tokens"] == 92
+        assert updated["usage_totals"]["estimated_cost_usd"] == 0.00246
+
     def test_delivery_error_cleared_on_success(self, tmp_cron_dir):
         """Successful delivery clears the previous delivery error."""
         job = create_job(prompt="Report", schedule="every 1h")
