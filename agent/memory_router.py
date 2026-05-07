@@ -171,7 +171,8 @@ def _mempalace_route(content: str, invocation_mode: InvocationMode, config: dict
     try:
         from plugins.memory.mempalace import _add_drawer, _route_content
     except Exception as exc:
-        return {"success": False, "error": f"MemPalace unavailable: {exc}"}
+        logger.debug("MemPalace unavailable; skipping sink: %s", exc)
+        return {"success": True, "mode": "disabled", "reason": f"MemPalace unavailable: {exc}"}
 
     palace_path, routing_rules = _resolve_mempalace_config(config)
     wing, room = _route_content(content, routing_rules)

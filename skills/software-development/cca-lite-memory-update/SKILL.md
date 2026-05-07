@@ -52,6 +52,8 @@ Use MemPalace for:
 - search-friendly knowledge that is not authoritative repo state
 - references to past discussions when a short pointer is enough
 
+If MemPalace is unavailable or cannot import, treat that sink as skipped and continue routing native memory and cca-lite. A missing MemPalace backend should not block the durable-memory pass.
+
 ### 3. cca-lite memory
 Use `hermes-memory.json` for:
 - repo-local durable facts
@@ -141,6 +143,10 @@ git commit -m "docs: promote cca-lite memory"
 5. Forgetting to validate before commit
    - Parse the JSON first.
    - Confirm hashes and supersession markers are present where needed.
+
+6. Treating a missing MemPalace backend as fatal
+   - The router should degrade gracefully when the plugin is unavailable.
+   - Native memory and cca-lite should still receive eligible facts.
 
 ## Verification Checklist
 

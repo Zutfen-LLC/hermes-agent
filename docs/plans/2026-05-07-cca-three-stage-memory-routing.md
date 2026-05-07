@@ -25,6 +25,7 @@
 3. Preserve failure isolation.
    - If one store fails, the other two still run.
    - No single backend should block shutdown or compression.
+   - If MemPalace is unavailable or cannot import, treat that sink as skipped and continue with native memory / cca-lite rather than failing the full routing pass.
 
 4. Prevent duplicate promotion.
    - The router must dedupe facts across invocations and across destinations.

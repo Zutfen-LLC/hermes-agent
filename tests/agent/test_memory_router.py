@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from agent import memory_router
 
 
@@ -77,3 +79,42 @@ def test_route_memory_candidates_dedupes_across_repeated_invocations(monkeypatch
     assert len(mempalace_calls) == 1
     assert len(cca_calls) == 1
     assert fake_store.calls[0][0] == "user"
+
+
+def test_mempalace_route_missing_backend_returns_disabled(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "plugins.memory.mempalace", object())
+
+    result = memory_router._mempalace_route(
+        "Please remember I prefer compact replies.",
+        "manual",
+        config={},
+    )
+
+    assert result["success"] is True
+    assert result["mode"] == "disabled"
+    assert "MemPalace unavailable" in result["reason"]
+
+
+def test_mempalace_missing_backend_is_skipped(monkeypatch) -> None:
+    memory_router.clear_seen("sess-missing-mp")
+
+    fake_store = FakeMemoryStore()
+    monkeypatch.setitem(sys.modules, "plugins.memory.mempalace", object())
+
+    result = memory_router.route_memory_candidates(
+        invocation_mode="manual",
+        session_id="sess-missing-mp",
+        messages=[
+            {"role": "user", "content": "Please remember I prefer compact replies."},
+            {"role": "assistant", "content": "Got it."},
+        ],
+        memory_store=fake_store,
+        source_event="cca-remember",
+        config={},
+    )
+
+    assert result["ok"] is True
+    assert not result["failed"]
+    assert result["routed"]
+    assert any(item["destination"] == "mempalace" and item["status"] == "no_op" for item in result["routed"])
+    assert len(fake_store.calls) == 1
