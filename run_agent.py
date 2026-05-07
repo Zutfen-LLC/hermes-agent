@@ -1018,7 +1018,7 @@ class AIAgent:
         """
         _install_safe_stdio()
 
-        self.model = model
+        self.model: str = str(model or "")
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
@@ -1051,7 +1051,7 @@ class AIAgent:
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
         self.base_url = base_url or ""
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
-        self.provider = provider_name or ""
+        self.provider: str = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
@@ -1341,6 +1341,8 @@ class AIAgent:
         # access for Codex Responses API streaming.
         self._anthropic_client = None
         self._is_anthropic_oauth = False
+        self._client_kwargs: dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {}
 
         # Resolve per-provider / per-model request timeout once up front so
         # every client construction path below (Anthropic native, OpenAI-wire,
@@ -1592,7 +1594,7 @@ class AIAgent:
         # failure).  Supports both legacy single-dict ``fallback_model`` and
         # new list ``fallback_providers`` format.
         if isinstance(fallback_model, list):
-            self._fallback_chain = [
+            self._fallback_chain: list[dict[str, Any]] = [
                 f for f in fallback_model
                 if isinstance(f, dict) and f.get("provider") and f.get("model")
             ]
@@ -2200,7 +2202,7 @@ class AIAgent:
         # preferred model gets a fresh attempt each time.  Uses a single dict
         # so new state fields are easy to add without N individual attributes.
         _cc = self.context_compressor
-        self._primary_runtime = {
+        self._primary_runtime: dict[str, Any] = {
             "model": self.model,
             "provider": self.provider,
             "base_url": self.base_url,
@@ -7698,8 +7700,10 @@ class AIAgent:
 
         fb = self._fallback_chain[self._fallback_index]
         self._fallback_index += 1
-        fb_provider = (fb.get("provider") or "").strip().lower()
-        fb_model = (fb.get("model") or "").strip()
+        fb_provider_raw = fb.get("provider")
+        fb_model_raw = fb.get("model")
+        fb_provider = fb_provider_raw.strip().lower() if isinstance(fb_provider_raw, str) else ""
+        fb_model = fb_model_raw.strip() if isinstance(fb_model_raw, str) else ""
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
 
@@ -7711,10 +7715,13 @@ class AIAgent:
             # Pass base_url and api_key from fallback config so custom
             # endpoints (e.g. Ollama Cloud) resolve correctly instead of
             # falling through to OpenRouter defaults.
-            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
-            fb_api_key_hint = (fb.get("api_key") or "").strip() or None
+            fb_base_url_raw = fb.get("base_url")
+            fb_api_key_raw = fb.get("api_key")
+            fb_base_url_hint = fb_base_url_raw.strip() if isinstance(fb_base_url_raw, str) else None
+            fb_api_key_hint = fb_api_key_raw.strip() if isinstance(fb_api_key_raw, str) else None
             if not fb_api_key_hint:
-                fb_key_env = (fb.get("key_env") or "").strip()
+                fb_key_env_raw = fb.get("key_env")
+                fb_key_env = fb_key_env_raw.strip() if isinstance(fb_key_env_raw, str) else ""
                 if fb_key_env:
                     fb_api_key_hint = os.getenv(fb_key_env, "").strip() or None
             # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
@@ -7724,8 +7731,8 @@ class AIAgent:
                 fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
             fb_client, _resolved_fb_model = resolve_provider_client(
                 fb_provider, model=fb_model, raw_codex=True,
-                explicit_base_url=fb_base_url_hint,
-                explicit_api_key=fb_api_key_hint)
+                explicit_base_url=fb_base_url_hint or "",
+                explicit_api_key=fb_api_key_hint or "")
             if fb_client is None:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
@@ -10509,7 +10516,7 @@ class AIAgent:
                 _cnr_sum = _ct_sum.normalize_response(summary_response)
                 final_response = (_cnr_sum.content or "").strip()
             else:
-                summary_kwargs = {
+                summary_kwargs: dict[str, Any] = {
                     "model": self.model,
                     "messages": api_messages,
                 }
@@ -10579,7 +10586,7 @@ class AIAgent:
                     _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
                     final_response = (_retry_result.content or "").strip()
                 else:
-                    summary_kwargs = {
+                    summary_kwargs: dict[str, Any] = {
                         "model": self.model,
                         "messages": api_messages,
                     }
