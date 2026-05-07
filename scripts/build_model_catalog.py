@@ -16,7 +16,7 @@ Usage::
 
 Output: ``website/static/api/model-catalog.json``
 
-Live URL (after ``deploy-site.yml`` runs on merge to main):
+Live URL (after the docs site deploy pipeline runs on merge to main):
 ``https://hermes-agent.nousresearch.com/docs/api/model-catalog.json``
 """
 

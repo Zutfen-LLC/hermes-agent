@@ -12,7 +12,7 @@ body:
         - Run `hermes debug share` and paste the links in the Debug Report section below
         - If you're in a chat session, you can use `/debug` instead — it does the same thing
         - Try `hermes update` to get the latest version
-        - Check the [README troubleshooting section](https://github.com/NousResearch/hermes-agent#troubleshooting)
+        - Check the [README troubleshooting section](/README.md#troubleshooting)
         - For general questions, consider the [Nous Research Discord](https://discord.gg/NousResearch) for faster help
 
   - type: textarea
@@ -46,7 +46,6 @@ body:
       options:
         - Install script (curl | bash)
         - Manual clone + pip/uv install
-        - PowerShell installer (Windows)
         - Docker
         - Other
     validations:
@@ -56,7 +55,7 @@ body:
     id: os
     attributes:
       label: Operating System
-      placeholder: Ubuntu 24.04 / macOS 15.2 / Windows 11
+      placeholder: Ubuntu 24.04
     validations:
       required: true
 

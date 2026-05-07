@@ -16,7 +16,7 @@ When the manifest is unreachable (offline, network blocked, hosting failure), He
 https://hermes-agent.nousresearch.com/docs/api/model-catalog.json
 ```
 
-Published on every merge to `main` via the existing `deploy-site.yml` GitHub Pages pipeline. The source of truth lives in the repo at `website/static/api/model-catalog.json`.
+Published when the docs site is deployed from `main`. The source of truth lives in the repo at `website/static/api/model-catalog.json`.
 
 ## Schema
 
