@@ -21,6 +21,9 @@ dependencies = [
   "tenacity>=9.1.4,<10",
   "pyyaml>=6.0.2,<7",
   "requests>=2.33.0,<3",  # CVE-2026-25645
+  # Keep urllib3 on the 2.5.x line; 2.6.x interacts badly with pytest's
+  # fallback import hook around optional zstd imports.
+  "urllib3>=2.5.0,<2.6",
   "jinja2>=3.1.5,<4",
   "pydantic>=2.12.5,<3",
   # Interactive CLI (prompt_toolkit is used directly by cli.py)

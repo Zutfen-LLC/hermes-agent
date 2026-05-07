@@ -72,8 +72,17 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         "utils",
     }
 
+    # These optional zstd entrypoints must fail fast with ImportError so
+    # urllib3 falls back cleanly instead of binding a half-implemented stub.
+    _BLOCKED_IMPORTS = {
+        "compression",
+        "zstandard",
+    }
+
     def find_spec(self, fullname: str, path=None, target=None):
         top_level = fullname.split(".", 1)[0]
+        if top_level in self._BLOCKED_IMPORTS:
+            return importlib.machinery.ModuleSpec(fullname, self, is_package=False)
         if top_level in self._PROJECT_TOP_LEVELS:
             return None
         return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
@@ -82,6 +91,9 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         return None  # use default module creation
 
     def exec_module(self, module):
+        top_level = module.__name__.split(".", 1)[0]
+        if top_level in self._BLOCKED_IMPORTS:
+            raise ImportError(f"No module named {module.__name__!r}")
         module.__dict__.setdefault("__path__", [])
 
         def _stub_attr(name):
