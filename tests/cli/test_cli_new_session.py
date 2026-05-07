@@ -33,6 +33,7 @@ class _FakeAgent:
         self._todo_store.write(
             [{"id": "t1", "content": "unfinished task", "status": "in_progress"}]
         )
+        self.route_memory_session = MagicMock(return_value={"ok": True, "summary": "manual route"})
         self.commit_memory_session = MagicMock()
         self._invalidate_system_prompt = MagicMock()
 
@@ -138,9 +139,16 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     old_session_id = cli.session_id
     old_session_start = cli.session_start
 
+    expected_history = list(cli.conversation_history)
     cli.process_command("/new")
 
     assert cli.session_id != old_session_id
+    cli.agent.route_memory_session.assert_called_once_with(
+        expected_history,
+        invocation_mode="manual",
+        source_event="new_session",
+    )
+    cli.agent.commit_memory_session.assert_called_once_with(expected_history)
 
     old_session = cli._session_db.get_session(old_session_id)
     assert old_session is not None

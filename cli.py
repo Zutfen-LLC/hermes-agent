@@ -5248,6 +5248,17 @@ class HermesCLI:
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         if self.agent and self.conversation_history:
+            # Route durable memory through the same manual contract used by
+            # /cca-remember before the session rotates, then perform the normal
+            # session-end flush. Dedupe in the router suppresses duplicate writes.
+            try:
+                self.agent.route_memory_session(
+                    list(self.conversation_history),
+                    invocation_mode="manual",
+                    source_event="new_session",
+                )
+            except Exception:
+                pass
             # Trigger memory extraction on the old session before session_id rotates.
             self.agent.commit_memory_session(self.conversation_history)
             self._notify_session_boundary("on_session_finalize")

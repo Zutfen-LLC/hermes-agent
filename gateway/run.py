@@ -7221,6 +7221,15 @@ class GatewayRunner:
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
 
+        # Route durable memory through the same manual contract used by
+        # /cca-remember before the session rotates. The router dedupes this
+        # against the subsequent session-reset flush, so the explicit trigger
+        # is safe to run here as part of /new and /reset.
+        try:
+            await self._handle_cca_remember_command(event)
+        except Exception:
+            pass
+
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
         # Guard with getattr because test fixtures may skip __init__.

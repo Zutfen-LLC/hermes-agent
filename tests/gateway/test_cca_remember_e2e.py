@@ -96,6 +96,38 @@ class _FakeAIAgent:
         )
 
 
+def test_gateway_new_command_routes_memory_before_reset(monkeypatch):
+    runner = _make_runner()
+    runner._handle_cca_remember_command = AsyncMock(return_value="🧠 3 routed")
+    runner._invalidate_session_run_generation = lambda *args, **kwargs: None
+    runner._evict_cached_agent = lambda *args, **kwargs: None
+    runner._clear_session_boundary_security_state = lambda *args, **kwargs: None
+    runner._format_session_info = lambda: ""
+    runner._telegram_topic_root_lobby = lambda *_args, **_kwargs: False
+    runner._telegram_topic_new_header = lambda *_args, **_kwargs: ""
+    runner.session_store._entries = {
+        build_session_key(_make_source()): SimpleNamespace(session_id="sess-old")
+    }
+    runner.session_store.reset_session = MagicMock(
+        return_value=SessionEntry(
+            session_key=build_session_key(_make_source()),
+            session_id="sess-new",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+        )
+    )
+
+    result = asyncio.get_event_loop().run_until_complete(
+        runner._handle_reset_command(_make_event("/new"))
+    )
+
+    runner._handle_cca_remember_command.assert_awaited_once()
+    runner.session_store.reset_session.assert_called_once_with(build_session_key(_make_source()))
+    assert isinstance(result, str)
+
+
 @pytest.mark.parametrize("command_text", ["/cca-remember", "/remember"])
 def test_gateway_dispatch_routes_memory_through_the_full_command_path(
     monkeypatch, command_text
