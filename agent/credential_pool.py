@@ -1397,12 +1397,12 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     changed = False
     active_sources: Set[str] = set()
 
-    # Match get_env_value precedence: an explicitly exported process env var
-    # wins, with ~/.hermes/.env as the fallback for non-CLI entry points that
-    # have not loaded dotenv into the process environment yet.
+    # Prefer ~/.hermes/.env over os.environ — the user's Hermes credential
+    # file is authoritative when both are present. Shell/env values remain a
+    # fallback for Docker, systemd, and other injected-runtime deployments.
     def _get_env_with_dotenv_fallback(key: str) -> str:
         env_file = load_env()
-        val = os.environ.get(key) or env_file.get(key) or ""
+        val = env_file.get(key) or os.environ.get(key) or ""
         return val.strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an

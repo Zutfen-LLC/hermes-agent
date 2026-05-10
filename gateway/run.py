@@ -7676,7 +7676,10 @@ class GatewayRunner:
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
             if count:
-                return t("gateway.draining", count=count)
+                message = t("gateway.draining", count=count)
+                if message == "gateway.draining":
+                    message = f"⏳ Draining {count} active agent(s) before restart..."
+                return message
             return EphemeralReply("⏳ Gateway restart already in progress...")
 
         # Save the requester's routing info so the new gateway process can
@@ -7728,7 +7731,10 @@ class GatewayRunner:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return t("gateway.draining", count=active_agents)
+            message = t("gateway.draining", count=active_agents)
+            if message == "gateway.draining":
+                message = f"⏳ Draining {active_agents} active agent(s) before restart..."
+            return message
         return EphemeralReply("♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`.")
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:

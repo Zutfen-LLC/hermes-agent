@@ -133,6 +133,30 @@ def _install_optional_dependency_stubs() -> None:
         _install_stub_module("fire", {"Fire": lambda *a, **k: None})
     if importlib.util.find_spec("dotenv") is None:
         _install_stub_module("dotenv", {"load_dotenv": lambda *a, **k: None})
+    if "botocore" not in sys.modules and importlib.machinery.PathFinder.find_spec("botocore") is None:
+        class _BotocoreSession:
+            def get_config_variable(self, name):
+                return None
+
+            def get_credentials(self):
+                return None
+
+        _botocore_session_mod = types.ModuleType("botocore.session")
+        _botocore_session_mod.get_session = lambda: _BotocoreSession()
+        _install_stub_module("botocore", {"session": _botocore_session_mod}, package=True)
+        sys.modules["botocore.session"] = _botocore_session_mod
+
+        _botocore_exceptions_mod = types.ModuleType("botocore.exceptions")
+        for _exc_name in (
+            "BotoCoreError",
+            "ClientError",
+            "ConnectionError",
+            "EndpointConnectionError",
+            "HTTPClientError",
+            "NoCredentialsError",
+        ):
+            setattr(_botocore_exceptions_mod, _exc_name, type(_exc_name, (Exception,), {}))
+        sys.modules["botocore.exceptions"] = _botocore_exceptions_mod
     if "chromadb" not in sys.modules and importlib.machinery.PathFinder.find_spec("chromadb") is None:
         class _Collection:
             def __init__(self):
@@ -605,6 +629,13 @@ def _reset_module_state():
     try:
         from tools import credential_files as _credf_mod
         _credf_mod._registered_files_var.set({})
+    except Exception:
+        pass
+
+    # --- tools.skill_provenance — write-origin ContextVar ---
+    try:
+        from tools import skill_provenance as _skill_prov_mod
+        _skill_prov_mod._write_origin.set("foreground")
     except Exception:
         pass
 

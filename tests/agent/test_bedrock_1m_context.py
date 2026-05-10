@@ -19,18 +19,18 @@ class TestBedrockContext1MBeta:
         from agent.anthropic_adapter import _COMMON_BETAS, _CONTEXT_1M_BETA
 
         assert _CONTEXT_1M_BETA == "context-1m-2025-08-07"
-        assert _CONTEXT_1M_BETA in _COMMON_BETAS
+        assert _CONTEXT_1M_BETA not in _COMMON_BETAS
 
     def test_common_betas_for_native_anthropic_includes_1m(self):
-        """Native Anthropic endpoints (and Bedrock with empty base_url) get 1M."""
+        """Native Anthropic endpoints do not get 1M by default."""
         from agent.anthropic_adapter import (
             _common_betas_for_base_url,
             _CONTEXT_1M_BETA,
         )
 
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(None)
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url("")
-        assert _CONTEXT_1M_BETA in _common_betas_for_base_url(
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url(None)
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url("")
+        assert _CONTEXT_1M_BETA not in _common_betas_for_base_url(
             "https://api.anthropic.com"
         )
 
@@ -99,7 +99,7 @@ class TestBedrockContext1MBeta:
             fast_mode=True,
         )
         beta_header = kwargs.get("extra_headers", {}).get("anthropic-beta", "")
-        assert "context-1m-2025-08-07" in beta_header, (
-            "fast-mode extra_headers must carry the 1M beta or it overrides "
-            "client-level default_headers and Bedrock drops back to 200K"
+        assert "context-1m-2025-08-07" not in beta_header, (
+            "native fast-mode extra_headers must not add the 1M beta because "
+            "some Anthropic subscriptions reject it"
         )
