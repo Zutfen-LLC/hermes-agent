@@ -45,9 +45,48 @@ _bedrock_runtime_client_cache: Dict[str, Any] = {}
 _bedrock_control_client_cache: Dict[str, Any] = {}
 
 
+def _ensure_smithy_aws_signature_type_compat() -> None:
+    """Patch smithy_aws_core enum drift before importing botocore.
+
+    Some boto/botocore installs can end up paired with a smithy_aws_core build
+    whose ``AwsSignatureType`` enum no longer exposes
+    ``HTTP_REQUEST_HEADERS``.  Newer botocore versions still reference that
+    member at import time.  Region and credential discovery should not fail
+    just because that optional dependency pair is skewed, so provide a best
+    effort alias to the first available enum member.
+    """
+    try:
+        from smithy_aws_core.identity import AwsSignatureType
+
+        if hasattr(AwsSignatureType, "HTTP_REQUEST_HEADERS"):
+            return
+        for candidate in (
+            "HTTP_REQUEST_VIA_HEADERS",
+            "HTTP_REQUEST",
+            "REQUEST_HEADERS",
+        ):
+            if hasattr(AwsSignatureType, candidate):
+                setattr(
+                    AwsSignatureType,
+                    "HTTP_REQUEST_HEADERS",
+                    getattr(AwsSignatureType, candidate),
+                )
+                return
+        try:
+            setattr(AwsSignatureType, "HTTP_REQUEST_HEADERS", next(iter(AwsSignatureType)))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_ensure_smithy_aws_signature_type_compat()
+
+
 def _require_boto3():
     """Import boto3, raising a clear error if not installed."""
     try:
+        _ensure_smithy_aws_signature_type_compat()
         import boto3
         return boto3
     except ImportError:
@@ -245,6 +284,7 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     # No env vars — check if boto3 can resolve credentials via IMDS or other
     # implicit sources (EC2 instance role, ECS task role, Lambda, etc.)
     try:
+        _ensure_smithy_aws_signature_type_compat()
         import botocore.session
         session = botocore.session.get_session()
         credentials = session.get_credentials()
@@ -276,6 +316,7 @@ def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     # metadata (IMDS), ECS container credentials, and other implicit sources
     # that don't set environment variables.
     try:
+        _ensure_smithy_aws_signature_type_compat()
         import botocore.session
         session = botocore.session.get_session()
         credentials = session.get_credentials()
@@ -310,6 +351,7 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     if explicit:
         return explicit
     try:
+        _ensure_smithy_aws_signature_type_compat()
         import botocore.session
         region = botocore.session.get_session().get_config_variable("region")
         if region:

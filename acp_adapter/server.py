@@ -304,11 +304,34 @@ class HermesACPAgent(acp.Agent):
         """Resolve ``provider:model`` input into the provider and normalized model id."""
         target_provider = current_provider
         new_model = raw_model.strip()
+        explicit_provider = None
+        explicit_model = None
+        colon = new_model.find(":")
+        if colon > 0:
+            provider_part = new_model[:colon].strip()
+            model_part = new_model[colon + 1:].strip()
+            if provider_part and model_part:
+                explicit_provider = provider_part
+                explicit_model = model_part
 
         try:
-            from hermes_cli.models import detect_provider_for_model, parse_model_input
+            from hermes_cli.models import (
+                _PROVIDER_LABELS,
+                detect_provider_for_model,
+                normalize_provider,
+                parse_model_input,
+            )
 
             target_provider, new_model = parse_model_input(new_model, current_provider)
+            if explicit_provider and explicit_model:
+                normalized_explicit = normalize_provider(explicit_provider)
+                if (
+                    normalized_explicit
+                    and normalized_explicit != "custom"
+                    and normalized_explicit in _PROVIDER_LABELS
+                    and target_provider != normalized_explicit
+                ):
+                    target_provider, new_model = normalized_explicit, explicit_model
             if target_provider == current_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
