@@ -10,7 +10,7 @@ import threading
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,8 @@ _ROUTING_CACHE_LOCK = threading.Lock()
 
 
 InvocationMode = Literal["manual", "pre_compress", "session_end"]
+MemoryDestination = Literal["native_user", "native_memory", "mempalace", "cca_lite"]
+MEMORY_DESTINATIONS: set[str] = {"native_user", "native_memory", "mempalace", "cca_lite"}
 
 
 def canonicalize_text(text: str) -> str:
@@ -118,24 +120,6 @@ def _collect_text(messages: list[dict[str, Any]], candidate_window: int | None =
     return combined[:4000]
 
 
-def _classify_native_target(text: str) -> str:
-    preference_markers = (
-        r"\bi prefer\b",
-        r"\bi like\b",
-        r"\bi want\b",
-        r"\bplease remember\b",
-        r"\bremember that\b",
-        r"\bmy preference\b",
-        r"\bdo not\b",
-        r"\bdon't\b",
-        r"\balways\b",
-        r"\bnever\b",
-    )
-    if any(re.search(pat, text, re.IGNORECASE) for pat in preference_markers):
-        return "user"
-    return "memory"
-
-
 def _entry_kind_for_target(target: str, text: str) -> str:
     if target == "user":
         return "preference"
@@ -144,6 +128,275 @@ def _entry_kind_for_target(target: str, text: str) -> str:
     if re.search(r"\bopen question\b|\bquestion\b|\btodo\b", text, re.IGNORECASE):
         return "open_question"
     return "operational_fact"
+
+
+def classify_memory_fact(content: str, requested_target: str = "memory") -> dict[str, Any]:
+    """Choose the canonical sink for a single durable fact before writing it."""
+    canonical_text = canonicalize_text(content)
+    requested_target = requested_target if requested_target in ("memory", "user") else "memory"
+
+    user_patterns = (
+        r"\bi prefer\b",
+        r"\bmy preference\b",
+        r"\bmy timezone\b",
+        r"\bmy role\b",
+        r"\bmy coding style\b",
+        r"\bmy name is\b",
+        r"\bcall me\b",
+        r"\bi am\b",
+        r"\bi'm\b",
+        r"\bthe user prefers\b",
+        r"\bthe user is\b",
+        r"\bthe user's\b",
+        r"\bthe user likes\b",
+        r"\bthe user wants\b",
+        r"\bthe user expects\b",
+        r"\buser correction\b",
+        r"\bpersonal correction\b",
+        r"\bdon't do that again\b",
+        r"\bdo not do that again\b",
+    )
+    if requested_target == "user" or any(re.search(pat, canonical_text, re.IGNORECASE) for pat in user_patterns):
+        return {
+            "canonical_destination": "native_user",
+            "native_target": "user",
+            "entry_kind": "preference",
+            "reason": "user_or_person_specific",
+        }
+
+    repo_patterns = (
+        r"\bthis repo\b",
+        r"\bthis repository\b",
+        r"\bthis codebase\b",
+        r"\bcurrent repo\b",
+        r"\bcurrent project\b",
+        r"\bproject-specific\b",
+        r"\brepo-local\b",
+        r"\bbelongs in git\b",
+        r"\bdocs/cca-lite\b",
+        r"\bhermes-memory\.json\b",
+        r"\bdecision\b",
+        r"\binvariant\b",
+        r"\bconvention\b",
+    )
+    if any(re.search(pat, canonical_text, re.IGNORECASE) for pat in repo_patterns):
+        return {
+            "canonical_destination": "cca_lite",
+            "native_target": None,
+            "entry_kind": _entry_kind_for_target("memory", canonical_text),
+            "reason": "repo_local_project_state",
+        }
+
+    cross_project_patterns = (
+        r"\bcross-project\b",
+        r"\bacross projects\b",
+        r"\bacross repos\b",
+        r"\breusable\b",
+        r"\bsemantic recall\b",
+        r"\boperational lesson\b",
+        r"\bnot tied to (one|a|this) repo\b",
+        r"\bacross sessions\b",
+        r"\bgeneral lesson\b",
+    )
+    if any(re.search(pat, canonical_text, re.IGNORECASE) for pat in cross_project_patterns):
+        return {
+            "canonical_destination": "mempalace",
+            "native_target": None,
+            "entry_kind": "operational_fact",
+            "reason": "cross_project_reusable_knowledge",
+        }
+
+    environment_patterns = (
+        r"\benvironment\b",
+        r"\bsetup\b",
+        r"\binstalled\b",
+        r"\bthis machine\b",
+        r"\btoolchain\b",
+        r"\bos\b",
+        r"\bhermes home\b",
+        r"\bapi key\b",
+        r"\bconfig\b",
+    )
+    if any(re.search(pat, canonical_text, re.IGNORECASE) for pat in environment_patterns):
+        return {
+            "canonical_destination": "native_memory",
+            "native_target": "memory",
+            "entry_kind": "operational_fact",
+            "reason": "stable_environment_or_setup_fact",
+        }
+
+    return {
+        "canonical_destination": "native_memory",
+        "native_target": "memory",
+        "entry_kind": _entry_kind_for_target("memory", canonical_text),
+        "reason": "default_native_memory",
+    }
+
+
+def _fallback_destinations(destination: MemoryDestination, routing: dict[str, Any]) -> list[MemoryDestination]:
+    if destination in ("native_user", "native_memory"):
+        if routing.get("entry_kind") in ("decision", "open_question"):
+            return ["cca_lite", "mempalace"]
+        if routing.get("reason") == "cross_project_reusable_knowledge":
+            return ["mempalace", "cca_lite"]
+        return ["mempalace", "cca_lite"]
+    if destination == "mempalace":
+        return ["native_memory", "cca_lite"]
+    if destination == "cca_lite":
+        return ["mempalace", "native_memory"]
+    return ["native_memory"]
+
+
+def _reviewed_routing(
+    heuristic_routing: dict[str, Any],
+    *,
+    canonical_destination: str | None = None,
+    classification_reason: str | None = None,
+) -> dict[str, Any]:
+    routing = dict(heuristic_routing)
+    heuristic_destination = str(heuristic_routing.get("canonical_destination", ""))
+    reviewed_destination = str(canonical_destination or "").strip()
+    routing["classification_source"] = "heuristic"
+    routing["heuristic_destination"] = heuristic_destination
+
+    if not reviewed_destination:
+        return routing
+
+    review = {
+        "requested_destination": reviewed_destination,
+        "accepted": reviewed_destination in MEMORY_DESTINATIONS,
+    }
+    if classification_reason:
+        review["reason"] = classification_reason.strip()
+    routing["agent_review"] = review
+
+    if reviewed_destination not in MEMORY_DESTINATIONS:
+        return routing
+
+    routing["classification_source"] = "agent_review"
+    routing["canonical_destination"] = reviewed_destination
+    routing["reason"] = classification_reason.strip() if classification_reason else "agent_review"
+    if reviewed_destination == "native_user":
+        routing["native_target"] = "user"
+        routing["entry_kind"] = "preference"
+    elif reviewed_destination == "native_memory":
+        routing["native_target"] = "memory"
+        routing["entry_kind"] = str(routing.get("entry_kind") or "operational_fact")
+    else:
+        routing["native_target"] = None
+        routing["entry_kind"] = str(routing.get("entry_kind") or "operational_fact")
+    return routing
+
+
+def route_memory_tool_write(
+    *,
+    requested_target: str,
+    content: str,
+    native_add: Callable[[str, str], dict[str, Any]],
+    session_id: str = "",
+    source_event: str = "memory_tool",
+    invocation_mode: InvocationMode = "manual",
+    canonical_destination: str | None = None,
+    classification_reason: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Route one memory-tool add to its canonical sink, with explicit fallback metadata."""
+    config = config or {}
+    routing = _reviewed_routing(
+        classify_memory_fact(content, requested_target),
+        canonical_destination=canonical_destination,
+        classification_reason=classification_reason,
+    )
+    destination: MemoryDestination = routing["canonical_destination"]
+    canonical_text = canonicalize_text(content)
+    entry_kind = str(routing.get("entry_kind") or "operational_fact")
+    session_key = session_id or "__memory_tool__"
+    fallback_attempted = False
+    attempts: list[dict[str, Any]] = []
+
+    def _metadata(
+        *,
+        actual_sink: str | None,
+        fallback: bool = False,
+        rerouted: bool = False,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        meta = {
+            "requested_target": requested_target,
+            "canonical_destination": destination,
+            "actual_sink": actual_sink,
+            "rerouted": rerouted,
+            "fallback": fallback,
+            "routing_reason": routing.get("reason"),
+            "classification_source": routing.get("classification_source", "heuristic"),
+            "heuristic_destination": routing.get("heuristic_destination"),
+            "agent_review": routing.get("agent_review"),
+            "attempts": attempts,
+        }
+        if error:
+            meta["error"] = error
+        return meta
+
+    def _write(dest: MemoryDestination) -> dict[str, Any]:
+        if dest == "native_user":
+            return native_add("user", content)
+        if dest == "native_memory":
+            return native_add("memory", content)
+        if dest == "mempalace":
+            return _mempalace_route(content, invocation_mode, config=config)
+        if dest == "cca_lite":
+            _, fingerprint = fingerprint_candidate("cca_lite", entry_kind, canonical_text, session_key)
+            return _route_to_cca_lite(
+                session_id=session_id,
+                invocation_mode=invocation_mode,
+                source_event=source_event,
+                entry_kind=entry_kind,
+                text=content,
+                canonical_text=canonical_text,
+                fingerprint=fingerprint,
+                config=config,
+            )
+        return {"success": False, "error": f"unknown destination {dest}"}
+
+    destinations = [destination] + _fallback_destinations(destination, routing)
+    seen_destinations: set[str] = set()
+    last_error = "no sink accepted the fact"
+
+    for candidate in destinations:
+        if candidate in seen_destinations:
+            continue
+        seen_destinations.add(candidate)
+        try:
+            result = _write(candidate)
+        except Exception as exc:
+            result = {"success": False, "error": str(exc)}
+
+        attempts.append({
+            "destination": candidate,
+            "success": bool(result.get("success")),
+            "mode": result.get("mode"),
+            "reason": result.get("reason"),
+            "error": result.get("error"),
+        })
+
+        disabled = result.get("success") and result.get("mode") == "disabled"
+        if result.get("success") and not disabled:
+            result = dict(result)
+            result["routing"] = _metadata(
+                actual_sink=candidate,
+                fallback=fallback_attempted,
+                rerouted=candidate != destination,
+            )
+            return result
+
+        last_error = str(result.get("reason") or result.get("error") or "sink unavailable")
+        fallback_attempted = True
+
+    return {
+        "success": False,
+        "error": last_error,
+        "routing": _metadata(actual_sink=None, fallback=fallback_attempted, error=last_error),
+    }
 
 
 def _resolve_mempalace_config(config: dict[str, Any] | None = None) -> tuple[str, list[tuple[list[re.Pattern], str, str]]]:
@@ -303,7 +556,7 @@ def route_memory_candidates(
     candidate_window: int | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Route a session slice into native memory, MemPalace, and cca-lite."""
+    """Route a session slice to one canonical durable memory sink."""
     session_key = session_id or "__global__"
     config = config or {}
     content = _collect_text(messages, candidate_window=candidate_window)
@@ -319,76 +572,60 @@ def route_memory_candidates(
             "summary": "No durable memory candidates found.",
         }
 
-    native_target = _classify_native_target(canonical_text)
-    native_kind = _entry_kind_for_target(native_target, canonical_text)
-    mempalace_kind = _entry_kind_for_target("memory", canonical_text)
-    cca_kind = native_kind
+    routing = classify_memory_fact(content, "memory")
+    destination = routing["canonical_destination"]
+    entry_kind = str(routing.get("entry_kind") or "operational_fact")
+    _, fingerprint = fingerprint_candidate(destination, entry_kind, canonical_text, session_key)
 
     routed: list[dict[str, Any]] = []
     suppressed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
 
-    def _route_destination(destination: str, entry_kind: str, writer) -> None:
-        _, fingerprint = fingerprint_candidate(destination, entry_kind, canonical_text, session_key)
-        if has_seen(session_key, fingerprint):
-            suppressed.append({
-                "destination": destination,
-                "entry_kind": entry_kind,
-                "fingerprint": fingerprint,
-                "reason": "session_duplicate",
-            })
-            return
-
-        result = writer(fingerprint)
-        if result.get("success"):
-            status = "no_op" if result.get("mode") == "disabled" else ("written" if result.get("appended", True) else "no_op")
-            routed.append({
-                "destination": destination,
-                "entry_kind": entry_kind,
-                "fingerprint": fingerprint,
-                "status": status,
-            })
-            mark_seen(session_key, fingerprint)
-            return
-
-        failed.append({
+    if has_seen(session_key, fingerprint):
+        suppressed.append({
             "destination": destination,
-            "error": result.get("error", "unknown error"),
+            "entry_kind": entry_kind,
+            "fingerprint": fingerprint,
+            "reason": "session_duplicate",
         })
-
-    if memory_store is not None:
-        def _write_native(_: str) -> dict[str, Any]:
+    else:
+        def _native_add(target: str, text: str) -> dict[str, Any]:
+            if memory_store is None:
+                return {"success": False, "mode": "disabled", "error": "native memory store not available"}
             try:
-                return memory_store.add(native_target, content)
+                return memory_store.add(target, text)
             except Exception as exc:
                 return {"success": False, "error": str(exc)}
 
-        _route_destination("native_memory", native_kind, _write_native)
-
-    def _write_mempalace(_: str) -> dict[str, Any]:
-        try:
-            return _mempalace_route(content, invocation_mode, config=config)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-    _route_destination("mempalace", mempalace_kind, _write_mempalace)
-
-    def _write_cca_lite(fingerprint: str) -> dict[str, Any]:
-        try:
-            return _route_to_cca_lite(
-                session_id=session_id,
-                invocation_mode=invocation_mode,
-                source_event=source_event,
-                entry_kind=cca_kind,
-                text=content,
-                canonical_text=canonical_text,
-                fingerprint=fingerprint,
-                config=config,
-            )
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-    _route_destination("cca_lite", cca_kind, _write_cca_lite)
+        result = route_memory_tool_write(
+            requested_target=str(routing.get("native_target") or "memory"),
+            content=content,
+            native_add=_native_add,
+            session_id=session_id,
+            source_event=source_event,
+            invocation_mode=invocation_mode,
+            config=config,
+        )
+        result_routing = result.get("routing", {}) if isinstance(result, dict) else {}
+        actual_sink = result_routing.get("actual_sink")
+        if result.get("success"):
+            routed.append({
+                "destination": actual_sink,
+                "canonical_destination": result_routing.get("canonical_destination"),
+                "entry_kind": entry_kind,
+                "fingerprint": fingerprint,
+                "status": "written" if result.get("appended", True) else "no_op",
+                "fallback": bool(result_routing.get("fallback")),
+                "rerouted": bool(result_routing.get("rerouted")),
+                "routing": result_routing,
+            })
+            mark_seen(session_key, fingerprint)
+        else:
+            failed.append({
+                "destination": destination,
+                "error": result.get("error", "unknown error"),
+                "routing": result_routing,
+            })
 
     written = len([item for item in routed if item.get("status") == "written"])
     skipped = len([item for item in routed if item.get("status") != "written"])

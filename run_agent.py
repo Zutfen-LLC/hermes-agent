@@ -9568,19 +9568,39 @@ class AIAgent:
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
+                session_id=self.session_id or "",
+                source_event="memory_tool",
+                canonical_destination=function_args.get("canonical_destination"),
+                classification_reason=function_args.get("classification_reason"),
+                config=getattr(self, "config", None),
             )
-            # Bridge: notify external memory provider of built-in memory writes
+            try:
+                _memory_result = json.loads(result) if isinstance(result, str) else {}
+            except Exception:
+                _memory_result = {}
+            _routing = _memory_result.get("routing") if isinstance(_memory_result, dict) else {}
+            _actual_sink = _routing.get("actual_sink") if isinstance(_routing, dict) else None
+            _canonical_sink = _routing.get("canonical_destination") if isinstance(_routing, dict) else None
+            # Bridge: notify external memory providers only for accepted native writes.
             if self._memory_manager and function_args.get("action") in ("add", "replace"):
                 try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                        metadata=self._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
-                    )
+                    if (
+                        _memory_result.get("success")
+                        and _actual_sink in ("native_user", "native_memory")
+                        and _canonical_sink == _actual_sink
+                    ):
+                        self._memory_manager.on_memory_write(
+                            function_args.get("action", ""),
+                            "user" if _actual_sink == "native_user" else "memory",
+                            function_args.get("content", ""),
+                            metadata={
+                                **self._build_memory_write_metadata(
+                                    task_id=effective_task_id,
+                                    tool_call_id=tool_call_id,
+                                ),
+                                "memory_routing": _routing,
+                            },
+                        )
                 except Exception:
                     pass
             return result
@@ -10175,19 +10195,39 @@ class AIAgent:
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
+                    session_id=self.session_id or "",
+                    source_event="memory_tool",
+                    canonical_destination=function_args.get("canonical_destination"),
+                    classification_reason=function_args.get("classification_reason"),
+                    config=getattr(self, "config", None),
                 )
-                # Bridge: notify external memory provider of built-in memory writes
+                try:
+                    _memory_result = json.loads(function_result) if isinstance(function_result, str) else {}
+                except Exception:
+                    _memory_result = {}
+                _routing = _memory_result.get("routing") if isinstance(_memory_result, dict) else {}
+                _actual_sink = _routing.get("actual_sink") if isinstance(_routing, dict) else None
+                _canonical_sink = _routing.get("canonical_destination") if isinstance(_routing, dict) else None
+                # Bridge: notify external memory providers only for accepted native writes.
                 if self._memory_manager and function_args.get("action") in ("add", "replace"):
                     try:
-                        self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
-                            target,
-                            function_args.get("content", ""),
-                            metadata=self._build_memory_write_metadata(
-                                task_id=effective_task_id,
-                                tool_call_id=getattr(tool_call, "id", None),
-                            ),
-                        )
+                        if (
+                            _memory_result.get("success")
+                            and _actual_sink in ("native_user", "native_memory")
+                            and _canonical_sink == _actual_sink
+                        ):
+                            self._memory_manager.on_memory_write(
+                                function_args.get("action", ""),
+                                "user" if _actual_sink == "native_user" else "memory",
+                                function_args.get("content", ""),
+                                metadata={
+                                    **self._build_memory_write_metadata(
+                                        task_id=effective_task_id,
+                                        tool_call_id=getattr(tool_call, "id", None),
+                                    ),
+                                    "memory_routing": _routing,
+                                },
+                            )
                     except Exception:
                         pass
                 tool_duration = time.time() - tool_start_time

@@ -35,5 +35,16 @@ def test_memory_schema_requires_old_text_for_remove_action():
     assert remove_requirements == [["old_text"]]
 
 
+def test_memory_schema_allows_agent_reviewed_canonical_destination():
+    props = MEMORY_SCHEMA["parameters"]["properties"]
+    assert props["canonical_destination"]["enum"] == [
+        "native_user",
+        "native_memory",
+        "mempalace",
+        "cca_lite",
+    ]
+    assert "classification_reason" in props
+
+
 def test_memory_schema_is_json_serializable():
     json.dumps(MEMORY_SCHEMA)
