@@ -10,6 +10,7 @@ Covers all error paths in run_agent.py's run_conversation() for api_mode=anthrop
 """
 
 import asyncio
+import signal
 import sys
 import types
 from types import SimpleNamespace
@@ -193,6 +194,15 @@ def _make_agent_cls(error_cls, recover_after=None):
 
 def _run_with_agent(monkeypatch, agent_cls):
     """Run _run_agent through the gateway with the given agent class."""
+    if sys.platform != "win32":
+        # These tests intentionally exercise the full gateway runner around
+        # the agent retry loop. On the self-hosted CI runner, plugin discovery
+        # plus xdist load can occasionally push that path past the suite's
+        # default 30s SIGALRM even though the retry backoff itself is patched
+        # out. Keep a hard cap, but give this integration-shaped helper enough
+        # room to finish.
+        signal.alarm(90)
+
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(
         "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
@@ -209,6 +219,12 @@ def _run_with_agent(monkeypatch, agent_cls):
         },
     )
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_reload_runtime_env_preserving_config_authority", lambda: None
+    )
 
     runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
     runner.adapters = {}
@@ -298,6 +314,12 @@ def test_401_credential_refresh_recovers(monkeypatch):
         "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
     )
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_reload_runtime_env_preserving_config_authority", lambda: None
+    )
 
     refresh_count = {"n": 0}
 
@@ -382,6 +404,12 @@ def test_401_refresh_fails_is_non_retryable(monkeypatch):
         "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
     )
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_reload_runtime_env_preserving_config_authority", lambda: None
+    )
 
     class _Auth401AlwaysFailAgent(run_agent.AIAgent):
         def __init__(self, *args, **kwargs):
@@ -457,6 +485,12 @@ def test_prompt_too_long_triggers_compression(monkeypatch):
         "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
     )
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run, "_reload_runtime_env_preserving_config_authority", lambda: None
+    )
 
     class _PromptTooLongThenSuccessAgent(run_agent.AIAgent):
         compress_called = 0
