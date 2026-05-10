@@ -406,7 +406,7 @@ class BaseEnvironment(ABC):
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
-        parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
+        parts.append(f"builtin cd -- {quoted_cwd} || exit 126  # cd {quoted_cwd}")
 
         # Run the actual command
         parts.append(f"eval '{escaped}'")
@@ -783,4 +783,3 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
-

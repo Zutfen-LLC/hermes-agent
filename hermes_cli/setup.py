@@ -2364,20 +2364,34 @@ def _setup_webhooks():
 
 def setup_gateway(config: dict):
     """Configure messaging platform integrations."""
-    from hermes_cli.gateway import _all_platforms, _platform_status, _configure_platform
+    from hermes_cli import gateway as gateway_mod
 
     print_header("Messaging Platforms")
     print_info("Connect to messaging platforms to chat with Hermes from anywhere.")
     print_info("Toggle with Space, confirm with Enter.")
     print()
 
-    platforms = _all_platforms()
+    platforms = gateway_mod._all_platforms()
+
+    def _status_for_setup(plat: dict) -> str:
+        original_get_env_value = gateway_mod.get_env_value
+        gateway_mod.get_env_value = get_env_value
+        try:
+            platform = {k: v for k, v in plat.items() if k != "_registry_entry"}
+            status = gateway_mod._platform_status(platform)
+            if status != "not configured" or platform.get("token_var"):
+                return status
+            return gateway_mod._platform_status(plat)
+        finally:
+            gateway_mod.get_env_value = original_get_env_value
 
     # Build checklist, pre-selecting already-configured platforms.
     items = []
     pre_selected = []
+    statuses = []
     for i, plat in enumerate(platforms):
-        status = _platform_status(plat)
+        status = _status_for_setup(plat)
+        statuses.append(status)
         items.append(f"{plat['emoji']} {plat['label']}  ({status})")
         if status == "configured":
             pre_selected.append(i)
@@ -2389,7 +2403,9 @@ def setup_gateway(config: dict):
         return
 
     for idx in selected:
-        _configure_platform(platforms[idx])
+        if statuses[idx] == "configured":
+            continue
+        gateway_mod._configure_platform(platforms[idx])
 
     # ── Gateway Service Setup ──
     # Count any platform (built-in or plugin) the user configured during this
@@ -2404,7 +2420,7 @@ def setup_gateway(config: dict):
         )
 
     any_messaging = any(
-        _is_progress(_platform_status(p)) for p in _all_platforms()
+        _is_progress(_status_for_setup(p)) for p in gateway_mod._all_platforms()
     )
     if any_messaging:
         print()
@@ -2694,16 +2710,27 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
         return f"max turns: {max_turns}"
 
     elif section_key == "gateway":
-        from hermes_cli.gateway import _all_platforms, _platform_status
+        from hermes_cli import gateway as gateway_mod
         # Count any non-empty status other than the "not configured" sentinel —
         # platforms like WhatsApp ("enabled, not paired"), Matrix ("configured
         # + E2EE"), and Signal ("partially configured") all indicate the user
         # has already started setup and we shouldn't force the section to rerun.
-        configured = [
-            _gateway_platform_short_label(plat["label"])
-            for plat in _all_platforms()
-            if _platform_status(plat) and _platform_status(plat) != "not configured"
-        ]
+        configured = []
+        original_get_env_value = gateway_mod.get_env_value
+        gateway_mod.get_env_value = get_env_value
+        try:
+            for plat in gateway_mod._all_platforms():
+                # The setup summary should be based on the same env/config
+                # reader this module uses so tests and migrations can isolate
+                # the environment. Avoid registry check_fn/is_connected here;
+                # those may consult the real process env and create false
+                # positives for platforms such as Teams in CI.
+                platform = {k: v for k, v in plat.items() if k != "_registry_entry"}
+                status = gateway_mod._platform_status(platform)
+                if status and status != "not configured":
+                    configured.append(_gateway_platform_short_label(plat["label"]))
+        finally:
+            gateway_mod.get_env_value = original_get_env_value
         if configured:
             return ", ".join(configured)
         return None  # No platforms configured — section must run

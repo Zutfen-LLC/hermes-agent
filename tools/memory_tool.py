@@ -468,6 +468,11 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     store: Optional[MemoryStore] = None,
+    session_id: str = "",
+    source_event: str = "memory_tool",
+    canonical_destination: str = None,
+    classification_reason: str = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -483,7 +488,37 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        try:
+            from agent.memory_router import route_memory_tool_write
+            if config is None:
+                try:
+                    from hermes_cli.config import load_config
+                    config = load_config()
+                except Exception:
+                    config = {}
+            result = route_memory_tool_write(
+                requested_target=target,
+                content=content,
+                native_add=store.add,
+                session_id=session_id,
+                source_event=source_event,
+                canonical_destination=canonical_destination,
+                classification_reason=classification_reason,
+                config=config,
+            )
+        except Exception as exc:
+            logger.debug("canonical memory routing failed; falling back to native %s: %s", target, exc)
+            result = store.add(target, content)
+            result["routing"] = {
+                "requested_target": target,
+                "canonical_destination": "native_user" if target == "user" else "native_memory",
+                "actual_sink": "native_user" if target == "user" else "native_memory",
+                "rerouted": False,
+                "fallback": True,
+                "routing_reason": "router_exception_native_fallback",
+                "classification_source": "native_fallback",
+                "error": str(exc),
+            }
 
     elif action == "replace":
         if not old_text:
@@ -491,11 +526,31 @@ def memory_tool(
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
         result = store.replace(target, old_text, content)
+        if result.get("success"):
+            result["routing"] = {
+                "requested_target": target,
+                "canonical_destination": "native_user" if target == "user" else "native_memory",
+                "actual_sink": "native_user" if target == "user" else "native_memory",
+                "rerouted": False,
+                "fallback": False,
+                "routing_reason": "native_replace",
+                "classification_source": "native_existing_entry",
+            }
 
     elif action == "remove":
         if not old_text:
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
+        if result.get("success"):
+            result["routing"] = {
+                "requested_target": target,
+                "canonical_destination": "native_user" if target == "user" else "native_memory",
+                "actual_sink": "native_user" if target == "user" else "native_memory",
+                "rerouted": False,
+                "fallback": False,
+                "routing_reason": "native_remove",
+                "classification_source": "native_existing_entry",
+            }
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
@@ -516,8 +571,10 @@ MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
         "Save durable information to persistent memory that survives across sessions. "
-        "Memory is injected into future turns, so keep it compact and focused on facts "
-        "that will still matter later.\n\n"
+        "Hermes routes each added fact to one canonical durable sink: native user/profile "
+        "memory, native agent memory, MemPalace, or repo-local cca-lite. Native memory is "
+        "injected into future turns, so keep entries compact and focused on facts that "
+        "will still matter later.\n\n"
         "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
         "- User corrects you or says 'remember this' / 'don't do that again'\n"
         "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
@@ -532,7 +589,11 @@ MEMORY_SCHEMA = {
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'memory': durable notes -- environment facts, reusable lessons, project conventions, tool quirks\n\n"
+        "Routing: user/person facts stay in native user memory; stable environment/setup facts "
+        "stay in native agent memory; cross-project reusable lessons go to MemPalace; "
+        "repo-local decisions, invariants, and conventions go to cca-lite. For add actions, "
+        "review the fact yourself and set canonical_destination when the right sink is clear.\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
@@ -557,6 +618,20 @@ MEMORY_SCHEMA = {
             "old_text": {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
+            },
+            "canonical_destination": {
+                "type": "string",
+                "enum": ["native_user", "native_memory", "mempalace", "cca_lite"],
+                "description": (
+                    "Optional reviewed canonical sink for add actions. Use native_user for "
+                    "user/person facts, native_memory for stable setup facts, mempalace for "
+                    "cross-project reusable knowledge, and cca_lite for repo-local decisions, "
+                    "invariants, and conventions."
+                ),
+            },
+            "classification_reason": {
+                "type": "string",
+                "description": "Short reason for the reviewed canonical_destination."
             },
         },
         "required": ["action", "target"],
@@ -599,11 +674,9 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        canonical_destination=args.get("canonical_destination"),
+        classification_reason=args.get("classification_reason"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-

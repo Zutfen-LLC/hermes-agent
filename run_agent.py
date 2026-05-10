@@ -9568,19 +9568,39 @@ class AIAgent:
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
+                session_id=self.session_id or "",
+                source_event="memory_tool",
+                canonical_destination=function_args.get("canonical_destination"),
+                classification_reason=function_args.get("classification_reason"),
+                config=getattr(self, "config", None),
             )
-            # Bridge: notify external memory provider of built-in memory writes
+            try:
+                _memory_result = json.loads(result) if isinstance(result, str) else {}
+            except Exception:
+                _memory_result = {}
+            _routing = _memory_result.get("routing") if isinstance(_memory_result, dict) else {}
+            _actual_sink = _routing.get("actual_sink") if isinstance(_routing, dict) else None
+            _canonical_sink = _routing.get("canonical_destination") if isinstance(_routing, dict) else None
+            # Bridge: notify external memory providers only for accepted native writes.
             if self._memory_manager and function_args.get("action") in ("add", "replace"):
                 try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                        metadata=self._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
-                    )
+                    if (
+                        _memory_result.get("success")
+                        and _actual_sink in ("native_user", "native_memory")
+                        and _canonical_sink == _actual_sink
+                    ):
+                        self._memory_manager.on_memory_write(
+                            function_args.get("action", ""),
+                            "user" if _actual_sink == "native_user" else "memory",
+                            function_args.get("content", ""),
+                            metadata={
+                                **self._build_memory_write_metadata(
+                                    task_id=effective_task_id,
+                                    tool_call_id=tool_call_id,
+                                ),
+                                "memory_routing": _routing,
+                            },
+                        )
                 except Exception:
                     pass
             return result
@@ -9703,10 +9723,12 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                guardrails = getattr(self, "_tool_guardrails", None)
+                if guardrails is not None:
+                    guardrail_decision = guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
@@ -9928,12 +9950,18 @@ class AIAgent:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
                 if not blocked:
-                    function_result = self._append_guardrail_observation(
-                        function_name,
-                        function_args,
-                        function_result,
-                        failed=is_error,
+                    append_guardrail_observation = getattr(
+                        self,
+                        "_append_guardrail_observation",
+                        None,
                     )
+                    if append_guardrail_observation is not None:
+                        function_result = append_guardrail_observation(
+                            function_name,
+                            function_args,
+                            function_result,
+                            failed=is_error,
+                        )
 
                 if is_error:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
@@ -10175,19 +10203,39 @@ class AIAgent:
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
+                    session_id=self.session_id or "",
+                    source_event="memory_tool",
+                    canonical_destination=function_args.get("canonical_destination"),
+                    classification_reason=function_args.get("classification_reason"),
+                    config=getattr(self, "config", None),
                 )
-                # Bridge: notify external memory provider of built-in memory writes
+                try:
+                    _memory_result = json.loads(function_result) if isinstance(function_result, str) else {}
+                except Exception:
+                    _memory_result = {}
+                _routing = _memory_result.get("routing") if isinstance(_memory_result, dict) else {}
+                _actual_sink = _routing.get("actual_sink") if isinstance(_routing, dict) else None
+                _canonical_sink = _routing.get("canonical_destination") if isinstance(_routing, dict) else None
+                # Bridge: notify external memory providers only for accepted native writes.
                 if self._memory_manager and function_args.get("action") in ("add", "replace"):
                     try:
-                        self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
-                            target,
-                            function_args.get("content", ""),
-                            metadata=self._build_memory_write_metadata(
-                                task_id=effective_task_id,
-                                tool_call_id=getattr(tool_call, "id", None),
-                            ),
-                        )
+                        if (
+                            _memory_result.get("success")
+                            and _actual_sink in ("native_user", "native_memory")
+                            and _canonical_sink == _actual_sink
+                        ):
+                            self._memory_manager.on_memory_write(
+                                function_args.get("action", ""),
+                                "user" if _actual_sink == "native_user" else "memory",
+                                function_args.get("content", ""),
+                                metadata={
+                                    **self._build_memory_write_metadata(
+                                        task_id=effective_task_id,
+                                        tool_call_id=getattr(tool_call, "id", None),
+                                    ),
+                                    "memory_routing": _routing,
+                                },
+                            )
                     except Exception:
                         pass
                 tool_duration = time.time() - tool_start_time

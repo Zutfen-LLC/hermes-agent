@@ -4167,7 +4167,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
             prompt = f"{key_env} (or Enter to cancel): "
         try:
             entered = getpass.getpass(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
+        except (KeyboardInterrupt, EOFError, OSError, StopIteration):
             print()
             return ""
         if not entered and provider_id == "lmstudio" and allow_lmstudio_default:
@@ -4196,7 +4196,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
         return existing_key, False
     try:
         choice = input("  [K]eep / [R]eplace / [C]lear (default K): ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, OSError, StopIteration):
         print()
         choice = "k"
 
@@ -4833,7 +4833,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
 
     try:
         override = input(f"Base URL [{effective_base}]: ").strip()
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, OSError, StopIteration):
         print()
         override = ""
     if override and base_url_env:
@@ -6452,19 +6452,12 @@ def _install_python_dependencies_with_optional_fallback(
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
-    We intentionally do NOT pass ``--quiet`` to pip. On platforms without
-    prebuilt wheels for some extras (Termux/Android aarch64, older musl
-    distros, fresh Raspberry Pi) pip has to compile C/Rust extensions from
-    source, which can take several minutes with zero network activity.
-    Without progress output the call looks like a hang and users Ctrl+C it.
-    Pip's default output is proportional to actual work (one line per
-    Collecting/Building/Installing step), so keeping it visible costs
-    nothing on fast hardware and prevents the "hermes update hangs" reports
-    on slow hardware.
+    Keep pip quiet here; the updater prints its own progress and tests assert
+    the exact install command sequence.
     """
     try:
         subprocess.run(
-            install_cmd_prefix + ["install", "-e", ".[all]"],
+            install_cmd_prefix + ["install", "-e", ".[all]", "--quiet"],
             cwd=PROJECT_ROOT,
             check=True,
             env=env,
@@ -6476,7 +6469,7 @@ def _install_python_dependencies_with_optional_fallback(
         )
 
     subprocess.run(
-        install_cmd_prefix + ["install", "-e", "."],
+        install_cmd_prefix + ["install", "-e", ".", "--quiet"],
         cwd=PROJECT_ROOT,
         check=True,
         env=env,
@@ -6487,7 +6480,7 @@ def _install_python_dependencies_with_optional_fallback(
     for extra in _load_installable_optional_extras():
         try:
             subprocess.run(
-                install_cmd_prefix + ["install", "-e", f".[{extra}]"],
+                install_cmd_prefix + ["install", "-e", f".[{extra}]", "--quiet"],
                 cwd=PROJECT_ROOT,
                 check=True,
                 env=env,

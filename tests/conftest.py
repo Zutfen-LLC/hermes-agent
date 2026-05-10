@@ -76,7 +76,19 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     # These optional zstd entrypoints must fail fast with ImportError so
     # urllib3 falls back cleanly instead of binding a half-implemented stub.
     _BLOCKED_IMPORTS = {
+        "OpenSSL",
+        "atroposlib",
+        "awscrt",
+        "brotli",
+        "brotlicffi",
+        "chardet",
         "compression",
+        "PIL",
+        "psutil",
+        "python_socks",
+        "simplejson",
+        "tiktoken",
+        "zstd",
         "zstandard",
     }
 
@@ -124,6 +136,101 @@ def _install_optional_dependency_stubs() -> None:
         _install_stub_module("fire", {"Fire": lambda *a, **k: None})
     if importlib.util.find_spec("dotenv") is None:
         _install_stub_module("dotenv", {"load_dotenv": lambda *a, **k: None})
+    if "botocore" not in sys.modules or getattr(sys.modules.get("botocore"), "__hermes_test_stub__", False):
+        class _BotocoreSession:
+            def get_config_variable(self, name):
+                return None
+
+            def get_credentials(self):
+                return None
+
+        _botocore_session_mod = types.ModuleType("botocore.session")
+        _botocore_session_mod.get_session = lambda: _BotocoreSession()
+        _botocore_mod = types.ModuleType("botocore")
+        _botocore_mod.__hermes_test_stub__ = True
+        _botocore_mod.__path__ = []  # type: ignore[attr-defined]
+        _botocore_mod.session = _botocore_session_mod
+        sys.modules["botocore"] = _botocore_mod
+        sys.modules["botocore.session"] = _botocore_session_mod
+
+        _botocore_exceptions_mod = types.ModuleType("botocore.exceptions")
+
+        class BotoCoreError(Exception):
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+                message = args[0] if args else kwargs.get("message", "")
+                super().__init__(message)
+
+        class ClientError(BotoCoreError):
+            def __init__(self, error_response=None, operation_name=None, *args, **kwargs):
+                self.response = error_response or {}
+                self.operation_name = operation_name
+                super().__init__(*args, **kwargs)
+
+        class HTTPClientError(BotoCoreError):
+            pass
+
+        class ConnectionError(HTTPClientError):
+            pass
+
+        class EndpointConnectionError(ConnectionError):
+            pass
+
+        class ConnectionClosedError(ConnectionError):
+            pass
+
+        class ReadTimeoutError(HTTPClientError):
+            pass
+
+        class ConnectTimeoutError(HTTPClientError):
+            pass
+
+        class NoCredentialsError(BotoCoreError):
+            pass
+
+        for _exc in (
+            BotoCoreError,
+            ClientError,
+            ConnectionError,
+            EndpointConnectionError,
+            HTTPClientError,
+            NoCredentialsError,
+            ConnectionClosedError,
+            ReadTimeoutError,
+            ConnectTimeoutError,
+        ):
+            setattr(_botocore_exceptions_mod, _exc.__name__, _exc)
+        _botocore_mod.exceptions = _botocore_exceptions_mod
+        sys.modules["botocore.exceptions"] = _botocore_exceptions_mod
+    if "chromadb" not in sys.modules and importlib.machinery.PathFinder.find_spec("chromadb") is None:
+        class _Collection:
+            def __init__(self):
+                self._items: dict[str, tuple[str, dict]] = {}
+
+            def count(self):
+                return len(self._items)
+
+            def get(self, *args, **kwargs):
+                return {"ids": list(self._items), "documents": [], "metadatas": []}
+
+            def upsert(self, ids=None, documents=None, metadatas=None, **kwargs):
+                for item_id, document, metadata in zip(ids or [], documents or [], metadatas or []):
+                    self._items[str(item_id)] = (document, metadata)
+
+            def query(self, *args, **kwargs):
+                return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        class _PersistentClient:
+            def __init__(self, *args, **kwargs):
+                self._collection = _Collection()
+
+            def get_or_create_collection(self, *args, **kwargs):
+                return self._collection
+
+            def get_collection(self, *args, **kwargs):
+                return self._collection
+
+        _install_stub_module("chromadb", {"PersistentClient": _PersistentClient})
 
     if importlib.util.find_spec("prompt_toolkit") is None:
         _install_stub_module("prompt_toolkit", {"print_formatted_text": lambda *a, **k: None}, package=True)
@@ -159,6 +266,28 @@ if not any(isinstance(finder, _StubFinder) for finder in sys.meta_path):
 
 
 _install_optional_dependency_stubs()
+
+# Compression backends are optional. Some runner images provide incompatible
+# zstd modules that expose importable packages without the methods httpx/urllib3
+# expect, so force those imports down the same unavailable path as a missing
+# dependency.
+for _optional_compression_module in (
+    "OpenSSL",
+    "awscrt",
+    "brotli",
+    "brotlicffi",
+    "compression",
+    "python_socks",
+    "zstd",
+    "zstandard",
+):
+    sys.modules[_optional_compression_module] = None
+try:
+    import httpx._decoders as _httpx_decoders
+    _httpx_decoders.SUPPORTED_DECODERS.pop("br", None)
+    _httpx_decoders.SUPPORTED_DECODERS.pop("zstd", None)
+except Exception:
+    pass
 
 
 # Ensure project root is importable
@@ -421,6 +550,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
+    monkeypatch.setenv("HERMES_SKIP_USER_SYSTEMD_PREFLIGHT", "1")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
@@ -554,6 +684,13 @@ def _reset_module_state():
     try:
         from tools import credential_files as _credf_mod
         _credf_mod._registered_files_var.set({})
+    except Exception:
+        pass
+
+    # --- tools.skill_provenance — write-origin ContextVar ---
+    try:
+        from tools import skill_provenance as _skill_prov_mod
+        _skill_prov_mod._write_origin.set("foreground")
     except Exception:
         pass
 

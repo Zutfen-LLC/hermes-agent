@@ -237,14 +237,10 @@ def _supports_fast_mode(model: str) -> bool:
 # here so older Claude (4.5, 4.1) + compatible endpoints that still gate on
 # the headers continue to get the enhanced features.
 #
-# Do NOT include ``context-1m-2025-08-07`` here. Anthropic returns HTTP 400
-# ("long context beta is not yet available for this subscription") for
-# accounts without the long-context beta, which breaks normal short auxiliary
-# calls like title generation/session summarization.
-#
 # ``context-1m-2025-08-07`` is still required to unlock the 1M context window
-# on Claude Opus 4.6/4.7 and Sonnet 4.6 when served via AWS Bedrock or Azure
-# AI Foundry. Add it only for those endpoint-specific paths below.
+# on endpoint-specific paths below, but native Anthropic accounts without the
+# beta reject even short auxiliary requests when it is sent by default.
+_CONTEXT_1M_BETA = "context-1m-2025-08-07"
 _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
@@ -253,10 +249,6 @@ _COMMON_BETAS = [
 # the fine-grained tool streaming beta is present.  Omit it so tool calls
 # fall back to the provider's default response path.
 _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
-# 1M context beta. Native Anthropic does not get this by default because some
-# subscriptions reject it, but Bedrock/Azure still need it for 1M context.
-_CONTEXT_1M_BETA = "context-1m-2025-08-07"
-
 # Fast mode beta — enables the ``speed: "fast"`` request parameter for
 # significantly higher output token throughput on Opus 4.6 (~2.5x).
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
@@ -1969,5 +1961,3 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
-

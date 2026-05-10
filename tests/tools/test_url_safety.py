@@ -441,7 +441,10 @@ class TestIsAlwaysBlockedUrl:
     # -- Things the floor must NOT block ----------------------------------------
 
     def test_public_url_not_blocked(self):
-        assert is_always_blocked_url("https://example.com/path") is False
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+        ]):
+            assert is_always_blocked_url("https://example.com/path") is False
 
     @pytest.mark.parametrize("url", [
         "http://127.0.0.1:8080/",
