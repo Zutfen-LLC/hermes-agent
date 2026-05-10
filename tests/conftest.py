@@ -78,6 +78,7 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     _BLOCKED_IMPORTS = {
         "OpenSSL",
         "atroposlib",
+        "awscrt",
         "brotli",
         "brotlicffi",
         "chardet",
@@ -134,7 +135,7 @@ def _install_optional_dependency_stubs() -> None:
         _install_stub_module("fire", {"Fire": lambda *a, **k: None})
     if importlib.util.find_spec("dotenv") is None:
         _install_stub_module("dotenv", {"load_dotenv": lambda *a, **k: None})
-    if "botocore" not in sys.modules and importlib.machinery.PathFinder.find_spec("botocore") is None:
+    if "botocore" not in sys.modules:
         class _BotocoreSession:
             def get_config_variable(self, name):
                 return None
@@ -227,7 +228,7 @@ _install_optional_dependency_stubs()
 # zstd modules that expose importable packages without the methods httpx/urllib3
 # expect, so force those imports down the same unavailable path as a missing
 # dependency.
-for _optional_compression_module in ("OpenSSL", "brotli", "brotlicffi", "compression", "zstd", "zstandard"):
+for _optional_compression_module in ("OpenSSL", "awscrt", "brotli", "brotlicffi", "compression", "zstd", "zstandard"):
     sys.modules[_optional_compression_module] = None
 try:
     import httpx._decoders as _httpx_decoders

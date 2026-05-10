@@ -322,16 +322,18 @@ class HermesACPAgent(acp.Agent):
                 parse_model_input,
             )
 
-            target_provider, new_model = parse_model_input(new_model, current_provider)
             if explicit_provider and explicit_model:
                 normalized_explicit = normalize_provider(explicit_provider)
                 if (
                     normalized_explicit
                     and normalized_explicit != "custom"
-                    and normalized_explicit in _PROVIDER_LABELS
-                    and target_provider != normalized_explicit
+                    and (
+                        normalized_explicit in _PROVIDER_LABELS
+                        or normalized_explicit.startswith("custom:")
+                    )
                 ):
-                    target_provider, new_model = normalized_explicit, explicit_model
+                    return normalized_explicit, explicit_model
+            target_provider, new_model = parse_model_input(new_model, current_provider)
             if target_provider == current_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:

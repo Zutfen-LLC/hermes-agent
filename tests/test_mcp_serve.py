@@ -1092,12 +1092,15 @@ class TestEventBridgePollE2E:
         )
         conn.commit()
         conn.close()
-        # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
-        os.utime(db_path, None)
+        # Force mtimes past the first poll's cached values. Some CI filesystems
+        # coalesce rapid writes into the same timestamp tick.
+        future_mtime = time.time() + 2.0
+        os.utime(db_path, (future_mtime, future_mtime))
 
         # Update sessions.json updated_at to trigger re-check
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
         (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        os.utime(sessions_dir / "sessions.json", (future_mtime, future_mtime))
 
         # Second poll — should detect the new message
         bridge._poll_once(db)

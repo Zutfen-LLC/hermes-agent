@@ -135,7 +135,6 @@ class TestUpdateYesConfigMigration:
 class TestUpdateYesStashRestore:
     """--yes auto-restores the pre-update autostash without prompting."""
 
-    @patch("hermes_cli.main._restore_stashed_changes")
     @patch(
         "hermes_cli.main._stash_local_changes_if_needed",
         return_value="stash@{0}",
@@ -153,7 +152,6 @@ class TestUpdateYesStashRestore:
         _mock_missing_cfg,
         _mock_version,
         _mock_stash,
-        mock_restore,
         capsys,
     ):
         # Not on main → cmd_update switches to main → autostash fires.
@@ -169,15 +167,22 @@ class TestUpdateYesStashRestore:
         # — ``patch.object`` on the real streams is robust under xdist).
         import sys as _sys
 
-        with patch.object(_sys.stdin, "isatty", return_value=True), patch.object(
+        with patch("builtins.input") as mock_input, patch.object(
+            _sys.stdin, "isatty", return_value=True
+        ), patch.object(
             _sys.stdout, "isatty", return_value=True
         ):
             cmd_update(args)
 
-        # _restore_stashed_changes was called, and called with prompt_user=False
-        # every time (so the user never sees "Restore local changes now?").
-        assert mock_restore.called
-        for call in mock_restore.call_args_list:
-            assert call.kwargs.get("prompt_user") is False, (
-                f"Expected prompt_user=False under --yes, got {call.kwargs}"
-            )
+        # The stash was applied without prompting, which is the behavior users
+        # care about.  Avoid asserting through the helper's patch identity here:
+        # under full-suite import order the implementation can still be the
+        # callable that prints the restore line, making this unnecessarily flaky.
+        mock_input.assert_not_called()
+        assert any(
+            "stash apply stash@{0}" in " ".join(str(part) for part in call.args[0])
+            for call in mock_run.call_args_list
+        )
+        out = capsys.readouterr().out
+        assert "Restoring local changes" in out
+        assert "Restore local changes now?" not in out
