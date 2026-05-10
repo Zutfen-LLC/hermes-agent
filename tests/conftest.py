@@ -76,6 +76,7 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     # These optional zstd entrypoints must fail fast with ImportError so
     # urllib3 falls back cleanly instead of binding a half-implemented stub.
     _BLOCKED_IMPORTS = {
+        "OpenSSL",
         "atroposlib",
         "brotli",
         "brotlicffi",
@@ -226,7 +227,7 @@ _install_optional_dependency_stubs()
 # zstd modules that expose importable packages without the methods httpx/urllib3
 # expect, so force those imports down the same unavailable path as a missing
 # dependency.
-for _optional_compression_module in ("brotli", "brotlicffi", "compression", "zstd", "zstandard"):
+for _optional_compression_module in ("OpenSSL", "brotli", "brotlicffi", "compression", "zstd", "zstandard"):
     sys.modules[_optional_compression_module] = None
 try:
     import httpx._decoders as _httpx_decoders
@@ -496,6 +497,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
+    monkeypatch.setenv("HERMES_SKIP_USER_SYSTEMD_PREFLIGHT", "1")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the

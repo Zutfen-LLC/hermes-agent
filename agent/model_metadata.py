@@ -1286,7 +1286,7 @@ def get_model_context_length(
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
     exact_default = DEFAULT_CONTEXT_LENGTHS.get(model.lower())
-    if exact_default:
+    if exact_default and provider != "openai-codex":
         return exact_default
 
     # 1. Check persistent cache (model+provider)

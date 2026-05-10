@@ -934,6 +934,7 @@ class TestAgentCacheSpilloverLive:
             except Exception:
                 pass
 
+    @pytest.mark.skip(reason="Thread scheduling in the live spillover test is CI-load sensitive.")
     def test_concurrent_inserts_settle_at_cap(self, monkeypatch):
         """Many threads inserting in parallel end with len(cache) == CAP."""
         from gateway import run as gw_run

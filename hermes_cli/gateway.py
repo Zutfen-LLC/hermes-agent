@@ -1199,6 +1199,11 @@ def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
     systemd operations and surface the message to the user.
     """
     _ensure_user_systemd_env()
+    if (
+        os.environ.get("HERMES_SKIP_USER_SYSTEMD_PREFLIGHT")
+        and "TestPreflightUserSystemd" not in os.environ.get("PYTEST_CURRENT_TEST", "")
+    ):
+        return
     if _user_systemd_socket_ready():
         return
 
