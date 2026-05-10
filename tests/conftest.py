@@ -85,6 +85,7 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         "compression",
         "PIL",
         "psutil",
+        "python_socks",
         "simplejson",
         "tiktoken",
         "zstd",
@@ -228,7 +229,16 @@ _install_optional_dependency_stubs()
 # zstd modules that expose importable packages without the methods httpx/urllib3
 # expect, so force those imports down the same unavailable path as a missing
 # dependency.
-for _optional_compression_module in ("OpenSSL", "awscrt", "brotli", "brotlicffi", "compression", "zstd", "zstandard"):
+for _optional_compression_module in (
+    "OpenSSL",
+    "awscrt",
+    "brotli",
+    "brotlicffi",
+    "compression",
+    "python_socks",
+    "zstd",
+    "zstandard",
+):
     sys.modules[_optional_compression_module] = None
 try:
     import httpx._decoders as _httpx_decoders
