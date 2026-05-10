@@ -51,7 +51,7 @@ class _BenignProbeMethodFilter(logging.Filter):
             from acp.exceptions import RequestError
         except ImportError:
             return True
-        if not isinstance(exc, RequestError):
+        if not isinstance(exc, RequestError) and exc.__class__.__name__ != "RequestError":
             return True
         if getattr(exc, "code", None) != -32601:
             return True

@@ -76,7 +76,16 @@ class _StubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     # These optional zstd entrypoints must fail fast with ImportError so
     # urllib3 falls back cleanly instead of binding a half-implemented stub.
     _BLOCKED_IMPORTS = {
+        "atroposlib",
+        "brotli",
+        "brotlicffi",
+        "chardet",
         "compression",
+        "PIL",
+        "psutil",
+        "simplejson",
+        "tiktoken",
+        "zstd",
         "zstandard",
     }
 
@@ -124,6 +133,35 @@ def _install_optional_dependency_stubs() -> None:
         _install_stub_module("fire", {"Fire": lambda *a, **k: None})
     if importlib.util.find_spec("dotenv") is None:
         _install_stub_module("dotenv", {"load_dotenv": lambda *a, **k: None})
+    if "chromadb" not in sys.modules and importlib.machinery.PathFinder.find_spec("chromadb") is None:
+        class _Collection:
+            def __init__(self):
+                self._items: dict[str, tuple[str, dict]] = {}
+
+            def count(self):
+                return len(self._items)
+
+            def get(self, *args, **kwargs):
+                return {"ids": list(self._items), "documents": [], "metadatas": []}
+
+            def upsert(self, ids=None, documents=None, metadatas=None, **kwargs):
+                for item_id, document, metadata in zip(ids or [], documents or [], metadatas or []):
+                    self._items[str(item_id)] = (document, metadata)
+
+            def query(self, *args, **kwargs):
+                return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        class _PersistentClient:
+            def __init__(self, *args, **kwargs):
+                self._collection = _Collection()
+
+            def get_or_create_collection(self, *args, **kwargs):
+                return self._collection
+
+            def get_collection(self, *args, **kwargs):
+                return self._collection
+
+        _install_stub_module("chromadb", {"PersistentClient": _PersistentClient})
 
     if importlib.util.find_spec("prompt_toolkit") is None:
         _install_stub_module("prompt_toolkit", {"print_formatted_text": lambda *a, **k: None}, package=True)
@@ -159,6 +197,19 @@ if not any(isinstance(finder, _StubFinder) for finder in sys.meta_path):
 
 
 _install_optional_dependency_stubs()
+
+# Compression backends are optional. Some runner images provide incompatible
+# zstd modules that expose importable packages without the methods httpx/urllib3
+# expect, so force those imports down the same unavailable path as a missing
+# dependency.
+for _optional_compression_module in ("brotli", "brotlicffi", "compression", "zstd", "zstandard"):
+    sys.modules[_optional_compression_module] = None
+try:
+    import httpx._decoders as _httpx_decoders
+    _httpx_decoders.SUPPORTED_DECODERS.pop("br", None)
+    _httpx_decoders.SUPPORTED_DECODERS.pop("zstd", None)
+except Exception:
+    pass
 
 
 # Ensure project root is importable

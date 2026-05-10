@@ -9723,10 +9723,12 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                guardrails = getattr(self, "_tool_guardrails", None)
+                if guardrails is not None:
+                    guardrail_decision = guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
@@ -9948,12 +9950,18 @@ class AIAgent:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
                 if not blocked:
-                    function_result = self._append_guardrail_observation(
-                        function_name,
-                        function_args,
-                        function_result,
-                        failed=is_error,
+                    append_guardrail_observation = getattr(
+                        self,
+                        "_append_guardrail_observation",
+                        None,
                     )
+                    if append_guardrail_observation is not None:
+                        function_result = append_guardrail_observation(
+                            function_name,
+                            function_args,
+                            function_result,
+                            failed=is_error,
+                        )
 
                 if is_error:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
