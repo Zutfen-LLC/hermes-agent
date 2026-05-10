@@ -136,7 +136,7 @@ def _install_optional_dependency_stubs() -> None:
         _install_stub_module("fire", {"Fire": lambda *a, **k: None})
     if importlib.util.find_spec("dotenv") is None:
         _install_stub_module("dotenv", {"load_dotenv": lambda *a, **k: None})
-    if "botocore" not in sys.modules:
+    if "botocore" not in sys.modules or getattr(sys.modules.get("botocore"), "__hermes_test_stub__", False):
         class _BotocoreSession:
             def get_config_variable(self, name):
                 return None
@@ -146,19 +146,61 @@ def _install_optional_dependency_stubs() -> None:
 
         _botocore_session_mod = types.ModuleType("botocore.session")
         _botocore_session_mod.get_session = lambda: _BotocoreSession()
-        _install_stub_module("botocore", {"session": _botocore_session_mod}, package=True)
+        _botocore_mod = types.ModuleType("botocore")
+        _botocore_mod.__hermes_test_stub__ = True
+        _botocore_mod.__path__ = []  # type: ignore[attr-defined]
+        _botocore_mod.session = _botocore_session_mod
+        sys.modules["botocore"] = _botocore_mod
         sys.modules["botocore.session"] = _botocore_session_mod
 
         _botocore_exceptions_mod = types.ModuleType("botocore.exceptions")
-        for _exc_name in (
-            "BotoCoreError",
-            "ClientError",
-            "ConnectionError",
-            "EndpointConnectionError",
-            "HTTPClientError",
-            "NoCredentialsError",
+
+        class BotoCoreError(Exception):
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+                message = args[0] if args else kwargs.get("message", "")
+                super().__init__(message)
+
+        class ClientError(BotoCoreError):
+            def __init__(self, error_response=None, operation_name=None, *args, **kwargs):
+                self.response = error_response or {}
+                self.operation_name = operation_name
+                super().__init__(*args, **kwargs)
+
+        class HTTPClientError(BotoCoreError):
+            pass
+
+        class ConnectionError(HTTPClientError):
+            pass
+
+        class EndpointConnectionError(ConnectionError):
+            pass
+
+        class ConnectionClosedError(ConnectionError):
+            pass
+
+        class ReadTimeoutError(HTTPClientError):
+            pass
+
+        class ConnectTimeoutError(HTTPClientError):
+            pass
+
+        class NoCredentialsError(BotoCoreError):
+            pass
+
+        for _exc in (
+            BotoCoreError,
+            ClientError,
+            ConnectionError,
+            EndpointConnectionError,
+            HTTPClientError,
+            NoCredentialsError,
+            ConnectionClosedError,
+            ReadTimeoutError,
+            ConnectTimeoutError,
         ):
-            setattr(_botocore_exceptions_mod, _exc_name, type(_exc_name, (Exception,), {}))
+            setattr(_botocore_exceptions_mod, _exc.__name__, _exc)
+        _botocore_mod.exceptions = _botocore_exceptions_mod
         sys.modules["botocore.exceptions"] = _botocore_exceptions_mod
     if "chromadb" not in sys.modules and importlib.machinery.PathFinder.find_spec("chromadb") is None:
         class _Collection:

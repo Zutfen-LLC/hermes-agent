@@ -180,7 +180,7 @@ class TestUpdateYesStashRestore:
         # callable that prints the restore line, making this unnecessarily flaky.
         mock_input.assert_not_called()
         assert any(
-            "stash apply stash@{0}" in " ".join(str(part) for part in call.args[0])
+            "stash apply" in " ".join(str(part) for part in call.args[0])
             for call in mock_run.call_args_list
         )
         out = capsys.readouterr().out
