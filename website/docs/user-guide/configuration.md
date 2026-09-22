@@ -2910,6 +2910,9 @@ delegation:
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
+  allow_model_selection: false             # Opt in to bounded model-facing per-call/per-task compute selection
+  allowed_models: []                       # Exact model allowlist; provider/credentials/transport never change
+  allowed_reasoning_efforts: []            # Exact reasoning-effort allowlist
   compression_threshold_tokens: 0          # Optional absolute cap on a subagent's compaction trigger (>= 16000); 0 = off, children use the ratio threshold
   # request_overrides:                      # Per-child request settings sent on every subagent API call (all resolution branches).
   #   extra_body:                           # Merged into the request's extra_body — e.g. OpenRouter routing hints:
@@ -2923,6 +2926,8 @@ delegation:
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
+
+**Opt-in per-task compute selection:** Set `delegation.allow_model_selection: true` and populate `allowed_models` and/or `allowed_reasoning_efforts` to expose bounded `model` / `reasoning_effort` choices on `delegate_task`. The call-level fields are defaults for every spawned task; a value on an individual `tasks[]` entry wins for that child. Values use exact allowlist membership and the whole batch is rejected before any child starts if one task requests an unapproved value. Selection changes compute only: provider, endpoint, credentials, wire protocol, request overrides, ACP transport, and tool access remain operator-controlled. **Every allowlisted model must therefore be compatible with that configured provider and wire protocol; selection will not switch or re-resolve transport to make an incompatible model work.** Start a new session after changing these allowlists so the cached tool schema stays stable.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
 

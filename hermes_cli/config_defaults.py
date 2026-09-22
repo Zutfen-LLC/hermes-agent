@@ -1344,6 +1344,11 @@ DEFAULT_CONFIG = {
         # Subagent effort: "ultra" | "max" | "xhigh" | "high" | "medium" | "low" | "minimal" |
         # "none" (empty = inherit)
         "reasoning_effort": "",
+        # Optional model-facing compute selection. Disabled by default; when enabled the model
+        # may choose only exact operator-approved values and cannot change provider/transport.
+        "allow_model_selection": False,
+        "allowed_models": [],
+        "allowed_reasoning_efforts": [],
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,
