@@ -14,6 +14,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Used by the fork's validated upstream-sync promotion pipeline.
+  workflow_dispatch:
 
 permissions:
   contents: read

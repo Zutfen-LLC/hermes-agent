@@ -18,6 +18,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Fork automation validates an exact upstream-merge candidate before
+  # promoting it to main. workflow_dispatch runs fail-open through the
+  # classifier, so all applicable lanes execute.
+  workflow_dispatch:
 
 permissions:
   contents: read

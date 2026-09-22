@@ -1,0 +1,285 @@
+name: Validated upstream sync
+
+# Fork release-channel policy:
+#   NousResearch/main -> temporary merge candidate -> CI + Nix -> fork/main.
+# Local Hermes installs track fork origin/main, so "hermes update" only sees
+# upstream code after this workflow has validated and promoted it.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */4 * * *"
+  # Run once immediately when this machinery is installed or materially edited.
+  # A promotion normally does not touch these files, so this does not recurse.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/upstream-sync.yml"
+      - ".github/workflows/ci.yaml"
+      - ".github/workflows/nix.yml"
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: validated-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+  SYNC_BRANCH: automation/upstream-sync
+  BLOCKER_TITLE: "Upstream sync blocked"
+
+jobs:
+  prepare:
+    name: Build merge candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      needed: ${{ steps.prepare.outputs.needed }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      upstream_sha: ${{ steps.prepare.outputs.upstream_sha }}
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Build candidate
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "zutfen-upstream-sync"
+          git config user.email "upstream-sync@users.noreply.github.com"
+
+          BASE_SHA="$(git rev-parse HEAD)"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --quiet --no-tags upstream main
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
+            echo "Fork main already contains upstream $UPSTREAM_SHA"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          report_blocker() {
+            local detail="$1"
+            local existing
+            existing="$(gh issue list --state open --limit 100 --json number,title \
+              --jq '.[] | select(.title == env.BLOCKER_TITLE) | .number' | head -n 1 || true)"
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$detail" >/dev/null 2>&1 || true
+            else
+              gh issue create --title "$BLOCKER_TITLE" --body "$detail" >/dev/null 2>&1 || true
+            fi
+          }
+
+          git checkout -B "$SYNC_BRANCH" "$BASE_SHA"
+
+          if ! git merge --no-ff --no-edit upstream/main; then
+            CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+            git merge --abort || true
+            git push origin --delete "$SYNC_BRANCH" >/dev/null 2>&1 || true
+            report_blocker "$(cat <<EOF
+          Automated upstream sync could not merge cleanly.
+
+          - Fork base: `$BASE_SHA`
+          - Upstream: `$UPSTREAM_SHA`
+          - Conflicting files:
+
+          ```
+          $CONFLICTS
+          ```
+
+          `main` was left untouched. Resolve the conflict in a normal branch, merge it to `main`, and the next sync run will retry.
+          EOF
+          )"
+            echo "::error::Upstream merge conflict. main was not changed."
+            printf '%s\n' "$CONFLICTS"
+            exit 1
+          fi
+
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+
+          # Fork invariants: upstream changes may evolve delegation and CI, but
+          # automatic promotion must never silently remove our compute-selection
+          # feature or restore runner labels this fork cannot provision.
+          test -f tools/delegate_tool_config.py
+          test -f tests/tools/test_delegate_model_selection.py
+          grep -q "def _resolve_task_execution_overrides" tools/delegate_tool_config.py
+          grep -q "allow_model_selection" hermes_cli/config_defaults.py
+          grep -q "workflow_dispatch:" .github/workflows/ci.yaml
+          grep -q "workflow_dispatch:" .github/workflows/nix.yml
+
+          if grep -E "ubuntu-latest-(96|32)-core|windows-latest-32-core" \
+              .github/workflows/tests.yml \
+              .github/workflows/tests-os.yml \
+              .github/workflows/nix.yml; then
+            report_blocker "$(cat <<EOF
+          Automated upstream sync produced a candidate that violates the fork runner policy.
+
+          - Fork base: `$BASE_SHA`
+          - Upstream: `$UPSTREAM_SHA`
+          - Candidate: `$CANDIDATE_SHA`
+
+          A private/large runner label reappeared in the fork CI files. `main` was left untouched.
+          EOF
+          )"
+            echo "::error::Fork runner invariant failed. main was not changed."
+            exit 1
+          fi
+
+          # Dedicated automation branch: force is intentional. main is never
+          # force-pushed, and concurrency guarantees one sync writer at a time.
+          git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
+
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream merge candidate"
+            echo "- base: `$BASE_SHA`"
+            echo "- upstream: `$UPSTREAM_SHA`"
+            echo "- candidate: `$CANDIDATE_SHA`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  validate:
+    name: Validate candidate
+    needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+    steps:
+      - name: Dispatch CI and Nix on the exact candidate
+        id: dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh workflow run ci.yaml --ref "$SYNC_BRANCH"
+          gh workflow run nix.yml --ref "$SYNC_BRANCH"
+
+          find_run() {
+            local workflow="$1"
+            local run_id=""
+            for _ in $(seq 1 60); do
+              run_id="$(gh run list \
+                --workflow "$workflow" \
+                --branch "$SYNC_BRANCH" \
+                --event workflow_dispatch \
+                --limit 30 \
+                --json databaseId,headSha \
+                --jq ".[] | select(.headSha == \"$CANDIDATE_SHA\") | .databaseId" \
+                | head -n 1)"
+              if [ -n "$run_id" ]; then
+                printf '%s' "$run_id"
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+
+          CI_RUN_ID="$(find_run ci.yaml)" || {
+            echo "::error::Could not find dispatched CI run for $CANDIDATE_SHA"
+            exit 1
+          }
+          NIX_RUN_ID="$(find_run nix.yml)" || {
+            echo "::error::Could not find dispatched Nix run for $CANDIDATE_SHA"
+            exit 1
+          }
+
+          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "nix_run_id=$NIX_RUN_ID" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Validation runs"
+            echo "- CI: https://github.com/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID"
+            echo "- Nix: https://github.com/$GITHUB_REPOSITORY/actions/runs/$NIX_RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require CI green
+        env:
+          RUN_ID: ${{ steps.dispatch.outputs.ci_run_id }}
+        run: gh run watch "$RUN_ID" --exit-status --interval 10
+
+      - name: Require Nix green
+        env:
+          RUN_ID: ${{ steps.dispatch.outputs.nix_run_id }}
+        run: gh run watch "$RUN_ID" --exit-status --interval 10
+
+  promote:
+    name: Promote validated candidate
+    needs: [prepare, validate]
+    if: needs.prepare.outputs.needed == 'true' && needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main to the validated SHA
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --quiet --no-tags origin main "$SYNC_BRANCH"
+          CURRENT_MAIN="$(git rev-parse origin/main)"
+          REMOTE_CANDIDATE="$(git rev-parse "origin/$SYNC_BRANCH")"
+
+          if [ "$CURRENT_MAIN" != "$BASE_SHA" ]; then
+            echo "::error::main moved during validation ($BASE_SHA -> $CURRENT_MAIN); refusing stale promotion."
+            exit 1
+          fi
+          if [ "$REMOTE_CANDIDATE" != "$CANDIDATE_SHA" ]; then
+            echo "::error::candidate branch moved during validation; refusing promotion."
+            exit 1
+          fi
+
+          git merge-base --is-ancestor "$BASE_SHA" "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$CANDIDATE_SHA"
+
+          # This is a fast-forward from the exact base that was validated.
+          git push origin "$CANDIDATE_SHA:refs/heads/main"
+          git push origin --delete "$SYNC_BRANCH" >/dev/null 2>&1 || true
+
+          {
+            echo "### Promoted"
+            echo "- main: `$CANDIDATE_SHA`"
+            echo "- includes upstream: `$UPSTREAM_SHA`"
+            echo "- validation: CI + Nix green"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close resolved blocker issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue="$(gh issue list --state open --limit 100 --json number,title \
+            --jq '.[] | select(.title == env.BLOCKER_TITLE) | .number' | head -n 1 || true)"
+          if [ -n "$issue" ]; then
+            gh issue close "$issue" \
+              --comment "Validated upstream sync succeeded and was promoted to main." || true
+          fi
