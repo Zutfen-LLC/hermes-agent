@@ -126,6 +126,8 @@ jobs:
           if grep -E "ubuntu-latest-(96|32)-core|windows-latest-32-core" \
               .github/workflows/tests.yml \
               .github/workflows/tests-os.yml \
+              .github/workflows/js-tests.yml \
+              .github/workflows/rust-tests.yml \
               .github/workflows/nix.yml; then
             report_blocker "$(cat <<EOF
           Automated upstream sync produced a candidate that violates the fork runner policy.

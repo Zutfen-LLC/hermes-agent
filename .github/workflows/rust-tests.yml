@@ -27,10 +27,9 @@ concurrency:
 jobs:
   bootstrap-installer:
     name: cargo test (bootstrap installer)
-    # cargo builds codegen units and test binaries in parallel across the
-    # cores. This lane also builds the crate from the start when Cargo.toml
-    # changes.
-    runs-on: ubuntu-latest-32-core
+    # Fork CI uses standard GitHub-hosted capacity. Cargo still parallelizes
+    # across the available cores; the cache keeps repeated runs practical.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
