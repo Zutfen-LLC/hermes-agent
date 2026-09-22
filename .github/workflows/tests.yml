@@ -72,7 +72,9 @@ jobs:
         # The trailing extras beyond all/dev are the lazy-install features
         # (tools/lazy_deps.py) that tests exercise for real: provider.anthropic,
         # stt/tts.mistral, image.fal, terminal.modal, terminal.daytona,
-        # memory.hindsight, search.parallel, provider.bedrock. The hermetic test env forbids
+        # memory.hindsight, search.parallel, provider.bedrock. The Bedrock schema tests
+        # import botocore directly, so the declared bedrock extra must be present in CI.
+        # The hermetic test env forbids
         # mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
         # tests/conftest.py), so the SDKs those tests need must be in the
         # venv up front — resolved from uv.lock like everything else, which
