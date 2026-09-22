@@ -61,7 +61,9 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # The marked set is small; the standard hosted Windows runner is
+            # sufficient for the fork and avoids requiring a private large runner.
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
