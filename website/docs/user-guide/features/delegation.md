@@ -274,6 +274,59 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+### Opt-in per-call and per-task model selection
+
+Operators can expose a bounded model and reasoning-effort choice directly on
+`delegate_task` without giving the model authority over providers or credentials:
+
+```yaml
+delegation:
+  allow_model_selection: true
+  allowed_models:
+    - "gpt-6-luna"
+    - "gpt-6-sol"
+  allowed_reasoning_efforts:
+    - "high"
+    - "max"
+```
+
+After starting a new session, the tool schema exposes only those exact values.
+A call-level selection becomes the default for every task:
+
+```python
+delegate_task(
+    model="gpt-6-sol",
+    reasoning_effort="max",
+    tasks=[{"goal": "Implement and validate issue #123"}],
+)
+```
+
+A task can override the call-level choice, so one batch can keep routine work on
+Luna and escalate only the difficult child to Sol:
+
+```python
+delegate_task(
+    model="gpt-6-luna",
+    reasoning_effort="high",
+    tasks=[
+        {"goal": "Run the routine compatibility audit"},
+        {
+            "goal": "Resolve the ambiguous concurrency failure",
+            "model": "gpt-6-sol",
+            "reasoning_effort": "max",
+        },
+    ],
+)
+```
+
+Invalid or non-allowlisted values fail the whole call before any child starts.
+These fields never change the configured provider, endpoint, credentials, wire
+protocol, request overrides, ACP transport, or tool access. Allowlisted models
+must therefore be compatible with the configured route and wire protocol;
+Hermes does not switch or re-resolve transport to make an incompatible model
+work. If selection is disabled, the fields are absent from the model-facing
+tool schema and direct attempts to supply them fail closed.
+
 ### Cost strategy: frontier planner, inexpensive workers
 
 Decomposing a problem into well-specified subtasks takes frontier-level judgment; executing a subtask that already comes with a clear goal, full context, and an output contract usually doesn't. Meanwhile the children are where the tokens go — a parallel batch of subagents typically burns the large majority of a run's total tokens, so the worker model is where the cost actually lives. Pinning `delegation.model` to an inexpensive model while your main session stays on a frontier model keeps the planning quality where it matters and cuts spend where the volume is:
@@ -289,7 +342,7 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+The `delegation.model` pin remains the default for every child. When opt-in selection is enabled, an approved call-level `model` / `reasoning_effort` overrides that default for the call, and an approved value on a `tasks[]` entry overrides the call-level choice for that child. The [kanban board](kanban.md#per-task-model-override) remains the durable per-task path for work dispatched outside the current conversation.
 
 ## The `/review` Command
 

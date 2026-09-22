@@ -32,6 +32,70 @@ def _cfg() -> dict:
     return _load_config()
 
 
+# Sentinel distinguishes an omitted model-facing selection from an explicitly
+# malformed value such as null / "". The latter must fail closed.
+_SELECTION_UNSET = object()
+
+
+def _selection_allowlists(cfg: dict) -> tuple[List[str], List[str]]:
+    """Return type-correct, operator-owned model and reasoning allowlists."""
+
+    def _strings(value: Any) -> List[str]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [item for item in value if isinstance(item, str) and item]
+
+    return _strings(cfg.get("allowed_models")), _strings(cfg.get("allowed_reasoning_efforts"))
+
+
+def _resolve_task_execution_overrides(
+    selection_cfg: Dict[str, Any],
+    base_creds: Dict[str, Any],
+    model: Any = _SELECTION_UNSET,
+    reasoning_effort: Any = _SELECTION_UNSET,
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Resolve approved task-local compute without changing the operator route.
+
+    Model selection changes only the model field in the already-resolved
+    credential bundle. Reasoning selection is returned separately so child
+    construction can override the global delegation effort without letting a
+    task change provider, endpoint, credentials, wire protocol, request
+    overrides, or ACP transport.
+    """
+    model_provided = model is not _SELECTION_UNSET
+    effort_provided = reasoning_effort is not _SELECTION_UNSET
+    if not model_provided and not effort_provided:
+        return base_creds, None
+
+    if not is_truthy_value(selection_cfg.get("allow_model_selection"), default=False):
+        raise ValueError("per-task model selection is disabled")
+
+    allowed_models, allowed_efforts = _selection_allowlists(selection_cfg)
+    creds = base_creds
+    reasoning = None
+
+    if model_provided:
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string when provided")
+        if model not in allowed_models:
+            raise ValueError(f"model {model!r} is not allowed")
+        creds = dict(base_creds)
+        creds["model"] = model
+
+    if effort_provided:
+        if not isinstance(reasoning_effort, str) or not reasoning_effort:
+            raise ValueError("reasoning_effort must be a non-empty string when provided")
+        if reasoning_effort not in allowed_efforts:
+            raise ValueError(f"reasoning_effort {reasoning_effort!r} is not allowed")
+        from hermes_constants import parse_reasoning_effort
+
+        reasoning = parse_reasoning_effort(reasoning_effort)
+        if reasoning is None:
+            raise ValueError(f"reasoning_effort {reasoning_effort!r} is invalid")
+
+    return creds, reasoning
+
+
 # ── Subagent approval callbacks ─────────────────────────────────────────────
 # Subagent worker threads don't inherit the CLI's threading.local approval
 # callback, so prompt_dangerous_approval() would fall back to input() and
@@ -489,6 +553,7 @@ def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
@@ -565,20 +630,29 @@ def _resolve_child_runtime(
             getattr(parent_agent, "requested_provider", None) or effective_provider
         )
 
-    # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
-    # YAML ``false`` must disable thinking, not coerce to "" and inherit.
-    child_reasoning = getattr(parent_agent, "reasoning_config", None)
-    try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is None:
-                logger.warning("Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort)
-            else:
-                child_reasoning = parsed
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    # Reasoning: an explicitly validated task-local selection wins; otherwise
+    # preserve the existing delegation.reasoning_effort > parent behavior.
+    # Keep the raw global value — YAML ``false`` must disable thinking, not
+    # coerce to "" and inherit.
+    child_reasoning = (
+        override_reasoning_config
+        if override_reasoning_config is not None
+        else getattr(parent_agent, "reasoning_config", None)
+    )
+    if override_reasoning_config is None:
+        try:
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is None:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level", delegation_effort
+                    )
+                else:
+                    child_reasoning = parsed
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,

@@ -30,8 +30,9 @@ from tools.delegate_tool_child_run import (  # noqa: F401
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
+    _SELECTION_UNSET, _inherit_parent_capabilities, _load_config, _merge_request_overrides,
+    _resolve_child_credential_pool, _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_task_execution_overrides, _selection_allowlists,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -168,6 +169,7 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
 
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
@@ -221,6 +223,7 @@ def _build_child_agent(
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
+        override_reasoning_config=override_reasoning_config,
         routing_cfg=routing_cfg,
     )
     if override_request_overrides is not None:
@@ -363,7 +366,8 @@ def _run_single_child(
 
 
 def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]],
+    task_execution: List[tuple[Dict[str, Any], Optional[Dict[str, Any]]]], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
@@ -371,16 +375,18 @@ def _build_children(
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = {
-        "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
-        "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
-        "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
-    }
     children = []
     for i, t in enumerate(task_list):
+        creds, reasoning_override = task_execution[i]
+        overrides = {
+            "override_provider": creds["provider"], "override_base_url": creds["base_url"],
+            "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
+            "override_request_overrides": creds.get("request_overrides"),
+            "override_acp_command": creds.get("command"),
+            "override_acp_args": creds.get("args"),
+            "override_reasoning_config": reasoning_override,
+            "routing_cfg": routing_cfg,
+        }
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -441,7 +447,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None,
+    model: Any = _SELECTION_UNSET, reasoning_effort: Any = _SELECTION_UNSET, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
@@ -505,6 +512,21 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+
+    # Preflight every task before charging one-shot budget, creating transcripts,
+    # or constructing a child. Per-task values override the call-level default.
+    task_execution: List[tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
+    for i, task in enumerate(task_list):
+        task_model = task["model"] if "model" in task else model
+        task_effort = task["reasoning_effort"] if "reasoning_effort" in task else reasoning_effort
+        try:
+            task_creds, task_reasoning = _resolve_task_execution_overrides(
+                cfg, creds, task_model, task_effort
+            )
+        except ValueError as exc:
+            return tool_error(f"Task {i}: {exc}")
+        task_execution.append((task_creds, task_reasoning))
+
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
@@ -512,21 +534,31 @@ def delegate_task(
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
+    # Batch metadata is descriptive only; mixed per-task model selection is
+    # represented explicitly rather than pretending every child used the base pin.
+    batch_creds = dict(creds)
+    task_models = {task_creds.get("model") for task_creds, _ in task_execution}
+    if len(task_models) == 1:
+        batch_creds["model"] = next(iter(task_models))
+    elif len(task_models) > 1:
+        batch_creds["model"] = "mixed"
+
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=batch_creds.get("model"), provider=batch_creds.get("provider")
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
     children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        task_list, task_schemas, task_execution, top_role=top_role, max_iterations=default_max_iter,
+        parent_agent=parent_agent, routing_cfg=routing_cfg, live_deleg_id=live_deleg_id,
+        live_writers=live_writers, task_images=task_images,
     )
     if err:
         return tool_error(err)
     batch = _Batch(
-        task_list, children, parent_agent, creds, context, top_role, max_children,
+        task_list, children, parent_agent, batch_creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
     )
     return _run_batch(batch, background)
@@ -615,13 +647,42 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params = {**DELEGATE_TASK_SCHEMA["parameters"]}
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
-    overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    tasks = overrides_params["properties"]["tasks"]
+    tasks["description"] = _build_tasks_param_description()
+    # The nested task schema must also be copied before dynamic fields are
+    # inserted/removed; mutating DELEGATE_TASK_SCHEMA would poison later sessions.
+    tasks["items"] = {**tasks["items"], "properties": dict(tasks["items"]["properties"])}
 
     if not independent_completions:
-        tasks = overrides_params["properties"]["tasks"]
-        tasks["items"] = {**tasks["items"], "properties": {
+        tasks["items"]["properties"] = {
             k: v for k, v in tasks["items"]["properties"].items() if k != "group"
-        }}
+        }
+
+    cfg = _load_config()
+    if is_truthy_value(cfg.get("allow_model_selection"), default=False):
+        models, efforts = _selection_allowlists(cfg)
+        if models:
+            overrides_params["properties"]["model"] = _p(
+                "string",
+                "Operator-approved default model for every spawned task in this call; a task-level model overrides it.",
+                enum=models,
+            )
+            tasks["items"]["properties"]["model"] = _p(
+                "string",
+                "Operator-approved model for this child only; overrides the call-level/default delegation model.",
+                enum=models,
+            )
+        if efforts:
+            overrides_params["properties"]["reasoning_effort"] = _p(
+                "string",
+                "Operator-approved default reasoning effort for every spawned task in this call; a task-level value overrides it.",
+                enum=efforts,
+            )
+            tasks["items"]["properties"]["reasoning_effort"] = _p(
+                "string",
+                "Operator-approved reasoning effort for this child only; overrides the call-level/default effort.",
+                enum=efforts,
+            )
 
     return {
         "description": _build_top_level_description(independent_completions=independent_completions),
@@ -743,6 +804,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model=args.get("model", _SELECTION_UNSET), reasoning_effort=args.get("reasoning_effort", _SELECTION_UNSET),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
