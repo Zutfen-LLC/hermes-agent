@@ -219,7 +219,7 @@ jobs:
       - name: Require CI green
         env:
           RUN_ID: ${{ steps.dispatch.outputs.ci_run_id }}
-        run: gh run watch "$RUN_ID" --exit-status --interval 10
+        run: gh run watch "$RUN_ID" -R "$GITHUB_REPOSITORY" --exit-status --interval 10
 
       - name: Require Nix green
         env:
