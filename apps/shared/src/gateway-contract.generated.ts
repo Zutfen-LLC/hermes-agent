@@ -889,8 +889,21 @@ export interface ConnectionOperationTarget {
   required_env?: ConnectionTargetEnvField[] | null
   tools?: string[] | null
   hint?: string | null
+  display?: string | null
+  description?: string | null
+  tier?: CatalogTier | null
+  platforms?: string[] | null
+  repo?: string | null
+  sha?: string | null
+  subdir?: string | null
+  scan?: CatalogScan | null
+  requirements?: string[] | null
+  has_desktop_half?: boolean | null
+  target_profile?: string | null
+  app_state?: CatalogAppState | null
+  skill?: string | null
 }
-export type ConnectionTargetKind = 'connector' | 'mcp'
+export type ConnectionTargetKind = 'connector' | 'mcp' | 'plugin' | 'skill'
 export type ConnectionTargetAction = 'authorize' | 'connect' | 'enable' | 'install' | 'reconnect'
 /** ``tools/connectors/contract.py::TargetState``. */
 export type ConnectionTargetState = 'pending' | 'initiated' | 'connected' | 'skipped' | 'failed' | 'expired' | 'not_connected'
@@ -902,6 +915,15 @@ export interface ConnectionTargetEnvField {
   default: string
   prompt?: string | null
 }
+export type CatalogTier = 'official' | 'community'
+/** The catalog's security scan of the pinned commit; read-only on the card. */
+export interface CatalogScan {
+  status: CatalogScanStatus
+  summary: string
+}
+export type CatalogScanStatus = 'passed' | 'warnings' | 'failed'
+/** The desktop app a catalog plugin drives, from its ``hermes_platform`` declaration. */
+export type CatalogAppState = 'present' | 'missing_app' | 'app_not_running' | 'unknown'
 export interface ConnectionWakeResult {
   status: 'ok'
 }
@@ -2330,6 +2352,7 @@ export interface PromptSubmitParams {
 export interface PromptSubmitResult {
   status?: PromptSubmitStatus | null
   voice_stopped?: boolean | null
+  user_row_id?: number | null
   survivor_user_row_ids?: (number | null)[] | null
   survivor_row_id_map?: Record<string, number | null> | null
   turn_isolation?: boolean | null
@@ -3941,12 +3964,29 @@ export interface PluginSettingField {
   has_value?: boolean | null
 }
 export type PluginSettingFieldType = 'string' | 'number' | 'boolean' | 'enum' | 'secret' | 'json'
-/** What a plugin loaded mid-run does NOW vs later (``hermes_cli.plugins_activation``), ``{kind: [names]}`` with only non-empty kinds present. ``activated_now`` kinds: ``gateway_commands`` (slash names), ``gateway_transforms`` / ``hooks`` (hook names), ``callbacks`` (platforms / ``slack:<action_id>``) — live in the running gateway once it reloaded (``gateway_reloaded``). ``deferred`` kinds: ``tools`` (tool names) and ``prompt`` (section ids) apply from the next session; ``mcp_servers`` lists the plugin's mcp.json server names (exactly as ``mcp.servers.*`` know them) — not connected until ``mcp.reload``. The Desktop "Installed. Connect its servers now" card reads exactly ``deferred.mcp_servers``. */
+/** What a plugin loaded mid-run does NOW vs later (``hermes_cli.plugins_activation``). ``activated_now`` kinds (``{kind: [names]}``): ``gateway_commands`` (slash names), ``gateway_transforms`` / ``hooks`` (hook names), ``callbacks`` (platforms / ``slack:<action_id>``) — live in the running gateway once it reloaded (``gateway_reloaded``). ``live_now``: the plugin's MCP servers (connected, with their tools, or the error) and skills, usable in every open chat of the profile from its next turn — the chats also get a note listing them. ``deferred`` kinds: ``tools`` (Python tool names) and ``prompt`` (section ids) apply from the next session. */
 export interface PluginActivation {
   name: string
   key: string
   activated_now?: Record<string, string[]>
+  live_now?: PluginLiveNow | null
   deferred?: Record<string, string[]>
+}
+export interface PluginLiveNow {
+  mcp_servers?: PluginLiveServer[]
+  skills?: PluginLiveSkill[]
+}
+/** One plugin MCP server connected at activation: its callable tool names, or the reason it did not connect. */
+export interface PluginLiveServer {
+  name: string
+  connected: boolean
+  tools?: string[]
+  error?: string | null
+}
+/** One plugin skill usable now through ``skill_view`` (qualified ``<plugin>:<skill>``). */
+export interface PluginLiveSkill {
+  name: string
+  description?: string
 }
 /** Single question: ``question`` / ``choices`` (/ ``multi_select``); batch: ``questions``. ``answers`` rides only on a reconnect replay (locks the server already accepted). */
 export interface ClarifyRequestParams {
@@ -4144,6 +4184,7 @@ export interface MessageCompletePayload {
   recoverable?: boolean | null
   error_surface?: ErrorSurface | null
   partial?: boolean | null
+  persisted_turn?: PersistedTurn | null
 }
 /** ``prompt_turn._result_status``. */
 export type TurnStatus = 'complete' | 'error' | 'interrupted'
@@ -4166,6 +4207,13 @@ export interface ErrorSurface {
   model?: string | null
   resets_at?: number | null
   [key: string]: unknown
+}
+/** Committed SQLite row addresses for the agent's current-turn suffix. Missing ids are unproven, never negative acknowledgements. ``complete`` permits retiring the whole local turn only when the original turn boundary, every row and final body are still accounted for; compaction, redirects and partial writes conservatively leave it false. Row ids are scoped to the owning profile's store, as in ``SessionMessage.row_id``. */
+export interface PersistedTurn {
+  row_ids: number[]
+  complete: boolean
+  user_row_id?: number | null
+  final_assistant_row_id?: number | null
 }
 /** ``server._status_update`` and the direct emitters (goal / loop / heartbeat / process). */
 export interface StatusUpdatePayload {
