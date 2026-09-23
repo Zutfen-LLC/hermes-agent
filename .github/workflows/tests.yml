@@ -97,6 +97,13 @@ jobs:
           scripts/run_tests.sh --slice ${{ matrix.slice }}/4 -j 4
         env:
           HERMES_TEST_WORKERS: 4
+          # Standard hosted runners are materially slower than upstream's
+          # private 96-core lane. The per-file runner already has a 300s
+          # default plus duration-aware scaling, but this fork intentionally
+          # does not share duration caches across the four slices. Give known
+          # large files (notably tests/hermes_state/test_hermes_state.py)
+          # enough headroom without weakening the 45-minute job-level bound.
+          HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
