@@ -172,14 +172,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh workflow run ci.yaml --ref "$SYNC_BRANCH"
-          gh workflow run nix.yml --ref "$SYNC_BRANCH"
+          gh workflow run ci.yaml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"
+          gh workflow run nix.yml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"
 
           find_run() {
             local workflow="$1"
             local run_id=""
             for _ in $(seq 1 60); do
               run_id="$(gh run list \
+                -R "$GITHUB_REPOSITORY" \
                 --workflow "$workflow" \
                 --branch "$SYNC_BRANCH" \
                 --event workflow_dispatch \
