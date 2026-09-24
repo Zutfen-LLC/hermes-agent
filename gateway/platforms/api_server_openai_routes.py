@@ -7,6 +7,7 @@ module (top-level import = cycle), and lazy lookup keeps ``patch("...api_server.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -461,7 +462,8 @@ class _ResponsesStream:
             if isinstance(result, dict) and result.get("error") and not self.final_response_text:
                 self.agent_error = self._api._redact_api_error_text(result["error"])
         except Exception as e:  # noqa: BLE001
-            logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
+            from gateway.platforms.api_server import _redact_api_error_text
+            logger.error("Error running agent for streaming responses: %s", _redact_api_error_text(e), exc_info=True)
             self.agent_error = self._api._redact_api_error_text(e)
 
     async def close_message_item(self) -> None:
@@ -572,6 +574,7 @@ class OpenAICompatRoutesMixin:
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
             _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+        from gateway.platforms import api_server_provider_credentials as _pc
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -580,6 +583,15 @@ class OpenAICompatRoutesMixin:
             body = await request.json()
         except Exception:
             return _error_response("Invalid JSON in request body", 400)
+        # Request-scoped provider credential (X-Hermes-Provider-API-Key contract):
+        # validate fail-closed BEFORE any agent work; the plaintext lives only in
+        # this handler scope + the agent's runtime for the turn.
+        try:
+            provider_credential = _pc.extract_provider_credential(
+                self, request, body if isinstance(body, dict) else {},
+                scope_fn=lambda: self._run_idempotency_scope(request))
+        except _pc.ProviderCredentialError as exc:
+            return _pc.error_response(exc)
         from gateway.platforms.api_server import _request_relay_metadata
         relay_metadata = _request_relay_metadata(body)
         messages = body.get("messages")
@@ -664,6 +676,7 @@ class OpenAICompatRoutesMixin:
             ephemeral_system_prompt=system_prompt, session_id=session_id,
             gateway_session_key=gateway_session_key, **agent_overrides, route=route,
             relay_metadata=relay_metadata,
+            provider_credential=provider_credential,
             # #98619: only an explicitly provided X-Hermes-Session-Id is wake-capable (the
             # header is 403-gated on API_SERVER_KEY, so the wake self-post can authenticate
             # and the client can resume the session by sending it again). A fingerprint-derived
@@ -720,6 +733,7 @@ class OpenAICompatRoutesMixin:
             fingerprint_keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream",
                               "hermes_notification_category"],
             route="chat_completions",
+            credential_fp=provider_credential.fingerprint if provider_credential else "",
         )
         if err is not None:
             return err
@@ -769,7 +783,8 @@ class OpenAICompatRoutesMixin:
 
     async def _run_idempotent(
         self, request: "web.Request", body: Dict[str, Any], compute, *,
-        log_label: str, fingerprint_keys: List[str], route: str) -> tuple:
+        log_label: str, fingerprint_keys: List[str], route: str,
+        credential_fp: str = "") -> tuple:
         """Run ``compute()`` once per (principal scope, logical route, Idempotency-Key) + body fingerprint
         -> ``((result, usage), None)`` or ``(None, 500 response)``.
 
@@ -777,22 +792,28 @@ class OpenAICompatRoutesMixin:
         ``/p/<profile>/v1/...`` mirror shares it, so the key carries ``_run_idempotency_scope`` (the same
         ``sha256(profile, expected API key)`` namespace the durable ``/v1/runs`` API uses) — a client key
         colliding across profiles, or a rotated API_SERVER_KEY, never replays another principal's response.
+        ``credential_fp`` folds the keyed request-scoped-credential fingerprint (never plaintext) into the
+        body fingerprint, so a replay with a rotated provider credential recomputes instead of serving the
+        response computed under the old one.
         ``route`` is the logical endpoint (``/v1/...`` and its ``/p/<profile>/v1/...`` alias are the same
         route), folded into the key because the store keeps the fingerprint only as the slot's value.
         """
-        from gateway.platforms.api_server import _error_response, _idem_cache, _make_request_fingerprint
+        from gateway.platforms.api_server import (
+            _error_response, _idem_cache, _make_request_fingerprint, _redact_api_error_text)
         idempotency_key = request.headers.get("Idempotency-Key")
         try:
             if idempotency_key:
                 principal_scope = self._run_idempotency_scope(request)
                 scoped_key = f"{principal_scope}\0{route}\0{idempotency_key}"
                 fp = _make_request_fingerprint(body, keys=fingerprint_keys)
+                if credential_fp:
+                    fp = hashlib.sha256(f"{fp}\0{credential_fp}".encode()).hexdigest()
                 result, usage = await _idem_cache.get_or_set(scoped_key, fp, compute)
             else:
                 result, usage = await compute()
             return (result, usage), None
         except Exception as e:
-            logger.error("Error running agent for %s: %s", log_label, e, exc_info=True)
+            logger.error("Error running agent for %s: %s", log_label, _redact_api_error_text(e), exc_info=True)
             message = "" if getattr(e, "_notification_presentation_suppressed", False) is True else f"Internal server error: {e}"
             return None, _error_response(message, 500, err_type="server_error")
 
@@ -960,6 +981,14 @@ class OpenAICompatRoutesMixin:
             body = await request.json()
         except Exception:
             return _invalid_request("Invalid JSON in request body")
+        # Request-scoped provider credential (same contract as /v1/chat/completions).
+        from gateway.platforms import api_server_provider_credentials as _pc
+        try:
+            provider_credential = _pc.extract_provider_credential(
+                self, request, body if isinstance(body, dict) else {},
+                scope_fn=lambda: self._run_idempotency_scope(request))
+        except _pc.ProviderCredentialError as exc:
+            return _pc.error_response(exc)
         from gateway.platforms.api_server import _request_relay_metadata
         relay_metadata = _request_relay_metadata(body)
         raw_input = body.get("input")
@@ -1046,7 +1075,8 @@ class OpenAICompatRoutesMixin:
             user_message=user_message, conversation_history=conversation_history,
             ephemeral_system_prompt=instructions, session_id=session_id,
             gateway_session_key=gateway_session_key, bind_declared_conversation=_declared_selected,
-            **agent_overrides, route=route, relay_metadata=relay_metadata)
+            **agent_overrides, route=route, relay_metadata=relay_metadata,
+            provider_credential=provider_credential)
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
 
@@ -1086,6 +1116,7 @@ class OpenAICompatRoutesMixin:
             request, body, _compute_response, log_label="responses",
             fingerprint_keys=["input", "instructions", "previous_response_id", "conversation", "model", "provider", "model_options", "tools"],
             route="responses",
+            credential_fp=provider_credential.fingerprint if provider_credential else "",
         )
         if err is not None:
             return err

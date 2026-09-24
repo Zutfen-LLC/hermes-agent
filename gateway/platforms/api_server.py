@@ -73,7 +73,18 @@ _STATIC_FEATURE_FLAGS = {
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
-    "session_key_header": "X-Hermes-Session-Key"}
+    "session_key_header": "X-Hermes-Session-Key",
+    # Request-scoped provider credentials (Ops Supervisor provider-runtime bridge):
+    # feature-detect via this object, never a version number. The secret rides the
+    # X-Hermes-Provider-API-Key header; ``admin_config_rw`` stays false (this is
+    # not persistent config mutation).
+    "provider_runtime_credentials": {
+        "supported": True,
+        "api_key_header": "X-Hermes-Provider-API-Key",
+        "base_url_field": "provider_base_url",
+        "per_request": True,
+        "persisted": False,
+        "idempotent_replay": "credential_fingerprint"}}
 # /v1/capabilities "endpoints" table: name -> (method, path).
 _CAPABILITY_ENDPOINTS = (
     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
@@ -121,6 +132,7 @@ from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_provider_credentials as _provider_credentials
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
@@ -806,7 +818,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id"}
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id, X-Hermes-Session-Key, X-Hermes-Provider-API-Key"}
 _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
@@ -1089,13 +1101,16 @@ class _ProviderAuthResolutionError(RuntimeError):
 
     def user_text(self) -> str:
         """Raw-surface failure line. A quota/429 cap with valid credentials must not be labelled an
-        authentication failure — the cause chain (RuntimeError -> AuthError) tells them apart (#89401)."""
+        authentication failure — the cause chain (RuntimeError -> AuthError) tells them apart (#89401).
+        Redacted: this text reaches final_response on the soft-fail path (no other redaction
+        pass applies there), and a request-scoped credential's vault registration must scrub it."""
         from hermes_cli.auth import is_rate_limited_auth_error
+        from agent.redact import redact_sensitive_text
 
         cause = self.__cause__
         cause = getattr(cause, "__cause__", None) if isinstance(cause, RuntimeError) else cause
         label = "Provider rate-limited" if is_rate_limited_auth_error(cause) else "Provider authentication failed"
-        return f"⚠️ {label}: {self}"
+        return redact_sensitive_text(f"⚠️ {label}: {self}", force=True)
 
 
 class _SessionEventQueue:
@@ -2101,11 +2116,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _select_agent_runtime(
         self, runtime_kwargs: Dict[str, Any], model: str, *, requested_model: Optional[str],
         requested_provider: Optional[str], route: Optional[Dict[str, Any]], session_model: Optional[str],
-        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str]) -> tuple:
+        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str],
+        provider_credential: Optional["_provider_credentials.ProviderCredentialOverride"] = None) -> tuple:
         """Apply the model/provider precedence chain for one agent (mutates ``runtime_kwargs``):
         confirmed Browser lock > session ``/model`` override > session-persisted model >
         model_routes alias > per-request provider/model > global defaults. A confirmed lock
         bypasses the override and fails closed if its provider cannot be resolved.
+        A request-scoped provider credential (``X-Hermes-Provider-API-Key``) outranks ALL of
+        those for THIS invocation: the request's explicit provider/model is authoritative and
+        the caller-supplied key/base URL replace every static credential — nothing persists.
         Returns ``(model, session_override, request_model, request_provider)``."""
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
@@ -2115,6 +2134,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
         current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+        if provider_credential is not None:
+            # Request-scoped credential contract: the invocation's provider/model/key/base_url
+            # come from the request. The existing conflict logic already ran at admission
+            # (_request_route_conflict_error / lock checks), so the only remaining work is to
+            # resolve the explicit runtime and make it THE runtime for this one agent.
+            effective_model = request_model or route_model or model or ""
+            runtime = _provider_credentials.resolve_credential_runtime(
+                provider_credential, target_model=effective_model or None)
+            _provider_credentials.apply_credential_runtime(runtime_kwargs, runtime)
+            model = effective_model
+            session_override = None
+            model = self._recover_or_record_model(model, runtime_kwargs, gateway_session_key)
+            return model, None, request_model, request_provider
         session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
         # Model-string precedence (override > session-persisted > global) is owned by
         # hermes_cli.model_switch.resolve_effective_model.
@@ -2176,11 +2208,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        provider_credential: Optional["_provider_credentials.ProviderCredentialOverride"] = None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
-        session ``/model`` override, disables the fallback chain and fails closed."""
+        session ``/model`` override, disables the fallback chain and fails closed.
+        ``provider_credential`` (request-scoped ``X-Hermes-Provider-API-Key`` contract) outranks
+        all of the above for this one invocation and is never persisted."""
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2202,7 +2237,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_kwargs, model,
             requested_model=requested_model, requested_provider=requested_provider, route=route,
             session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
-            gateway_session_key=gateway_session_key, session_id=session_id)
+            gateway_session_key=gateway_session_key, session_id=session_id,
+            provider_credential=provider_credential)
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``
@@ -2234,7 +2270,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "status_callback": status_callback,
             "session_db": self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
-            "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
+            # Same fallback-off rule as a confirmed model lock: a request-scoped
+            # credential names THE provider for this invocation — a silent switch to
+            # a static fallback provider would run the caller's prompt (and possibly
+            # their data) against credentials they never supplied.
+            "fallback_model": (
+                None if (confirmed_runtime_lock or provider_credential is not None)
+                else GatewayRunner._load_fallback_model()),
             "reasoning_config": request_reasoning_config,
             "gateway_session_key": gateway_session_key}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
@@ -3098,6 +3140,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return None, err
+        # Request-scoped provider credential (same contract as the /v1 surfaces).
+        try:
+            provider_credential = _provider_credentials.extract_provider_credential(
+                self, request, body if isinstance(body, dict) else {},
+                scope_fn=lambda: self._run_idempotency_scope(request))
+        except _provider_credentials.ProviderCredentialError as exc:
+            return None, _provider_credentials.error_response(exc)
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return None, err
@@ -3147,7 +3196,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # #98619: the client addresses this session by construction — the id is in the
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
-            session_history_delivery="1", **agent_overrides)
+            session_history_delivery="1", provider_credential=provider_credential, **agent_overrides)
         return {
             "gateway_session_key": gateway_session_key, "session_id": session_id, "body": body,
             "user_message": user_message, "runtime_request": runtime_request,
@@ -3321,7 +3370,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ctx, err = await self._prepare_session_chat(request)
         if err is not None:
             return err
-        handed_off = await self._answer_through_live_bot_chat(ctx)
+        # A request-scoped provider credential cannot ride the live-owner mailbox
+        # (the record carries no secret); such a turn always runs in-process.
+        handed_off = (await self._answer_through_live_bot_chat(ctx)
+                      if ctx["run_kwargs"].get("provider_credential") is None else None)
         if handed_off is not None:
             return handed_off
         gateway_session_key = ctx["gateway_session_key"]
@@ -3361,7 +3413,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ctx, err = await self._prepare_session_chat(request)
         if err is not None:
             return err
-        handed_off = await self._stream_through_live_bot_chat(request, ctx)
+        # Same credential gate as the non-streaming sibling: the mailbox cannot
+        # carry the secret, so a credential turn never hands off.
+        handed_off = (await self._stream_through_live_bot_chat(request, ctx)
+                      if ctx["run_kwargs"].get("provider_credential") is None else None)
         if handed_off is not None:
             return handed_off
         gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
@@ -3922,7 +3977,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
-        resume_unanswered_turn: bool = False) -> tuple:
+        resume_unanswered_turn: bool = False,
+        provider_credential: Optional["_provider_credentials.ProviderCredentialOverride"] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3934,7 +3990,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``resume_unanswered_turn`` marks a policy-gated re-run of a turn whose user row the failed attempt
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
-        (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
+        (``agent.session_persistence.adopt_unanswered_turn``; #115325).
+        ``provider_credential`` is the request-scoped provider credential (transient, in-memory
+        for this turn only; never persisted, never threaded into metadata)."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
@@ -3963,7 +4021,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         reasoning_callback=reasoning_callback, status_callback=status_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
-                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+                        provider_credential=provider_credential)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if resume_unanswered_turn:
@@ -4012,9 +4071,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return result, usage
                 except _ProviderAuthResolutionError as exc:
                     # Typed provider-auth failure only, handled once for every caller in
-                    # run.py's response shape (text, no HTTP error).
+                    # run.py's response shape (text, no HTTP error). Redacted: the
+                    # exception text can embed the failing credential (a request-scoped
+                    # key echoed by an upstream 401), and raw exception strings bypass
+                    # every response-boundary redaction pass.
                     logger.warning("Provider resolution failed for session=%s: %s",
-                                   session_id or "", exc)
+                                   session_id or "", _redact_api_error_text(exc))
                     return (
                         {"final_response": exc.user_text(), "messages": [],
                          "api_calls": 0, "tools": [],

@@ -453,6 +453,10 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    # Request-scoped provider credential (X-Hermes-Provider-API-Key): transient,
+    # in-memory for the lifetime of this run task only. Never persisted, never
+    # logged (repr is safe), never threaded into status/events/metadata.
+    provider_credential: Any = None
 
     @property
     def approval_session_key(self) -> str:
@@ -575,6 +579,18 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    # Request-scoped provider credential (X-Hermes-Provider-API-Key contract): the
+    # secret NEVER enters the durable body fingerprint — only its keyed,
+    # non-reversible fingerprint does, so a replay with a DIFFERENT secret is a
+    # fingerprint conflict (409, fail closed) instead of a silent re-association,
+    # and no plaintext is persisted to compare replays.
+    from gateway.platforms import api_server_provider_credentials as _pc
+    try:
+        provider_credential = _pc.extract_provider_credential(
+            self, request, body if isinstance(body, dict) else {},
+            scope_fn=lambda: self._run_idempotency_scope(request))
+    except _pc.ProviderCredentialError as exc:
+        return _pc.error_response(exc)
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -591,7 +607,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
         idempotency_fingerprint = hashlib.sha256(json.dumps(
-            {"body": body, "gateway_session_key": gateway_session_key or ""},
+            {"body": body, "gateway_session_key": gateway_session_key or "",
+             "provider_credential_fp": provider_credential.fingerprint if provider_credential else ""},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
     raw_input = body.get("input")
@@ -685,12 +702,17 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author,
+        provider_credential=provider_credential)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+    # EXCEPT a request-scoped provider credential: the mailbox record cannot carry the secret and
+    # the owner process would resolve static credentials, silently dropping the caller's key — so
+    # a credential run always executes in this process.
+    admitted = (await self._admit_to_live_bot_chat(session_id, user_message, turn_author)
+                if selected_session_id and provider_credential is None else None)
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
@@ -913,7 +935,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+                interim_assistant_callback=_interim_cb, provider_credential=run.provider_credential,
+                **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
@@ -940,7 +963,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         raise
     except _api_server._ProviderAuthResolutionError as exc:
         # Same controlled provider-auth message the _run_agent() endpoints give.
-        logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
+        # Redacted for the same reason: raw exception text can embed the failing
+        # credential and bypasses response-boundary redaction.
+        logger.warning("Provider resolution failed for run=%s: %s", run_id, _redact_api_error_text(exc))
         _finish("failed", error=exc.user_text())
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
