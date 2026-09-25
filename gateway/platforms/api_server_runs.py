@@ -1165,8 +1165,9 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         resolved = resolve_gateway_approval(
             approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
     except Exception as exc:
-        logger.exception("[api_server] approval resolution failed for run %s", run_id)
-        return _json_error(_openai_error, str(exc), status=500)
+        safe_error = _api_server._redact_api_error_text(exc)
+        logger.error("[api_server] approval resolution failed for run %s: %s", run_id, safe_error)
+        return _json_error(_openai_error, safe_error, status=500)
     if resolved <= 0:
         return _json_error(
             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
@@ -1202,8 +1203,9 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     try:
         accepted = bool(agent.steer(steer_text))
     except Exception as exc:
-        logger.exception("[api_server] steer failed for run %s", run_id)
-        return _json_error(_openai_error, _api_server._redact_api_error_text(exc), code="steer_failed", status=500)
+        safe_error = _api_server._redact_api_error_text(exc)
+        logger.error("[api_server] steer failed for run %s: %s", run_id, safe_error)
+        return _json_error(_openai_error, safe_error, code="steer_failed", status=500)
     if not accepted:
         return _json_error(
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)

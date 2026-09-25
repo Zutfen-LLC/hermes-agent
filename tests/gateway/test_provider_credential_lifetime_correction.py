@@ -26,6 +26,8 @@ def _app(adapter):
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     return app
 
@@ -148,6 +150,58 @@ async def test_cancelled_run_task_keeps_redaction_until_executor_thread_exits():
                 assert _count() == 1, "cancelled asyncio task must not unredact running thread"
                 gates[run_id].set()
                 await _until(lambda: _count() == 0)
+            finally:
+                gates[run_id].set()
+                await _until(lambda: _count() == 0)
+
+
+@pytest.mark.asyncio
+async def test_steer_error_does_not_log_active_provider_secret(caplog):
+    caplog.set_level(logging.DEBUG)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": AUTH["Authorization"].split()[-1]}))
+    gates = defaultdict(threading.Event)
+    agent = BlockingAgent(gates)
+    with patch.object(adapter, "_create_agent", return_value=agent), \
+         patch.object(agent, "steer", create=True, side_effect=RuntimeError(SECRET)):
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            response = await cli.post("/v1/runs", json=BODY,
+                headers={**AUTH, "X-Hermes-Provider-API-Key": SECRET})
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            try:
+                await _until(lambda: agent.started.is_set() and
+                    adapter._run_statuses.get(run_id, {}).get("status") == "running")
+                result = await cli.post(f"/v1/runs/{run_id}/steer",
+                    json={"input": "continue"}, headers=AUTH)
+                assert result.status == 500
+                assert SECRET not in await result.text(), "steer response exposed provider key"
+                assert SECRET not in caplog.text, "steer traceback exposed provider key"
+            finally:
+                gates[run_id].set()
+                await _until(lambda: _count() == 0)
+
+
+@pytest.mark.asyncio
+async def test_approval_error_does_not_echo_active_provider_secret(caplog):
+    caplog.set_level(logging.DEBUG)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": AUTH["Authorization"].split()[-1]}))
+    gates = defaultdict(threading.Event)
+    agent = BlockingAgent(gates)
+    with patch.object(adapter, "_create_agent", return_value=agent), \
+         patch("tools.approval.resolve_gateway_approval", side_effect=RuntimeError(SECRET)):
+        async with TestClient(TestServer(_app(adapter))) as cli:
+            response = await cli.post("/v1/runs", json=BODY,
+                headers={**AUTH, "X-Hermes-Provider-API-Key": SECRET})
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            try:
+                await _until(lambda: agent.started.is_set() and
+                    adapter._run_statuses.get(run_id, {}).get("status") == "running")
+                result = await cli.post(f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once"}, headers=AUTH)
+                assert result.status == 500
+                assert SECRET not in await result.text(), "approval response exposed provider key"
+                assert SECRET not in caplog.text, "approval traceback exposed provider key"
             finally:
                 gates[run_id].set()
                 await _until(lambda: _count() == 0)
