@@ -507,7 +507,11 @@ Rules:
   scope, explicit provider, API key, and `provider_base_url` — so a changed
   base URL is never idempotently equivalent to the prior endpoint: `/v1/runs`
   answers `409`, and chat completions / Responses recompute against the new
-  endpoint instead of replaying the cached one.
+  endpoint instead of replaying the cached one. Because the fingerprint now
+  includes the URL, a durable row recorded before an upgrade by an older
+  fingerprint spelling is answered with the same fail-closed `409` until the
+  row leaves the retention window (24h) — a retry then starts a fresh run
+  rather than replaying the pre-upgrade one.
 - **Fingerprint authority.** The replay fingerprint is a keyed HMAC made with
   gateway-only installation material, not the API bearer or provider key. If
   that keying material is unavailable, credentialed admission fails with
