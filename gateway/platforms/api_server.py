@@ -3196,7 +3196,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # #98619: the client addresses this session by construction — the id is in the
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
-            session_history_delivery="1", provider_credential=provider_credential, **agent_overrides)
+            session_history_delivery="1", provider_credential=provider_credential,
+            **agent_overrides)
         return {
             "gateway_session_key": gateway_session_key, "session_id": session_id, "body": body,
             "user_message": user_message, "runtime_request": runtime_request,
@@ -3453,6 +3454,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 events.enqueue("assistant.commentary", {
                     "message_id": message_id, "text": text, "already_streamed": bool(already_streamed)})
 
+        stream_lease = None
+        stream_run_kwargs = dict(ctx["run_kwargs"])
+        credential = stream_run_kwargs.get("provider_credential")
+        if credential is not None:
+            from agent.redact import register_provider_credential_redaction
+            stream_lease = register_provider_credential_redaction(credential.api_key or "")
+            stream_run_kwargs["credential_redaction_lease"] = stream_lease
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {
@@ -3464,7 +3472,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 result, usage = await self._run_agent(
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
-                    active_run_id=run_id, **ctx["run_kwargs"])
+                    active_run_id=run_id, **stream_run_kwargs)
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
@@ -3489,11 +3497,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
                 raise
             except Exception as exc:
-                logger.exception("[api_server] session chat stream failed")
+                logger.error("[api_server] session chat stream failed: %s", _redact_api_error_text(exc))
                 self._set_run_status(
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                if stream_lease is not None:
+                    stream_lease.release()
                 self._active_run_agents.pop(run_id, None)
                 self._release_run_owner_if_forgotten(run_id)
                 await queue.put(_event_payload("done", {}))
@@ -3501,6 +3511,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
         task = asyncio.create_task(_run_and_signal())
+        if stream_lease is not None:
+            task.add_done_callback(lambda _done: stream_lease.release())
         self._track_background_task(task)
         headers = {
             "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
@@ -3528,7 +3540,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.info("Session SSE task cancelled; drained live run %s", run_id)
             raise
         except Exception as exc:
-            logger.debug("[api_server] session SSE stream error: %s", exc)
+            logger.debug("[api_server] session SSE stream error: %s", _redact_api_error_text(exc))
         return response
 
     async def _drain_session_stream_task_on_disconnect(
@@ -3978,6 +3990,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False,
+        credential_redaction_lease: Any = None,
         provider_credential: Optional["_provider_credentials.ProviderCredentialOverride"] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
@@ -3998,6 +4011,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_profile = _api_request_profile.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
+        # The caller (HTTP handler or SSE writer) owns its own lease through
+        # response/error rendering. A DISTINCT worker lease follows the executor
+        # thread, which may outlive the awaiting task after cancellation.
+        worker_credential_lease = None
+        if provider_credential is not None:
+            from agent.redact import register_provider_credential_redaction
+            worker_credential_lease = register_provider_credential_redaction(
+                provider_credential.api_key or "")
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -4089,6 +4110,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         setattr(exc, "_notification_presentation_suppressed", True)
                     raise
                 finally:
+                    if worker_credential_lease is not None:
+                        worker_credential_lease.release()
                     # Turn over (any outcome): clear ownership so a late disconnect can't reap
                     # background work this turn deliberately left running.
                     if active_run_id:
@@ -4107,12 +4130,31 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
+        def _run_with_credential_cleanup():
+            try:
+                return _run()
+            finally:
+                if worker_credential_lease is not None:
+                    worker_credential_lease.release()
+
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
             # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
-            return await _api_runs._submit_api_worker(loop, _run)
+            try:
+                worker_future = _api_runs._submit_api_worker(loop, _run_with_credential_cleanup)
+            except BaseException:
+                if worker_credential_lease is not None:
+                    worker_credential_lease.release()
+                raise
+            # Shield the executor Future: cancelling the request task must not cancel a
+            # queued worker before its finally can release the exact-secret lease.
+            # The caller remains cancellable; the thread owns its lease to completion.
+            worker_future.add_done_callback(
+                lambda future: worker_credential_lease.release()
+                if future.cancelled() and worker_credential_lease is not None else None)
+            return await asyncio.shield(worker_future)
         finally:
             self._inflight_agent_runs -= 1
 

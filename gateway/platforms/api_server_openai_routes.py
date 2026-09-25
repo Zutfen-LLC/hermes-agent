@@ -463,7 +463,7 @@ class _ResponsesStream:
                 self.agent_error = self._api._redact_api_error_text(result["error"])
         except Exception as e:  # noqa: BLE001
             from gateway.platforms.api_server import _redact_api_error_text
-            logger.error("Error running agent for streaming responses: %s", _redact_api_error_text(e), exc_info=True)
+            logger.error("Error running agent for streaming responses: %s", _redact_api_error_text(e))
             self.agent_error = self._api._redact_api_error_text(e)
 
     async def close_message_item(self) -> None:
@@ -561,9 +561,27 @@ class OpenAICompatRoutesMixin:
             if text:
                 stream_q.put_threadsafe(("__status__", {"kind": str(kind), "text": text}))
         agent_ref = [None]
-        agent_task = asyncio.ensure_future(self._run_agent(
-            stream_delta_callback=_on_delta, reasoning_callback=_on_reasoning, status_callback=_on_status,
-            agent_ref=agent_ref, **run_kwargs))
+        credential = run_kwargs.get("provider_credential")
+        lease = None
+        if credential is not None:
+            from agent.redact import register_provider_credential_redaction
+            lease = register_provider_credential_redaction(credential.api_key or "")
+            run_kwargs["credential_redaction_lease"] = lease
+        async def _run_stream_worker():
+            return await self._run_agent(
+                stream_delta_callback=_on_delta, reasoning_callback=_on_reasoning, status_callback=_on_status,
+                agent_ref=agent_ref, **run_kwargs)
+        try:
+            agent_task = asyncio.ensure_future(_run_stream_worker())
+        except BaseException:
+            if lease is not None:
+                lease.release()
+            raise
+        if lease is not None:
+            # Worker redaction is independently owned by _run_agent. Keep this
+            # stream-task lease until its response/error rendering has finished,
+            # including cancellation before the worker ever starts.
+            agent_task.add_done_callback(lambda _fut: lease.release())
         agent_task.add_done_callback(lambda _fut: stream_q.put_nowait(None))
         return agent_task, agent_ref
 
@@ -813,8 +831,8 @@ class OpenAICompatRoutesMixin:
                 result, usage = await compute()
             return (result, usage), None
         except Exception as e:
-            logger.error("Error running agent for %s: %s", log_label, _redact_api_error_text(e), exc_info=True)
-            message = "" if getattr(e, "_notification_presentation_suppressed", False) is True else f"Internal server error: {e}"
+            logger.error("Error running agent for %s: %s", log_label, _redact_api_error_text(e))
+            message = "" if getattr(e, "_notification_presentation_suppressed", False) is True else f"Internal server error: {_redact_api_error_text(e)}"
             return None, _error_response(message, 500, err_type="server_error")
 
     async def _prepare_sse_response(
@@ -842,7 +860,7 @@ class OpenAICompatRoutesMixin:
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
         disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
         from gateway.platforms.api_server import (
-            _abandon_agent_task, _chat_usage_payload, _sse_frame)
+            _abandon_agent_task, _chat_usage_payload, _redact_api_error_text, _sse_frame)
         response = await self._prepare_sse_response(request, session_id, gateway_session_key)
 
         def _chunk(delta: Dict[str, Any], finish_reason=None, **extra) -> Dict[str, Any]:
@@ -874,11 +892,14 @@ class OpenAICompatRoutesMixin:
                 usage = agent_usage or usage
             except Exception as exc:
                 agent_error = exc
-                logger.error("Agent task %s failed during SSE streaming: %s", completion_id, exc)
+                logger.error("Agent task %s failed during SSE streaming: %s", completion_id,
+                             _redact_api_error_text(exc))
             completed, is_partial, is_failed, err_msg = _result_flags(result)
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            if err_msg:
+                err_msg = _redact_api_error_text(err_msg)
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
             finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             presentation_muted = (
@@ -897,10 +918,10 @@ class OpenAICompatRoutesMixin:
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             await _abandon_agent_task(agent_ref, agent_task, "SSE client disconnected")
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
-        except Exception:
+        except Exception as exc:
             # Agent crashed mid-stream: an error chunk beats a TransferEncodingError.
-            import traceback as _tb
-            logger.error("Agent crashed mid-stream for %s: %s", completion_id, _tb.format_exc()[:300])
+            logger.error("Agent crashed mid-stream for %s: %s", completion_id,
+                         _redact_api_error_text(exc))
             with suppress(Exception):
                 await response.write(_sse_frame(_chunk({}, "error")))
                 await response.write(b"data: [DONE]\n\n")

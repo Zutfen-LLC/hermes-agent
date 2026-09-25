@@ -473,6 +473,11 @@ Rules:
 - **Authentication.** Only callers that passed the normal API-server
   authorization boundary may use the contract: room-grant bearers and keyless
   listeners are refused with `403` (`provider_credential_auth_required`).
+- **Base URL is not a credential substitute.** `provider_base_url` is accepted
+  only together with `X-Hermes-Provider-API-Key`; a URL-only request is rejected
+  with `400` (`provider_api_key_required`). The URL must be an absolute HTTP(S)
+  URL with a valid host and optional port/path. Userinfo, query strings,
+  fragments, malformed hosts, control characters, and backslashes are rejected.
 - **Precedence.** For that one invocation the request's explicit
   provider/model are authoritative and the caller-supplied key/base URL become
   the runtime values — they beat static Hermes provider credentials, catalog
@@ -484,7 +489,9 @@ Rules:
   fail closed with `provider_credential_unsupported` rather than silently
   dropping it.
 - **No persistence.** The plaintext key lives in memory for the lifetime of
-  the request (and its background run task for `/v1/runs`) only. It is never
+ the request and, for asynchronous `/v1/runs`, until its worker actually
+ exits; streaming/session work similarly retains it only through execution.
+ It is never
   written to run/idempotency storage, the ResponseStore, the session DB,
   logs, errors, events, or API responses. Provider auth failures surface a
   stable redacted diagnostic (status + error code + provider identity) that
@@ -496,6 +503,11 @@ Rules:
   same key + same secret replays the original run; the same key + a
   DIFFERENT secret (or the secret dropped entirely) is a `409`
   `idempotency_key_conflict` — fail closed, never a silent re-association.
+- **Fingerprint authority.** The replay fingerprint is a keyed HMAC made with
+  gateway-only installation material, not the API bearer or provider key. If
+  that keying material is unavailable, credentialed admission fails with
+  `503` (`provider_credential_fingerprint_unavailable`); Hermes does not fall
+  back to an unkeyed or client-known secret.
 - **Restart.** A gateway restart never needs the plaintext: owner-dead runs
   become `interrupted` as before, and a later idempotent replay re-supplies
   the credential.

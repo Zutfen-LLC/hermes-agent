@@ -31,6 +31,50 @@ _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_REDACTION_LOCK = threading.Lock()
 
+# Provider credentials are request-scoped: unlike vault-fill values they must not
+# become process-lifetime redaction entries. Counts allow concurrent requests to
+# share a credential without one worker removing another worker's protection.
+_PROVIDER_REDACTION_VALUES: dict[str, dict[str, int]] = {}
+
+
+class ProviderCredentialRedactionLease:
+    """Idempotent handle released only when the owning worker actually exits."""
+
+    __slots__ = ("_home", "_value", "_released", "_lock")
+
+    def __init__(self, home: str, value: str):
+        self._home, self._value = home, value
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        with _VAULT_REDACTION_LOCK:
+            bucket = _PROVIDER_REDACTION_VALUES.get(self._home)
+            if bucket is None:
+                return
+            count = bucket.get(self._value, 0) - 1
+            if count > 0:
+                bucket[self._value] = count
+            else:
+                bucket.pop(self._value, None)
+            if not bucket:
+                _PROVIDER_REDACTION_VALUES.pop(self._home, None)
+
+
+def register_provider_credential_redaction(value) -> ProviderCredentialRedactionLease | None:
+    """Register an exact provider secret in the active profile; caller owns the lease."""
+    if not isinstance(value, str) or not value:
+        return None
+    home = _vault_scope()
+    with _VAULT_REDACTION_LOCK:
+        bucket = _PROVIDER_REDACTION_VALUES.setdefault(home, {})
+        bucket[value] = bucket.get(value, 0) + 1
+    return ProviderCredentialRedactionLease(home, value)
+
 
 def _vault_scope() -> str:
     from hermes_constants import get_hermes_home
@@ -68,11 +112,14 @@ def redact_registered_vault_values(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
-    for value in values:
+        home = _vault_scope()
+        bucket = _VAULT_REDACTION_VALUES.get(home) or {}
+        provider_bucket = _PROVIDER_REDACTION_VALUES.get(home, {})
+        values = sorted(((value, "«redacted-vault-secret»") for value in bucket), key=lambda item: len(item[0]), reverse=True)
+        values += sorted(((value, "«redacted-provider-credential»") for value in provider_bucket), key=lambda item: len(item[0]), reverse=True)
+    for value, marker in values:
         if value in text:
-            text = text.replace(value, "«redacted-vault-secret»")
+            text = text.replace(value, marker)
     return text
 
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth

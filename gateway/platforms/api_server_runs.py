@@ -457,6 +457,7 @@ class _RunLaunch:
     # in-memory for the lifetime of this run task only. Never persisted, never
     # logged (repr is safe), never threaded into status/events/metadata.
     provider_credential: Any = None
+    credential_redaction_lease: Any = None
 
     @property
     def approval_session_key(self) -> str:
@@ -591,6 +592,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             scope_fn=lambda: self._run_idempotency_scope(request))
     except _pc.ProviderCredentialError as exc:
         return _pc.error_response(exc)
+    credential_redaction_lease = None
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -692,6 +694,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    if provider_credential is not None:
+        from agent.redact import register_provider_credential_redaction
+        credential_redaction_lease = register_provider_credential_redaction(
+            provider_credential.api_key or "")
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -703,7 +709,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author,
-        provider_credential=provider_credential)
+        provider_credential=provider_credential,
+        credential_redaction_lease=credential_redaction_lease)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -894,6 +901,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    worker_submitted = False
+    worker_done = threading.Event()
+    task_exiting = threading.Event()
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -939,8 +949,26 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage, served_runtime = await _submit_api_worker(
-            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        def _run_worker_with_credential_cleanup():
+            try:
+                return _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server)
+            finally:
+                worker_done.set()
+                # On task cancellation the executor may still be running. Keep
+                # this sole lease until it definitively exits; otherwise the
+                # task's final error/status rendering owns the release.
+                if task_exiting.is_set() and run.credential_redaction_lease is not None:
+                    run.credential_redaction_lease.release()
+        worker_future = _submit_api_worker(
+            loop, _run_worker_with_credential_cleanup)
+        worker_submitted = True
+        # A cancelled handler does not cancel a queued executor job: its lease
+        # belongs to the worker until its own finally runs. Shutdown cancellation
+        # of the inner Future has a separate release path.
+        worker_future.add_done_callback(
+            lambda future: run.credential_redaction_lease.release()
+            if future.cancelled() and run.credential_redaction_lease is not None else None)
+        result, usage, served_runtime = await asyncio.shield(worker_future)
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
@@ -968,9 +996,14 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         logger.warning("Provider resolution failed for run=%s: %s", run_id, _redact_api_error_text(exc))
         _finish("failed", error=exc.user_text())
     except Exception as exc:
-        logger.exception("[api_server] run %s failed", run_id)
+        # Never pass the exception object/traceback to logging: provider SDKs
+        # can embed an arbitrary-shaped credential in their diagnostic.
+        logger.error("[api_server] run %s failed: %s", run_id, _redact_api_error_text(exc))
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
+        task_exiting.set()
+        if (not worker_submitted or worker_done.is_set()) and run.credential_redaction_lease is not None:
+            run.credential_redaction_lease.release()
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)

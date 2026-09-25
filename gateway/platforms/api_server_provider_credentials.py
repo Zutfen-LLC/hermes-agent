@@ -25,9 +25,12 @@ Supervisor separately enforces HTTPS for non-loopback gateways).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import ipaddress
 import re
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -65,6 +68,7 @@ class ProviderCredentialOverride:
     # Keyed, non-reversible digest bound to the authenticated principal scope;
     # this is the ONLY derived value allowed to outlive the request.
     fingerprint: str = ""
+    redaction_lease: Any = None
 
     def __repr__(self) -> str:  # defensive: keeps any repr that reaches a log safe
         return (f"<ProviderCredentialOverride provider={self.provider!r} "
@@ -79,28 +83,57 @@ def _clean_secret(value: Any) -> Optional[str]:
 
 
 def _clean_base_url(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not value or len(value) > _MAX_BASE_URL_LEN:
         return None
-    text = value.strip()
-    return text.rstrip("/") or None
+    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f for char in value) or "\\" in value:
+        return None
+    if not value.startswith(("http://", "https://")):
+        return None
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if (parsed.scheme not in ("http", "https") or not host
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or "?" in value or "#" in value
+                or "%" in parsed.netloc or parsed.netloc.endswith(":")
+                or re.fullmatch(r"0[xX][0-9a-fA-F]+", host)):
+            return None
+        if parsed.port is not None and not (1 <= parsed.port <= 65535):
+            return None
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+            if not parsed.netloc.startswith("["):
+                return None
+        elif re.fullmatch(r"[0-9.]+", host):
+            ipaddress.IPv4Address(host)
+        elif (len(host) > 253 or not all(
+                0 < len(label) <= 63 and re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?", label)
+                for label in host.split("."))):
+            return None
+    except ValueError:
+        return None
+    return value
 
 
 def principal_fingerprint_secret(adapter: Any) -> bytes:
-    """Keying material for credential fingerprints.
+    """Load the installation's gateway-only signing secret for credential HMACs.
 
-    Preference order, both gateway-only values no API client can read:
-    1. the installation's RoomLink signing secret (stable across restarts, so
-       replay fingerprints survive a gateway restart);
-    2. an HMAC of the configured API-server key (same derivation domain the
-       hosted-room grants use).
+    No client-known bearer (including API_SERVER_KEY) may key durable provider
+    fingerprints. An unavailable/corrupt/read-only installation secret rejects
+    admission; never substitute another key and redefine existing replays.
     """
+    from gateway.hosted_room_peer import gateway_room_grant_secret
     try:
-        from gateway.hosted_room_peer import gateway_room_grant_secret
-        return gateway_room_grant_secret()
+        key = gateway_room_grant_secret()
     except Exception:
-        pass
-    from gateway.hosted_room_peer import derive_room_grant_secret
-    return derive_room_grant_secret(adapter._expected_api_key())
+        raise ProviderCredentialError(
+            "Gateway-only fingerprint secret is unavailable; credential request cannot be admitted.",
+            status=503, code="provider_credential_fingerprint_unavailable") from None
+    if not isinstance(key, bytes) or not key:
+        raise ProviderCredentialError(
+            "Gateway-only fingerprint secret is unavailable; credential request cannot be admitted.",
+            status=503, code="provider_credential_fingerprint_unavailable")
+    return key
 
 
 def credential_fingerprint(adapter: Any, principal_scope: str, credential: ProviderCredentialOverride) -> str:
@@ -137,13 +170,33 @@ def extract_provider_credential(
     """
     is_body = isinstance(body, dict)
     header_key = _clean_secret(request.headers.get(PROVIDER_API_KEY_HEADER))
+    # Register at the first point the authenticated handler accepts the key,
+    # before any body validation, route lookup, fingerprinting, or resolver can
+    # raise. The handler-task callback covers *all* early-return/error paths.
+    from agent.redact import register_provider_credential_redaction
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    lease = register_provider_credential_redaction(header_key) if task is not None else None
+    if task is not None and lease is not None:
+        task.add_done_callback(lambda _done: lease.release())
     body_base_url = _clean_base_url(body.get(PROVIDER_BASE_URL_FIELD)) if is_body else None
-    using_contract = header_key is not None or body_base_url is not None
+    invalid_base_url = is_body and body.get(PROVIDER_BASE_URL_FIELD) is not None and body_base_url is None
+    using_contract = header_key is not None or (is_body and body.get(PROVIDER_BASE_URL_FIELD) is not None)
     for secret_field in _BODY_SECRET_FIELDS:
         if is_body and body.get(secret_field) is not None:
             raise _body_secret_error(secret_field)
+    if invalid_base_url:
+        raise ProviderCredentialError(
+            f"'{PROVIDER_BASE_URL_FIELD}' must be a structurally valid http(s) URL of at most {_MAX_BASE_URL_LEN} characters.",
+            code="invalid_provider_base_url")
     if not using_contract:
         return None
+    if header_key is None:
+        raise ProviderCredentialError(
+            f"'{PROVIDER_BASE_URL_FIELD}' requires {PROVIDER_API_KEY_HEADER} for a credentialed provider.",
+            code="provider_api_key_required")
     # Fail closed on any authorization shape that is not the normal
     # API_SERVER_KEY bearer boundary (room grants, keyless test listeners).
     room_token = getattr(adapter, "_room_grant_token", None)
@@ -160,11 +213,10 @@ def extract_provider_credential(
             raise ProviderCredentialError(
                 f"{PROVIDER_API_KEY_HEADER} must be 1-{_MAX_API_KEY_LEN} visible characters.",
                 code="invalid_provider_credential")
-    if body_base_url is not None:
-        if len(body_base_url) > _MAX_BASE_URL_LEN or not body_base_url.lower().startswith(("http://", "https://")):
-            raise ProviderCredentialError(
-                f"'{PROVIDER_BASE_URL_FIELD}' must be an http(s) URL of at most {_MAX_BASE_URL_LEN} characters.",
-                code="invalid_provider_base_url")
+    if len(str(body.get(PROVIDER_BASE_URL_FIELD)).strip()) > _MAX_BASE_URL_LEN:
+        raise ProviderCredentialError(
+            f"'{PROVIDER_BASE_URL_FIELD}' must be an http(s) URL of at most {_MAX_BASE_URL_LEN} characters.",
+            code="invalid_provider_base_url")
     # Explicit provider identity is mandatory: never guess from the key.
     provider = ""
     if is_body:
@@ -174,8 +226,14 @@ def extract_provider_credential(
             "An explicit 'provider' is required when request-scoped provider credentials are supplied.",
             code="provider_required_for_credential")
     credential = ProviderCredentialOverride(
-        api_key=header_key, base_url=body_base_url, provider=provider)
-    credential.fingerprint = credential_fingerprint(adapter, scope_fn(), credential)
+        api_key=header_key, base_url=body_base_url, provider=provider,
+        redaction_lease=lease)
+    try:
+        credential.fingerprint = credential_fingerprint(adapter, scope_fn(), credential)
+    except BaseException:
+        if lease is not None:
+            lease.release()
+        raise
     return credential
 
 
@@ -192,17 +250,27 @@ def resolve_credential_runtime(
     ignore ``explicit_api_key``; a silent drop would send someone else's
     credential — or none — to the caller's stated provider).
     """
-    from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+    if not credential.api_key:
+        raise ProviderCredentialError(
+            f"Request-scoped provider runtime requires {PROVIDER_API_KEY_HEADER}.",
+            code="provider_api_key_required")
+    from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         runtime = resolve_runtime_provider(
             requested=credential.provider,
             explicit_api_key=credential.api_key or None,
             explicit_base_url=credential.base_url or None,
             target_model=target_model or None)
-    except Exception as exc:
+    except Exception:
+        # A provider may include arbitrary caller-key bytes in its exception.
+        # Never relay the underlying text, even through a traceback chain.
         raise ProviderCredentialError(
-            f"Provider resolution failed for request-scoped credentials: {format_runtime_provider_error(exc)}",
-            code="provider_resolution_failed") from exc
+            "Provider resolution failed for request-scoped credentials.",
+            code="provider_resolution_failed") from None
+    if not isinstance(runtime, dict):
+        raise ProviderCredentialError(
+            "Provider resolution failed for request-scoped credentials.",
+            code="provider_resolution_failed")
     if credential.api_key and runtime.get("api_key") != credential.api_key:
         raise ProviderCredentialError(
             f"Provider '{credential.provider}' does not accept request-scoped API keys "
@@ -238,13 +306,8 @@ def apply_credential_runtime(runtime_kwargs: Dict[str, Any], runtime: Dict[str, 
         runtime_kwargs.pop("base_url", None)
     # A rotating pool would replace the caller's key with a static one.
     runtime_kwargs["credential_pool"] = None
-    # Belt for error/dump paths: exact-substring scrub of the caller's key in
-    # any redacted text (registry patterns only cover known key shapes).
-    try:
-        from agent.redact import register_vault_redaction_value
-        register_vault_redaction_value(str(runtime.get("api_key") or ""))
-    except Exception:
-        pass
+    # Caller-key redaction is owned by the authenticated request and its worker
+    # leases, not the long-lived browser-vault redaction registry.
 
 
 def error_response(exc: ProviderCredentialError):
