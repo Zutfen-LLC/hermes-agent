@@ -503,6 +503,11 @@ Rules:
   same key + same secret replays the original run; the same key + a
   DIFFERENT secret (or the secret dropped entirely) is a `409`
   `idempotency_key_conflict` — fail closed, never a silent re-association.
+  The fingerprint binds the full request-scoped runtime identity — principal
+  scope, explicit provider, API key, and `provider_base_url` — so a changed
+  base URL is never idempotently equivalent to the prior endpoint: `/v1/runs`
+  answers `409`, and chat completions / Responses recompute against the new
+  endpoint instead of replaying the cached one.
 - **Fingerprint authority.** The replay fingerprint is a keyed HMAC made with
   gateway-only installation material, not the API bearer or provider key. If
   that keying material is unavailable, credentialed admission fails with
