@@ -256,7 +256,7 @@ async def _main() -> int:
         for f in failures:
             print(" -", f)
         return 1
-    print("\nFIXTURE PASSED: all 10 proof points satisfied")
+    print("\nFIXTURE PASSED: all proof points satisfied")
     return 0
 
 

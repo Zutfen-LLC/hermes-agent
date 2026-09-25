@@ -489,9 +489,9 @@ Rules:
   fail closed with `provider_credential_unsupported` rather than silently
   dropping it.
 - **No persistence.** The plaintext key lives in memory for the lifetime of
- the request and, for asynchronous `/v1/runs`, until its worker actually
- exits; streaming/session work similarly retains it only through execution.
- It is never
+  the request and, for asynchronous `/v1/runs`, until its worker actually
+  exits; streaming/session work similarly retains it only through execution.
+  It is never
   written to run/idempotency storage, the ResponseStore, the session DB,
   logs, errors, events, or API responses. Provider auth failures surface a
   stable redacted diagnostic (status + error code + provider identity) that
