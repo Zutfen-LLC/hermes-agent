@@ -31,6 +31,7 @@ def _app(adapter):
     for method, path, handler in routes:
         app.router.add_route(method, path, handler)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
 
 
@@ -62,6 +63,8 @@ async def service(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("HERMES_HOME", str(home))
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": AUTH["Authorization"].split()[-1]}))
     adapter._create_agent = lambda **kwargs: Agent()
+    db = await adapter._ensure_session_db_async()
+    db.create_session("sentinel-session", "api_server")
     caplog.set_level(logging.DEBUG)
     async with TestClient(TestServer(_app(adapter))) as client:
         yield client, adapter, home, caplog
@@ -161,8 +164,12 @@ async def test_normal_chat_and_session_chat_are_secret_free(service):
     # The authenticated session endpoint parses the same scoped header and invokes the real handler.
     session = await client.post("/api/sessions/sentinel-session/chat", json={"message": "hello", "provider": "deepinfra"}, headers=_headers())
     session_text = await session.text()
-    assert SECRET not in session_text
-    _assert_no_secret(client, home, caplog, chat_text, session_text)
+    assert session.status == 200 and SECRET not in session_text
+    stream = await client.post("/api/sessions/sentinel-session/chat/stream",
+                               json={"message": "hello", "provider": "deepinfra"}, headers=_headers())
+    stream_text = await stream.text()
+    assert stream.status == 200 and SECRET not in stream_text
+    _assert_no_secret(client, home, caplog, chat_text, session_text, stream_text)
 
 
 @pytest.mark.asyncio
