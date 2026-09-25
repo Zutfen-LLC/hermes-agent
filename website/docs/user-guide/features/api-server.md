@@ -409,6 +409,133 @@ Requests that include an explicit `provider` — and the Hermes-native
 `/v1/runs` and session-chat endpoints — always honor the requested model
 regardless of this flag.
 
+## Request-scoped provider credentials (`X-Hermes-Provider-API-Key`)
+
+An authenticated API client can supply the provider API key and base URL that
+apply to a single invocation, without editing Hermes config, touching the
+environment, or restarting anything. This is the contract external orchestrators
+(such as Ops Supervisor) use when they own provider configuration and store
+provider keys encrypted on their side.
+
+Send the SECRET provider API key in a purpose-specific header — never the JSON
+body — plus an explicit `provider` (mandatory; never guessed from the key) and
+optionally the NON-secret `provider_base_url`:
+
+```http
+POST /v1/runs HTTP/1.1
+Authorization: Bearer ***
+Idempotency-Key: ops-run-0173
+X-Hermes-Provider-API-Key: <provider key>
+Content-Type: application/json
+
+{
+  "input": "Deploy the branch and report.",
+  "provider": "deepinfra",
+  "model": "Qwen/Qwen2.5-72B-Instruct",
+  "provider_base_url": "https://api.deepinfra.com/v1/openai"
+}
+```
+
+Accepted on `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/runs`,
+`POST /api/sessions/{session_id}/chat(+/stream)`, and every `/p/<profile>/`
+mirror of those routes.
+
+Feature-detect it via `GET /v1/capabilities`:
+
+```json
+"features": {
+  "provider_runtime_credentials": {
+    "supported": true,
+    "api_key_header": "X-Hermes-Provider-API-Key",
+    "base_url_field": "provider_base_url",
+    "per_request": true,
+    "persisted": false,
+    "idempotent_replay": "credential_fingerprint"
+  }
+}
+```
+
+`admin_config_rw` stays `false`: this is not persistent config mutation.
+
+Rules:
+
+- **Header, not body.** The secret must ride the
+  `X-Hermes-Provider-API-Key` header. A body-carried `provider_api_key` /
+  `provider_credentials` is rejected with `400`
+  (`provider_credential_in_body`) because clients durably retain request
+  bodies — `/v1/runs` idempotency replay depends on that — and Hermes must
+  not turn body retention into credential persistence.
+- **Explicit provider required.** A credential without `provider` (or
+  `provider_id`) is rejected with `400` (`provider_required_for_credential`).
+  The provider is never inferred from the key. The request's provider/model
+  still passes the existing route-conflict validation (`model_routes`,
+  model-lock) unchanged.
+- **Authentication.** Only callers that passed the normal API-server
+  authorization boundary may use the contract: room-grant bearers and keyless
+  listeners are refused with `403` (`provider_credential_auth_required`).
+- **Base URL is not a credential substitute.** `provider_base_url` is accepted
+  only together with `X-Hermes-Provider-API-Key`; a URL-only request is rejected
+  with `400` (`provider_api_key_required`). The URL must be an absolute HTTP(S)
+  URL with a valid host and optional port/path. Userinfo, query strings,
+  fragments, malformed hosts, control characters, and backslashes are rejected.
+- **Precedence.** For that one invocation the request's explicit
+  provider/model are authoritative and the caller-supplied key/base URL become
+  the runtime values — they beat static Hermes provider credentials, catalog
+  entries, credential pools, session `/model` overrides, and route-pinned
+  secrets for that request. Every precedence rule below the credential applies
+  again on the next request without the header; nothing is written back to
+  config, sessions, or routes. Providers whose credentials resolve through a
+  login or external process (OAuth, ACP) cannot honor a request-scoped key and
+  fail closed with `provider_credential_unsupported` rather than silently
+  dropping it.
+- **No persistence.** The plaintext key lives in memory for the lifetime of
+  the request and, for asynchronous `/v1/runs`, until its worker actually
+  exits; streaming/session work similarly retains it only through execution.
+  It is never
+  written to run/idempotency storage, the ResponseStore, the session DB,
+  logs, errors, events, or API responses. Provider auth failures surface a
+  stable redacted diagnostic (status + error code + provider identity) that
+  never echoes the key.
+- **Idempotency.** `/v1/runs` durable idempotency is unchanged for ordinary
+  requests. For credential requests the durable fingerprint incorporates a
+  keyed, non-reversible HMAC of the secret (bound to the authenticated
+  principal scope; the plaintext is never stored to compare replays): the
+  same key + same secret replays the original run; the same key + a
+  DIFFERENT secret (or the secret dropped entirely) is a `409`
+  `idempotency_key_conflict` — fail closed, never a silent re-association.
+  The fingerprint binds the full request-scoped runtime identity — principal
+  scope, explicit provider, API key, and `provider_base_url` — so a changed
+  base URL is never idempotently equivalent to the prior endpoint: `/v1/runs`
+  answers `409`, and chat completions / Responses recompute against the new
+  endpoint instead of replaying the cached one. Because the fingerprint now
+  includes the URL, a durable row recorded before an upgrade by an older
+  fingerprint spelling is answered with the same fail-closed `409` until the
+  row leaves the retention window (24h) — a retry then starts a fresh run
+  rather than replaying the pre-upgrade one.
+- **Fingerprint authority.** The replay fingerprint is a keyed HMAC made with
+  gateway-only installation material, not the API bearer or provider key. If
+  that keying material is unavailable, credentialed admission fails with
+  `503` (`provider_credential_fingerprint_unavailable`); Hermes does not fall
+  back to an unkeyed or client-known secret.
+- **Restart.** A gateway restart never needs the plaintext: owner-dead runs
+  become `interrupted` as before, and a later idempotent replay re-supplies
+  the credential.
+- **Chat sessions.** The credential is per-turn and never stored in the
+  session: send it again on every turn that needs it (with
+  `X-Hermes-Session-Id` for continuity), and a different credential on a
+  later turn affects only that turn.
+- **Transport.** The credential crosses the gateway connection verbatim;
+  remote use requires HTTPS/TLS or an equivalently protected trusted
+  transport (orchestrators like Ops Supervisor separately enforce HTTPS for
+  non-loopback gateways).
+
+Error codes: `provider_credential_in_body` (400), `invalid_provider_credential`
+(400), `invalid_provider_base_url` (400), `provider_required_for_credential`
+(400), `provider_credential_auth_required` (403),
+`provider_resolution_failed` (400, resolution ladder failure),
+`provider_credential_unsupported` (400, provider cannot take a request-scoped
+key). None of the messages ever include the credential value.
+
 Example:
 
 ```json
