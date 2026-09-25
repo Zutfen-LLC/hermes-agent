@@ -675,6 +675,18 @@ def credential_pool_entry_serves_endpoint(entry: Any, base_url: Any) -> bool:
     return normalize_route_base_url(entry_url) == normalize_route_base_url(base_url)
 
 
+def native_pool_auth_type(provider: Any) -> Optional[str]:
+    """The one pool auth type a provider's endpoint accepts, or None when several are valid (Anthropic and
+    OpenRouter take both API keys and OAuth). The Codex/xAI OAuth endpoints reject API keys outright."""
+    return AUTH_TYPE_OAUTH if provider in _TOKENS_SINGLETON_PROVIDERS else None
+
+
+def credential_pool_entry_matches_auth_type(entry: Any, auth_type: Optional[str]) -> bool:
+    """Whether a pooled credential carries ``auth_type`` (None = unconstrained). A session pinned to an OAuth
+    authority must never adopt an API-key entry from the same pool, or vice versa (#216 prereq)."""
+    return auth_type is None or getattr(entry, "auth_type", None) == auth_type
+
+
 def credential_pool_matches_provider(
     pool_or_provider: Any,
     provider: Optional[str],
