@@ -1,8 +1,10 @@
 """Real HTTP admission keeps exact provider secrets only for active invocations."""
 
 import asyncio
+import logging
 import threading
 from collections import defaultdict
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -173,8 +175,14 @@ async def test_missing_gateway_fingerprint_secret_rejects_before_run_admission()
 
 @pytest.mark.parametrize("provider", ["deepinfra", "anthropic"])
 @pytest.mark.asyncio
-async def test_base_only_http_request_never_substitutes_gateway_key_into_caller_endpoint(provider):
+async def test_base_only_http_request_never_substitutes_gateway_key_into_caller_endpoint(
+    provider, tmp_path, monkeypatch, caplog
+):
     static = "STATIC_GATEWAY_KEY_DO_NOT_SEND"
+    home = Path(tmp_path) / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    caplog.set_level(logging.DEBUG)
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": AUTH["Authorization"].split()[-1]}))
     delivered = []
     async def fake_endpoint(request):
@@ -193,6 +201,10 @@ async def test_base_only_http_request_never_substitutes_gateway_key_into_caller_
     assert response.status == 400
     assert data["error"]["code"] == "provider_api_key_required"
     assert static not in str(data)
+    assert static not in caplog.text
+    for path in home.rglob("*"):
+        if path.is_file():
+            assert static.encode() not in path.read_bytes(), f"static key persisted in {path.name}"
     assert delivered == []
     resolve.assert_not_called()
     create.assert_not_called()
