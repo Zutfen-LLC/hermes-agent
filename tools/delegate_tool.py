@@ -284,8 +284,9 @@ def _build_child_agent(
     )
     if child_pool is not None:
         child._credential_pool = child_pool
-        if child_pool is getattr(parent_agent, "_credential_pool", None):
-            # Shared pool: the lease reacquires the entry the parent is actually bound to (see _lease_child_credential).
+        if child_pool is getattr(parent_agent, "_credential_pool", None) and rt.get("api_key") == parent_api_key:
+            # Shared pool on the parent's exact credential: the lease reacquires the entry the parent is bound to
+            # (see _lease_child_credential). An explicitly configured key is never replaced by the parent's entry.
             child._credential_pool_entry_id = getattr(parent_agent, "_credential_pool_entry_id", None)
 
     _attach_child(parent_agent, child)  # interrupt propagation

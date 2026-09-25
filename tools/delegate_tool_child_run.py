@@ -450,7 +450,7 @@ def _log_child_auth_route(child: Any, entry: Any) -> None:
     logger.info(
         "subagent auth route: provider=%s model=%s auth_type=%s auth_source=%s endpoint=%s",
         getattr(child, "provider", None) or "-", getattr(child, "model", None) or "-",
-        getattr(entry, "auth_type", None) or getattr(child, "_pinned_auth_type", None) or "inherited",
+        getattr(entry, "auth_type", None) or getattr(child, "_pinned_auth_type", None) or "unknown",
         getattr(entry, "source", None) or "inherited", base_url_hostname(getattr(child, "base_url", None) or "") or "-",
     )
 
@@ -458,18 +458,18 @@ def _log_child_auth_route(child: Any, entry: Any) -> None:
 def _lease_child_credential(child: Any) -> tuple[Any, Optional[str]]:
     """Lease a credential from the child's pool (if any) and bind it; ``(pool, lease_id)``.
 
-    The child inherits the parent's authentication AUTHORITY, not whatever the pool hands out: the entry backing the
-    child's credential is reacquired and its auth type pinned, so neither this lease nor a later rotation can move an
+    The child inherits the parent's authentication AUTHORITY, not whatever the pool hands out: the auth type of the
+    entry backing the child's credential is pinned, so neither this lease nor a later rotation can move an
     OAuth child onto an API-key entry (an ``openai-codex`` child leasing a stale ``sk-`` key 401s while the parent
     keeps working). With no backing entry, providers with one native auth type pin that type; others keep
     least-leased sharing. The bound entry must also serve the child's endpoint: on a mixed same-provider pool the
-    least-leased pick may target another host, so it is released and a matching entry is leased by id (#68237)."""
+    least-leased pick may target another host (#68237)."""
     child_pool = getattr(child, "_credential_pool", None)
     if child_pool is None:
         return None, None
     from agent.credential_pool import (
         credential_pool_entry_matches_auth_type as _entry_has_auth_type,
-        credential_pool_entry_serves_endpoint as _entry_serves_endpoint, native_pool_auth_type,
+        AUTH_TYPE_OAUTH, credential_pool_entry_serves_endpoint as _entry_serves_endpoint, native_pool_auth_type,
     )
     base_url = getattr(child, "base_url", None)
     authority = _child_authority_entry(child, child_pool.entries())
@@ -479,21 +479,19 @@ def _lease_child_credential(child: Any) -> tuple[Any, Optional[str]]:
     def _serves(entry: Any) -> bool:
         return _entry_serves_endpoint(entry, base_url) and _entry_has_auth_type(entry, pinned)
 
-    leased_cred_id = child_pool.acquire_lease(authority.id) if authority is not None else child_pool.acquire_lease()
-    leased_entry = None
-    if leased_cred_id is not None:
+    # OAuth refresh tokens are single-use, so an OAuth child shares the parent's exact entry (one refresh owner)
+    # while it is available; otherwise, and for API keys, least-leased spreading over compatible entries only.
+    leased_cred_id = None
+    if authority is not None and pinned == AUTH_TYPE_OAUTH:
+        leased_cred_id = child_pool.acquire_lease(predicate=lambda e: e.id == authority.id and _serves(e))
+    if leased_cred_id is None:
+        leased_cred_id = child_pool.acquire_lease(predicate=_serves)
+    # Resolve the leased entry by id: the pool is shared with the parent/siblings, so current() is a mutable cursor
+    # that may already point at someone else's pick.
+    leased_entry = next((e for e in child_pool.entries() if e.id == leased_cred_id), None)
+    if leased_entry is not None and hasattr(child, "_swap_credential"):
         with _quiet("Failed to bind child to leased credential: %s"):
-            # Resolve the leased entry by id: the pool is shared with the parent/siblings, so current() is a
-            # mutable cursor that may already point at someone else's pick.
-            leased_entry = next((e for e in child_pool.entries() if e.id == leased_cred_id), None)
-            if not _serves(leased_entry):
-                child_pool.release_lease(leased_cred_id)
-                leased_entry = next(
-                    (e for e in child_pool.entries() if e.last_status != "dead" and _serves(e)), None,
-                )
-                leased_cred_id = child_pool.acquire_lease(leased_entry.id) if leased_entry is not None else None
-            if leased_entry is not None and hasattr(child, "_swap_credential"):
-                child._swap_credential(leased_entry)
+            child._swap_credential(leased_entry)
     _log_child_auth_route(child, leased_entry)
     return child_pool, leased_cred_id
 
