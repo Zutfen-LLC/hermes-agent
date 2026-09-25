@@ -137,16 +137,25 @@ def principal_fingerprint_secret(adapter: Any) -> bytes:
 
 
 def credential_fingerprint(adapter: Any, principal_scope: str, credential: ProviderCredentialOverride) -> str:
-    """Non-reversible, key-bound digest of the secret for idempotency replay
-    comparison. Unsalted hashing is deliberately avoided: an attacker holding
-    the durable store must not be able to trial-dictionary the credential
-    offline against a bare digest."""
+    """Bind the effective request-scoped provider runtime identity to replay checks.
+
+    Principal scope, explicit provider, API-key identity, and provider base URL
+    determine the runtime. A changed base URL selects a different runtime and
+    must never replay the prior endpoint's result. After structural validation,
+    the base URL is non-secret and is bound verbatim: normalizing near-identical
+    spellings could equate distinct endpoints, while treating distinct spellings
+    as distinct only recomputes, the fail-safe direction. URL-less credentials
+    retain the pre-correction message so existing durable replays survive.
+
+    The digest is a keyed HMAC, not a bare hash: an attacker holding the
+    durable store must not be able to trial-dictionary the credential offline
+    against an unsalted digest.
+    """
     key = principal_fingerprint_secret(adapter)
-    message = "\0".join((
-        principal_scope,
-        credential.provider or "",
-        credential.api_key or "",
-    )).encode("utf-8")
+    parts = (principal_scope, credential.provider or "", credential.api_key or "")
+    if credential.base_url:
+        parts += (credential.base_url,)
+    message = "\0".join(parts).encode("utf-8")
     return hmac.new(key, _FINGERPRINT_DOMAIN + message, hashlib.sha256).hexdigest()
 
 

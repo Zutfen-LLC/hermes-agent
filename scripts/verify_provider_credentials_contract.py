@@ -18,6 +18,7 @@ following proof points of the bridge:
 8. ordinary requests return to the static configuration
 9. unsafe base-URL-only input is rejected without echoing caller material
 10. exact-secret redaction protects arbitrary resolver errors and logs
+11. changing only the provider base URL on chat idempotency recomputes for the new endpoint
 
 Usage:
     python scripts/verify_provider_credentials_contract.py [--port 8791]
@@ -93,7 +94,7 @@ async def _main() -> int:
                 started.set()
                 if not release.wait(timeout=5):
                     raise RuntimeError("fixture lifetime probe timed out")
-            return {"final_response": f"ok via {self.provider}", "completed": True}
+            return {"final_response": f"ok via {self.provider} at {self.kwargs.get('base_url')}", "completed": True}
 
     failures: list[str] = []
 
@@ -242,6 +243,27 @@ async def _main() -> int:
             check(10, status >= 400 and no_echo and
                   _PROVIDER_REDACTION_VALUES.get(scope, {}).get(SENTINEL_A, 0) == 0,
                   "resolver failure response/log withheld secret; lease released")
+
+            # -- proof 11: chat idempotency recomputes when only endpoint changes --
+            endpoint_a = "https://endpoint-a.fixture.test/v1"
+            endpoint_b = "https://endpoint-b.fixture.test/v1"
+            chat_body = {"provider": "deepinfra", "model": "Qwen/Qwen2.5-72B-Instruct",
+                         "provider_base_url": endpoint_a,
+                         "messages": [{"role": "user", "content": "endpoint identity"}]}
+            chat_headers = {**auth, "X-Hermes-Provider-API-Key": SENTINEL_A,
+                            "Idempotency-Key": "fixture-url-change-11"}
+            before = len(captured)
+            first_status, first_data, _ = await post_json("/v1/chat/completions", chat_body, chat_headers)
+            second_status, second_data, _ = await post_json(
+                "/v1/chat/completions", {**chat_body, "provider_base_url": endpoint_b}, chat_headers)
+            first_text = first_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            second_text = second_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            executions = captured[before:]
+            check(11, first_status == second_status == 200 and len(executions) == 2
+                  and executions[1]["base_url"] == endpoint_b
+                  and endpoint_a in first_text and endpoint_b in second_text
+                  and endpoint_a not in second_text,
+                  "changed URL executed twice and second response used endpoint B")
 
         await server.close()
 
