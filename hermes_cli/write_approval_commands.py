@@ -113,7 +113,7 @@ def handle_pending_subcommand(
 
 
 def _usage(subsystem: str) -> str:
-    usage = f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
+    usage = f"Usage: /{subsystem} approve|reject <id> [<id> ...]  (or 'all')"
     if subsystem == wa.MEMORY:
         usage += f"  — bulk-reject archived: /memory reject {' /'.join(sorted(_BULK_REJECT_FLAGS))}"
     return usage
@@ -152,6 +152,7 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     if not records:
         return f"No pending {subsystem} writes."
     skip_summary = None
+    refusals: List[str] = []
     if target.lower() == "all":
         if subsystem == wa.MEMORY:
             skip_summary, targets = _ready_memory_records(subsystem, memory_store)
@@ -163,15 +164,24 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         else:
             targets = list(records)
     else:
-        rec = wa.get_pending(subsystem, target)
-        if not rec:
-            return f"No pending {subsystem} write with id '{target}'."
-        if rec.get("status") == wa.STATUS_REJECTED:
-            # Rejected records are terminal evidence: applying (then unlinking) one
-            # here would destroy the audit trail the rejection decision rests on.
-            return (f"Record '{target}' was rejected and is kept as evidence only; "
-                    f"recreate the change instead if you still want it.")
-        targets = [rec]
+        # One or more explicit ids (multi-id: /memory approve <id1> <id2> ...). Ids that
+        # cannot be applied are reported individually rather than silently skipping — and a
+        # missing or rejected id does not stop the rest of the list from being applied.
+        targets = []
+        for pending_id in rest:
+            rec = wa.get_pending(subsystem, pending_id)
+            if not rec:
+                refusals.append(f"No pending {subsystem} write with id '{pending_id}'.")
+                continue
+            if rec.get("status") == wa.STATUS_REJECTED:
+                # Rejected records are terminal evidence: applying (then unlinking) one
+                # here would destroy the audit trail the rejection decision rests on.
+                refusals.append(f"Record '{pending_id}' was rejected and is kept as evidence "
+                                f"only; recreate the change instead if you still want it.")
+                continue
+            targets.append(rec)
+        if not targets:
+            return "\n".join(refusals) if refusals else _usage(subsystem)
 
     applied, failed, overwritten, removed = 0, [], [], []
     for rec in targets:
@@ -204,6 +214,8 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         out.extend(f"  {f}" for f in failed)
     if skip_summary:
         out.append(skip_summary)
+    if refusals:
+        out.extend(refusals)
     return "\n".join(out)
 
 

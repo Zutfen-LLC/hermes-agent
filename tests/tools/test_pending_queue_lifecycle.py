@@ -399,6 +399,45 @@ def test_approve_single_failed_attempt_persists_classification(hermes_home):
     assert rec["id"] not in listing  # not listed; counts-only footer
 
 
+def test_approve_multiple_ids_applies_each(hermes_home):
+    """/memory approve <id> <id> ... applies every listed ready record in one call."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "keeper entry that stays")
+    store.add("memory", "first approve target entry")
+    store.add("memory", "second approve target entry")
+    first = _stage_remove("first approve target entry", "first approve target")
+    second = _stage_remove("second approve target entry", "second approve target")
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", first["id"], second["id"]],
+                                    memory_store=store)
+    assert "Approved 2" in out
+    assert store._entries_for("memory") == ["keeper entry that stays"]
+    assert all(not wa._pending_path(wa.MEMORY, r["id"]).exists() for r in (first, second))
+
+
+def test_approve_multiple_ids_reports_missing_and_rejected_but_applies_the_rest(hermes_home):
+    """One bad id in the list must not silently swallow the good ones, and must not
+    stop them from being applied."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "good target entry")
+    store.add("memory", "rejected target entry")
+    good = _stage_remove("good target entry", "good target")
+    rejected = _stage_remove("rejected target entry", "rejected target")
+    handle_pending_subcommand(wa.MEMORY, ["reject", rejected["id"]], memory_store=store)
+
+    out = handle_pending_subcommand(
+        wa.MEMORY, ["approve", "deadbeef", rejected["id"], good["id"]], memory_store=store)
+    assert "Approved 1" in out
+    assert "No pending memory write with id 'deadbeef'" in out
+    assert "kept as evidence only" in out
+    assert "good target entry" not in store._entries_for("memory")          # the good one applied
+    assert "rejected target entry" in store._entries_for("memory")          # the rejected one did not
+    assert wa._pending_path(wa.MEMORY, rejected["id"]).exists()             # evidence kept
+
+
 def test_approve_single_ready_still_applies(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa
