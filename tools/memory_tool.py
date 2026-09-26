@@ -7,6 +7,7 @@ Single `memory` tool: add/replace/remove or a batch `operations` list."""
 import copy
 import json
 import logging
+from contextlib import suppress
 from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -183,6 +184,13 @@ def _background_delete_gate(store, action, operations, target="memory", content=
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
+        from tools import write_approval as wa
+        autonomous = wa.unattended_memory_consolidation_enabled()
+    except Exception:
+        autonomous = False  # unreadable policy keeps the safe stage-for-approval path
+    if autonomous:
+        return _autonomous_consolidation(store, payload, detail)
+    try:
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched
         from tools import write_approval as wa
@@ -202,6 +210,64 @@ def _background_delete_gate(store, action, operations, target="memory", content=
         return tool_error(
             "Background review may not delete memory entries ('replace'/'remove', including in a "
             "batch); 'add' is still available.", success=False)
+
+
+def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], detail: str) -> str:
+    """Opt-in path (``memory.allow_unattended_consolidation``, #106919): an unattended
+    background-review fork applies destructive consolidation DIRECTLY, wrapped in the
+    same guarantees as an approved staged write — exact-entry pinning, the public atomic
+    store path, plus an audit snapshot taken BEFORE anything is applied (fail-closed: no
+    snapshot, no mutation) and an undo hint. ``/memory undo <audit_id>`` restores the
+    recorded before-state as one atomic batch."""
+    from tools.memory_consolidation import MemoryConsolidationAuditError, record_applied, record_begin
+
+    target = payload.get("target", "memory")
+    try:
+        # Fresh authoritative view: pin, snapshot and budget all judge the same disk state.
+        store.load_from_disk()
+        before_entries = list(store._entries_for(target))
+        before_raw = store._read_raw_checked(store._path_for(target))[0]
+        if (unmatched := _pin_matched_entries(store, payload)) is not None:
+            return unmatched  # missing/ambiguous anchor: the store's own error, nothing applied
+        try:
+            audit_id = record_begin(target, destructive_ops(payload), before_raw, before_entries)
+        except MemoryConsolidationAuditError as e:
+            return tool_error(f"Unattended consolidation refused: audit snapshot could not be "
+                              f"created ({e}); nothing was applied.", success=False)
+        result = apply_memory_pending(payload, store)
+        if not result.get("success"):
+            # Fail closed; the begin record stays in the ledger as auditable evidence.
+            return json.dumps(result, ensure_ascii=False)
+        if payload.get("action") == "batch":
+            replaced = result.get("replaced_entries") or {}
+            removed = result.get("removed_entries") or {}
+            counts = {"replaced": len(replaced), "removed": len(removed),
+                      "added": sum(1 for op in payload.get("operations") or []
+                                   if (op or {}).get("action") == "add")}
+        else:
+            counts = {"replaced": int(bool(result.get("replaced_entry"))),
+                      "removed": int(bool(result.get("removed_entry"))), "added": 0}
+        with suppress(Exception):  # best-effort: the commit is already durable
+            after_raw = store._read_raw_checked(store._path_for(target))[0]
+            record_applied(audit_id, target, after_raw, counts)
+        tool_result = {
+            "success": True, "done": True, "target": target,
+            "autonomously_consolidated": True, "audit_id": audit_id,
+            "replaced": counts["replaced"], "removed": counts["removed"], "added": counts["added"],
+            "usage": result.get("usage"), "entry_count": result.get("entry_count"),
+            "message": f"Unattended memory consolidation applied automatically. "
+                       f"Recovery: /memory undo {audit_id}",
+        }
+        for extra in ("replaced_entries", "removed_entries", "replaced_entry", "removed_entry"):
+            if result.get(extra) is not None:
+                tool_result[extra] = result[extra]
+        return json.dumps(tool_result, ensure_ascii=False)
+    except Exception:
+        logger.warning("Unattended consolidation failed; nothing was applied (ops: %s)",
+                       detail, exc_info=True)
+        return tool_error("Unattended consolidation failed safely; nothing was applied. "
+                          "The operator can retry it in the foreground or via /memory.",
+                          success=False)
 
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
