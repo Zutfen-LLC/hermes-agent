@@ -130,6 +130,17 @@ _RULES: dict[str, tuple] = {
                 "test_failed_setup_never_runs_child_and_releases_handles[$case]\")\n"
                 "            done\n"
                 "          fi\n"),
+        # Upstream sizes Windows x64 concurrency for 32 cores; on 4 vCPUs 8 and 6
+        # concurrent files starve PowerShell and taskkill deadlines. The hosted
+        # arm64 lane already runs at 2 and passes.
+        Replace("tests-os: windows x64 workers",
+                "(runner.arch == 'ARM64' && '2' || '8')",
+                "(runner.arch == 'ARM64' && '2' || '3')"),
+        Replace("tests-os: windows x64 bound",
+                "          - name: Windows-only tests\n",
+                "          - name: Windows-only tests\n            timeout: 45\n"),
+        Replace("tests-os: windows e2e workers", "HERMES_TEST_WORKERS: '6'\n", "HERMES_TEST_WORKERS: '3'\n"),
+        Replace("tests-os: windows e2e bound", "    timeout-minutes: 25\n", "    timeout-minutes: 40\n"),
     ),
     "js-tests.yml": (
         # Every check sizes its own worker pool to the core count; four at once
