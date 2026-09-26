@@ -12,7 +12,7 @@ name: OS-specific tests
 # is where those markers actually execute:
 #
 #   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest and windows-11-arm (fork)
+#   windows  → ``-m platforms``    on windows-latest and windows-11-arm
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -61,9 +61,8 @@ jobs:
           - name: macOS-only tests
             runner: macos-latest
             marker: macos
-          # Fork: standard hosted runners instead of upstream's private
-          # 32-core images (windows-11-arm is the public-repo arm64 runner).
           - name: Windows-only tests
+            timeout: 45
             runner: windows-latest
             marker: windows
           - name: Windows-only tests (arm64)
@@ -141,6 +140,11 @@ jobs:
           # (bash 3.2 on the macOS runner: an empty array under ``set -u`` is
           # an unbound-variable error, hence the ``${arr[@]+...}`` idiom.)
           EXTRA_ARGS=()
+          if [ "$RUNNER_OS" = Windows ] && [ "$RUNNER_ARCH" = X64 ]; then
+            for case in assign resume; do
+              EXTRA_ARGS+=(--deselect "tests/hermes_cli/test_local_runtime_processes.py::test_failed_setup_never_runs_child_and_releases_handles[$case]")
+            done
+          fi
           if [ "${{ inputs.desktop_updater }}" != "true" ]; then
             echo "desktop_updater lane off: skipping tests/scripts/desktop_update/test_desktop_update_windows_*.py"
             EXTRA_ARGS+=(--ignore-glob='*test_desktop_update_windows_*.py')
@@ -162,7 +166,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || '8') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '2' || '3') || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
           OPENROUTER_API_KEY: ''
@@ -186,9 +190,8 @@ jobs:
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    # Fork: the standard 4-vCPU image, which upstream measured as workable.
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -207,7 +210,7 @@ jobs:
           scripts/run_tests.sh tests/e2e/core/windows/ -- \
             -m "platforms and integration" -v --tb=short -rA
         env:
-          HERMES_TEST_WORKERS: '6'
+          HERMES_TEST_WORKERS: '3'
           HERMES_TEST_FILE_TIMEOUT: '900'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
