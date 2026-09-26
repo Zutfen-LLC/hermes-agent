@@ -12,7 +12,7 @@ name: OS-specific tests
 # is where those markers actually execute:
 #
 #   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest and windows-11-arm (fork)
+#   windows  → ``-m platforms``    on windows-latest and windows-11-arm
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -61,10 +61,8 @@ jobs:
           - name: macOS-only tests
             runner: macos-latest
             marker: macos
-          # Fork: standard hosted runners instead of upstream's private
-          # 32-core images (windows-11-arm is the public-repo arm64 runner).
           - name: Windows-only tests
-            runner: windows-latest
+            runner: windows-2022
             marker: windows
           - name: Windows-only tests (arm64)
             runner: windows-11-arm
@@ -186,7 +184,6 @@ jobs:
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    # Fork: the standard 4-vCPU image, which upstream measured as workable.
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
