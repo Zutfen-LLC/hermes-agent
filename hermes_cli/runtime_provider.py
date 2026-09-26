@@ -716,6 +716,27 @@ _EXPLICIT_RESOLVERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "azure-foundry": lambda rq, mc, key, url, tm: _resolve_azure_foundry_runtime(requested_provider=rq, model_cfg=mc,
                                                                                  explicit_api_key=key, explicit_base_url=url),
 }
+# What the credential a dedicated explicit rung on a login-native provider carries IS: Nous' is a NAS inference API
+# key beside its portal OAuth login; Codex's forwards the value as its OAuth bearer (its endpoint takes no API key).
+# Undeclared rungs carry the provider's registered mechanism, so a resolver alone never admits an API key.
+_EXPLICIT_RUNG_AUTH_TYPES: Dict[str, str] = {"nous": "api_key", "openai-codex": "oauth"}
+
+
+def explicit_credential_auth_type(provider: Any) -> Optional[str]:
+    """Auth type of the credential the explicit (``--api-key``) rung accepts for canonical *provider*: ``"api_key"``,
+    ``"oauth"`` (a bearer the rung forwards as the provider's OAuth token), or None when the rung takes no explicit
+    credential. The same dispatch as ``_resolve_explicit_runtime``."""
+    if not isinstance(provider, str) or not provider:
+        return None
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    registry_auth_type = str(getattr(pconfig, "auth_type", "") or "")
+    if provider in _EXPLICIT_RESOLVERS:
+        if provider in _EXPLICIT_RUNG_AUTH_TYPES:
+            return _EXPLICIT_RUNG_AUTH_TYPES[provider]
+        if pconfig is None or registry_auth_type == "api_key":
+            return "api_key"
+        return "oauth" if registry_auth_type.startswith("oauth") else None
+    return "api_key" if registry_auth_type == "api_key" else None
 
 
 def _resolve_explicit_runtime(*, provider: str, requested_provider: str, model_cfg: Dict[str, Any],
@@ -727,11 +748,17 @@ def _resolve_explicit_runtime(*, provider: str, requested_provider: str, model_c
         return None
     resolver = _EXPLICIT_RESOLVERS.get(provider)
     if resolver is not None:
-        return resolver(requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
-    pconfig = PROVIDER_REGISTRY.get(provider)
-    if not (pconfig and pconfig.auth_type == "api_key"):
-        return None
-    return _explicit_api_key_provider(provider, pconfig, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+        runtime = resolver(requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    else:
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        if not (pconfig and pconfig.auth_type == "api_key"):
+            return None
+        runtime = _explicit_api_key_provider(provider, pconfig, requested_provider, model_cfg, explicit_api_key,
+                                             explicit_base_url, target_model)
+    # Only an explicit key is the rung's own credential; with a --base-url alone the resolver fell back to stored ones.
+    if isinstance(runtime, dict) and explicit_api_key and runtime.get("api_key") == explicit_api_key:
+        runtime.setdefault("auth_type", explicit_credential_auth_type(provider))
+    return runtime
 
 
 # ── OAuth / auth-store providers ───────────────────────────────────────────────────────────
@@ -770,7 +797,7 @@ def _resolve_oauth_runtime(provider, requested_provider, model_cfg, target_model
     creds = spec.resolve()
     api_mode = spec.api_mode(_effective_model(model_cfg, target_model)) if callable(spec.api_mode) else spec.api_mode
     return _runtime(provider, api_mode, (creds.get("base_url") or "").rstrip("/") or spec.default_base_url,
-                    creds.get("api_key", ""), source=creds.get("source", spec.default_source),
+                    creds.get("api_key", ""), source=creds.get("source", spec.default_source), auth_type="oauth",
                     **{spec.expiry_key: creds.get(spec.expiry_key)}, requested_provider=requested_provider)
 
 

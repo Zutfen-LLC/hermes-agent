@@ -178,6 +178,7 @@ def _build_child_agent(
     # literal) and the runtime's credential-source category; the auth type a logical profile demands.
     override_key_origin: Optional[str] = None,
     override_key_source: Optional[str] = None,
+    override_key_auth_type: Optional[str] = None,
     override_auth_type: Optional[str] = None,
     override_profile: Optional[str] = None,
     # Configuration block that owns the selected provider/model route. Internal
@@ -244,7 +245,7 @@ def _build_child_agent(
     child_authority = bind_child_authority(
         rt, parent_agent=parent_agent, pool=child_pool,
         key_origin=(override_key_origin or KEY_EXPLICIT) if override_api_key else (KEY_PARENT if rt.get("api_key") else None),
-        key_source=override_key_source,
+        key_source=override_key_source, key_auth_type=override_key_auth_type,
         same_route=not (override_provider or override_base_url or override_acp_command),
         expected_auth_type=override_auth_type, profile=override_profile,
     )
@@ -412,6 +413,7 @@ def _build_children(
             "override_acp_args": creds.get("args"),
             "override_key_origin": creds.get("key_origin"),
             "override_key_source": creds.get("key_source"),
+            "override_key_auth_type": creds.get("key_auth_type"),
             "override_auth_type": creds.get("auth_type"),
             "override_profile": creds.get("profile"),
             "override_reasoning_config": reasoning_override,

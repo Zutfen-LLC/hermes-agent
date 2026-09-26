@@ -437,9 +437,11 @@ def _require_pinned_command(command: Optional[str], message: str) -> None:
 def _credential_bundle(model, provider, base_url, api_key, api_mode, request_overrides, **extra) -> dict:
     """The child credential dict every branch of ``_resolve_delegation_credentials`` returns. ``key_origin`` /
     ``key_source`` say where ``api_key`` came from (runtime-resolved vs. operator literal) so the child's auth
-    authority can be bound (``tools.delegate_tool_auth``); both None when the key is inherited from the parent."""
+    authority can be bound (``tools.delegate_tool_auth``); both None when the key is inherited from the parent.
+    ``key_auth_type`` is the auth type the resolving rung stamped on a runtime-resolved key, when it did."""
     extra.setdefault("key_origin", None)
     extra.setdefault("key_source", None)
+    extra.setdefault("key_auth_type", None)
     return {
         "model": model, "provider": provider, "base_url": base_url, "api_key": api_key, "api_mode": api_mode,
         "request_overrides": request_overrides, **extra,
@@ -533,7 +535,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         runtime.get("base_url"), api_key, runtime.get("api_mode"),
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
-        key_origin="runtime", key_source=runtime.get("source"),
+        key_origin="runtime", key_source=runtime.get("source"), key_auth_type=runtime.get("auth_type"),
     )
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:

@@ -22,7 +22,7 @@ OTHER_URL = "https://codex-proxy.invalid/backend-api/codex"
     (None, "api_key", CODEX_URL, True),      # unbound sessions (the parent) keep pool rotation as before
 ])
 def test_rotation_stays_within_the_bound_authority(bound_type, entry_type, entry_url, adopted):
-    authority = AuthAuthority("openai-codex", "chatgpt.com/backend-api/codex", bound_type, "device_code", "dc") \
+    authority = AuthAuthority.for_route("openai-codex", CODEX_URL, bound_type, "device_code", "dc") \
         if bound_type else None
     agent = SimpleNamespace(provider="openai-codex", model="gpt-test", base_url=CODEX_URL, api_key="current",
                             api_mode="codex_responses", _client_kwargs={}, _auth_authority=authority,

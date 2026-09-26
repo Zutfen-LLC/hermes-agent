@@ -1,8 +1,10 @@
 """``X-Hermes-Provider-API-Key`` stays API-key carriage only (PR #15 invariant, ops-supervisor#216).
 
-A provider whose registered metadata mandates OAuth or an external process has no API-key rung; before this guard
-openai-codex's explicit rung forwarded any header value as its bearer, so the header could smuggle an OAuth access
-token. Delegated OAuth children resolve their authority natively and never touch the request-scoped channel.
+The header is admitted exactly when the provider's runtime accepts an API key
+(``agent.auth_authority.provider_accepted_mechanisms``): OAuth-only and external-process providers reject it
+before resolution — openai-codex's explicit rung would otherwise forward it as its OAuth bearer — while a provider
+whose native login is OAuth but whose explicit rung takes an inference API key (Nous) keeps the PR #15 contract.
+Delegated OAuth children resolve their authority natively and never touch the request-scoped channel.
 """
 
 import threading
@@ -14,24 +16,49 @@ from gateway.platforms import api_server_provider_credentials as pc
 from tools.delegate_tool import delegate_task
 
 OAUTH_TOKEN = "oauth-access-token-FIXTURE"
+REQUEST_KEY = "request-scoped-key-FIXTURE"
 CODEX_URL = "https://chatgpt.com/backend-api/codex"
 
 
-@pytest.mark.parametrize("provider", ["openai-codex", "codex", "xai-oauth", "nous", "copilot-acp"])
-def test_login_and_process_providers_reject_request_scoped_keys(provider):
+def _external_process_providers():
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    return sorted(p for p, cfg in PROVIDER_REGISTRY.items() if cfg.auth_type == "external_process")
+
+
+def _resolve(provider, key):
+    return pc.resolve_credential_runtime(pc.ProviderCredentialOverride(api_key=key, provider=provider),
+                                         target_model=None)
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "codex", "xai-oauth", *_external_process_providers()])
+def test_login_only_and_process_providers_reject_request_scoped_keys(provider):
     with patch("hermes_cli.runtime_provider.resolve_runtime_provider") as resolve:
         with pytest.raises(pc.ProviderCredentialError) as failure:
-            pc.resolve_credential_runtime(pc.ProviderCredentialOverride(api_key=OAUTH_TOKEN, provider=provider),
-                                          target_model=None)
+            _resolve(provider, OAUTH_TOKEN)
     resolve.assert_not_called()
     assert failure.value.code == "provider_credential_unsupported"
     assert OAUTH_TOKEN not in failure.value.message
 
 
-def test_api_key_providers_keep_request_scoped_semantics():
-    runtime = pc.resolve_credential_runtime(pc.ProviderCredentialOverride(api_key="glm-request-key", provider="zai"),
-                                            target_model=None)
-    assert (runtime["provider"], runtime["api_key"]) == ("zai", "glm-request-key")
+@pytest.mark.parametrize("provider", ["nous", "zai"])
+def test_api_key_capable_providers_carry_the_request_key_verbatim(provider):
+    """Nous' native login is OAuth, but its explicit rung takes an inference API key: PR #15 accepted it and the
+    request key reached the resolved runtime unchanged. zai is a plain API-key provider."""
+    runtime = _resolve(provider, REQUEST_KEY)
+    assert (runtime["provider"], runtime["api_key"], runtime["source"]) == (provider, REQUEST_KEY, "explicit")
+    assert runtime["auth_type"] == "api_key"
+
+
+def test_an_explicit_resolver_alone_never_admits_an_oauth_route(monkeypatch):
+    """Registering an explicit-credential rung for an OAuth provider does not make it an API-key provider: an
+    undeclared rung carries the provider's registered mechanism, so the header is still refused."""
+    from hermes_cli import runtime_provider as rp
+    monkeypatch.setitem(rp._EXPLICIT_RESOLVERS, "xai-oauth",
+                        lambda rq, mc, key, url, tm: rp._runtime("xai-oauth", "codex_responses", url, key))
+    assert rp.explicit_credential_auth_type("xai-oauth") == "oauth"
+    with pytest.raises(pc.ProviderCredentialError) as failure:
+        _resolve("xai-oauth", OAUTH_TOKEN)
+    assert failure.value.code == "provider_credential_unsupported"
 
 
 def test_delegated_oauth_child_never_uses_the_request_scoped_channel():

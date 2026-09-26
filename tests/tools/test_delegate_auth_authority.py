@@ -94,7 +94,7 @@ def test_oauth_children_bind_the_parents_oauth_entry_not_an_api_key(caplog):
     assert leases == ["dc"] * 3 and [_bound_key(c) for c in children] == [OAUTH_TOKEN] * 3
     authority = children[0]._auth_authority
     assert (authority.provider, authority.endpoint, authority.auth_type, authority.auth_source, authority.entry_id) == \
-        ("openai-codex", "chatgpt.com/backend-api/codex", "oauth", "device_code", "dc")
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", "oauth", "device_code", "dc")
     assert "auth_type=oauth auth_source=device_code entry=dc" in caplog.text
     assert not any(secret in caplog.text for secret in SECRETS)
 
@@ -211,7 +211,7 @@ def test_child_secrets_stay_out_of_logs_errors_and_persisted_state(caplog):
         failed = delegate_task(goal="code it", parent_agent=_parent("openai-codex", CODEX_URL, STALE, orphan_pool))
     assert len(built) == 1 and built[0].api_key == OAUTH_TOKEN
     assert built[0]._session_init_model_config["_delegate_auth"] == {
-        "provider": "openai-codex", "endpoint": "chatgpt.com/backend-api/codex", "auth_type": "oauth",
+        "provider": "openai-codex", "endpoint": "https://chatgpt.com/backend-api/codex", "auth_type": "oauth",
         "auth_source": "device_code", "entry_id": "dc"}
     metadata = json.dumps(built[0]._session_init_model_config)
     persisted = "".join(p.read_text(errors="ignore") for p in get_hermes_home().rglob("*") if p.is_file())

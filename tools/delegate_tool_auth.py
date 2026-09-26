@@ -5,6 +5,12 @@ the parent happens to hold is only accepted when a canonical authority stands be
 it, the provider's own OAuth login store, a runtime the provider system just resolved, or an operator-configured
 key. An OAuth-only provider (per its registered metadata) with no canonical OAuth authority fails closed here with a
 stable, secret-free code, so the child is never built on an opaque inherited string and the parent keeps working.
+
+A provider may accept several mechanisms (Nous: OAuth login and an explicit inference key —
+``agent.auth_authority.provider_accepted_mechanisms``). There the credential's auth type is the selecting authority's:
+its pool entry, the auth type the resolving rung stamped on the runtime, or the parent's bound authority — never the
+provider's native login. An inherited credential none of those identify is bound ``undetermined``: it stays on its
+own route and admits no rotation.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ from typing import Any, List, Optional
 
 from agent.auth_authority import (
     AUTH_API_KEY, AUTH_CLOUD_SDK, AUTH_EXTERNAL_PROCESS, AUTH_NONE, AUTH_OAUTH, AuthAuthority, endpoint_identity,
-    provider_auth_mechanism,
+    provider_accepted_mechanisms, provider_auth_mechanism, route_identity,
 )
 
 logger = logging.getLogger("tools.delegate_tool")
@@ -26,6 +32,9 @@ KEY_EXPLICIT = "explicit"
 KEY_RUNTIME = "runtime"
 # Hermes' marker for endpoints that take no credential (see hermes_cli.model_switch); never a secret.
 NO_KEY_PLACEHOLDER = "no-key-required"
+# Auth type of an inherited, unpooled credential on a multi-mechanism provider when nothing canonical says which it
+# is. Not a pooled mechanism, so the authority admits no rotation.
+AUTH_UNDETERMINED = "undetermined"
 
 # Stable diagnostic codes (the exception text never carries credential material or upstream error text).
 AUTH_UNAVAILABLE = "delegation_auth_unavailable"
@@ -70,12 +79,28 @@ def _entry_by_id(entries: List[Any], entry_id: Any) -> Any:
 
 
 def parent_auth_type(parent_agent: Any) -> Optional[str]:
-    """Auth type of the credential the parent runs on: its bound pool entry's, else what its provider mandates."""
+    """Auth type of the credential the parent runs on: its bound pool entry's, its own bound authority's (a nested
+    child), else what its provider mandates. None when that is not determinable (multi-mechanism providers)."""
     entry = _entry_by_id(_pool_entries(getattr(parent_agent, "_credential_pool", None)),
                          getattr(parent_agent, "_credential_pool_entry_id", None))
     if entry is not None:
         return getattr(entry, "auth_type", None)
+    authority = getattr(parent_agent, "_auth_authority", None)
+    if isinstance(authority, AuthAuthority) and authority.auth_type != AUTH_UNDETERMINED:
+        return authority.auth_type
     return provider_auth_mechanism(getattr(parent_agent, "provider", None))
+
+
+def _parent_may_hold_oauth(parent_agent: Any) -> bool:
+    """Whether the parent's credential may be an OAuth token: proven OAuth, or undetermined on a provider that
+    accepts OAuth (or a token format that means OAuth). Fail closed: unknown on an OAuth-capable provider is OAuth."""
+    known = parent_auth_type(parent_agent)
+    if known is not None:
+        return known == AUTH_OAUTH
+    provider = getattr(parent_agent, "provider", None)
+    key = getattr(parent_agent, "api_key", None)
+    return AUTH_OAUTH in (provider_accepted_mechanisms(provider) or ()) or (
+        isinstance(key, str) and _unpooled_auth_type(provider, key) == AUTH_OAUTH)
 
 
 def _unpooled_auth_type(provider: Any, key: str) -> str:
@@ -85,8 +110,7 @@ def _unpooled_auth_type(provider: Any, key: str) -> str:
 
 
 def _authority(provider, base_url, auth_type, source, entry_id=None, profile=None) -> AuthAuthority:
-    return AuthAuthority(provider=str(provider or ""), endpoint=endpoint_identity(base_url), auth_type=auth_type,
-                         auth_source=str(source or "unknown"), entry_id=entry_id, profile=profile)
+    return AuthAuthority.for_route(provider, base_url, auth_type, source, entry_id, profile)
 
 
 def _oauth_error(exc: Exception, provider: Any) -> DelegationAuthError:
@@ -127,7 +151,8 @@ def _canonical_oauth(provider: str, base_url: Any, model: Any, entries: List[Any
     if not isinstance(key, str) or not key:
         raise DelegationAuthError(AUTH_UNAVAILABLE, provider, "no OAuth login or pooled OAuth credential exists "
                                   f"for this provider; run `hermes auth add {provider} --type oauth`.")
-    if endpoint_identity(runtime.get("base_url")) != endpoint_identity(base_url):
+    # Enforceable route identity (scheme included): an https login never authorizes an http route.
+    if route_identity(runtime.get("base_url")) != route_identity(base_url):
         raise DelegationAuthError(ROUTE_MISMATCH, provider, f"the OAuth login serves "
                                   f"{endpoint_identity(runtime.get('base_url'))}, not the child's endpoint "
                                   f"{endpoint_identity(base_url)}.")
@@ -136,12 +161,14 @@ def _canonical_oauth(provider: str, base_url: Any, model: Any, entries: List[Any
 
 def bind_child_authority(
     rt: dict, *, parent_agent: Any, pool: Any, key_origin: Optional[str], key_source: Optional[str] = None,
-    same_route: bool, expected_auth_type: Optional[str] = None, profile: Optional[str] = None,
+    key_auth_type: Optional[str] = None, same_route: bool, expected_auth_type: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> AuthAuthority:
     """Resolve the child's authentication authority and bind ``rt["api_key"]`` to its credential (in place).
 
     *key_origin* says where ``rt["api_key"]`` came from (``KEY_PARENT`` / ``KEY_EXPLICIT`` / ``KEY_RUNTIME`` /
-    None); *same_route* whether the child runs the parent's exact provider + endpoint. Raises
+    None); *key_auth_type* the auth type the resolving rung stamped on a ``KEY_RUNTIME`` credential; *same_route*
+    whether the child runs the parent's exact provider + endpoint. Raises
     :class:`DelegationAuthError` when no canonical authority exists."""
     provider, base_url, model = rt.get("provider"), rt.get("base_url"), rt.get("model")
     mechanism = provider_auth_mechanism(provider)
@@ -153,7 +180,7 @@ def bind_child_authority(
         authority = _authority(provider, base_url, AUTH_CLOUD_SDK, key_source or "cloud-sdk", profile=profile)
     else:
         authority = _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanism, key, key_origin,
-                                     key_source, same_route, profile)
+                                     key_source, key_auth_type, same_route, profile)
     if expected_auth_type and authority.auth_type != expected_auth_type:
         raise DelegationAuthError(PROFILE_AUTH_MISMATCH, provider, f"the profile requires auth_type="
                                   f"{expected_auth_type} but the route resolved auth_type={authority.auth_type}.")
@@ -161,8 +188,9 @@ def bind_child_authority(
 
 
 def _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanism, key, key_origin, key_source,
-                     same_route, profile) -> AuthAuthority:
-    if key_origin == KEY_PARENT and not same_route and AUTH_OAUTH in (mechanism, parent_auth_type(parent_agent)):
+                     key_auth_type, same_route, profile) -> AuthAuthority:
+    accepted = provider_accepted_mechanisms(provider)
+    if key_origin == KEY_PARENT and not same_route and (mechanism == AUTH_OAUTH or _parent_may_hold_oauth(parent_agent)):
         # The parent's credential belongs to the parent's authority: an OAuth token never leaves its own route, and
         # an OAuth-only route never adopts whatever the parent holds.
         key, key_origin = None, None
@@ -173,13 +201,14 @@ def _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanis
         # The parent's bound entry by id survives an OAuth refresh the pool applied after the parent read its token.
         entry = _entry_by_id(entries, getattr(parent_agent, "_credential_pool_entry_id", None))
     entry = entry or _entry_for_key(entries, key)
-    if entry is not None and mechanism == AUTH_OAUTH and getattr(entry, "auth_type", None) != AUTH_OAUTH:
+    if entry is not None and accepted is not None and getattr(entry, "auth_type", None) not in accepted:
         if key_origin == KEY_EXPLICIT:
             raise DelegationAuthError(AUTH_TYPE_MISMATCH, provider, f"pool entry {entry.id} is "
                                       f"auth_type={getattr(entry, 'auth_type', None)}, but this provider only accepts "
-                                      "OAuth.")
-        # An inherited or auto-selected non-OAuth entry is not the provider's authority: resolve the real one.
-        logger.info("subagent auth: pool entry %s is auth_type=%s on OAuth-only provider %s; resolving its OAuth "
+                                      f"{', '.join(sorted(accepted))}.")
+        # An inherited or auto-selected entry of a mechanism the provider does not accept is not its authority:
+        # resolve the real one.
+        logger.info("subagent auth: pool entry %s is auth_type=%s, which provider %s does not accept; resolving its "
                     "authority instead", entry.id, getattr(entry, "auth_type", None), provider)
         entry, key_origin = None, None
     if entry is not None:
@@ -197,11 +226,28 @@ def _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanis
         return authority
     if key and key != NO_KEY_PLACEHOLDER:
         source = key_source if key_origin == KEY_RUNTIME and key_source else (key_origin or "inherited")
-        return _authority(provider, base_url, _unpooled_auth_type(provider, key), source, None, profile)
+        return _authority(provider, base_url, _unpooled_key_auth_type(parent_agent, provider, key, key_origin,
+                                                                       key_auth_type, accepted), source, None, profile)
     # Local / no-auth endpoint: no credential is manufactured. The placeholder keeps AIAgent on the child's own
     # endpoint (a falsy key would re-route it through the configured provider's credentials instead).
     rt["api_key"] = NO_KEY_PLACEHOLDER if base_url else None
     return _authority(provider, base_url, AUTH_NONE, "none", None, profile)
+
+
+def _unpooled_key_auth_type(parent_agent, provider, key, key_origin, key_auth_type, accepted) -> str:
+    """Auth type of a credential no pool entry carries, from the authority that selected it: the rung's stamp for a
+    runtime key, an operator literal is an API key (unless its format says OAuth), an inherited key is the parent's.
+    A multi-mechanism provider with nothing canonical to go on is undetermined, never a guess."""
+    if key_origin == KEY_RUNTIME and key_auth_type in (AUTH_OAUTH, AUTH_API_KEY):
+        return key_auth_type
+    if key_origin == KEY_PARENT:
+        inherited = parent_auth_type(parent_agent)
+        if inherited in (AUTH_OAUTH, AUTH_API_KEY):
+            return inherited
+    by_format = _unpooled_auth_type(provider, key)
+    if key_origin == KEY_EXPLICIT or by_format == AUTH_OAUTH or accepted is None or len(accepted) == 1:
+        return by_format
+    return AUTH_UNDETERMINED
 
 
 def log_child_auth_route(child: Any, authority: Optional[AuthAuthority]) -> None:
