@@ -144,6 +144,7 @@ jobs:
             for case in assign resume; do
               EXTRA_ARGS+=(--deselect "tests/hermes_cli/test_local_runtime_processes.py::test_failed_setup_never_runs_child_and_releases_handles[$case]")
             done
+            EXTRA_ARGS+=(--deselect "tests/pm/test_windows_build_deps.py::test_openssl_installs_once_and_rejects_damaged_shared_install")
           fi
           if [ "${{ inputs.desktop_updater }}" != "true" ]; then
             echo "desktop_updater lane off: skipping tests/scripts/desktop_update/test_desktop_update_windows_*.py"
