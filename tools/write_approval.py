@@ -32,6 +32,23 @@ MEMORY = "memory"
 SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
 
+# --- Pending-record lifecycle statuses (MEMORY) ---
+#
+# A staged memory proposal can outlive the state it was pinned to: the entry it pins may
+# have been edited or removed, a newer proposal may already cover the same entry, or the
+# record may predate pinning entirely. Such records are never deleted — each carries a
+# ``status`` field (absent = active/ready, so records written before this field existed
+# stay valid): 'stale' (a pinned entry is gone/changed), 'superseded' (a newer ACTIVE
+# proposal pins the same entry; ``superseded_by`` names it), 'invalid' (malformed payload
+# or legacy unpinned destructive op — fail closed forever) and 'rejected' (operator
+# -archived). Statused files stay on disk as audit evidence.
+
+STATUS_ACTIVE: Optional[str] = None
+STATUS_STALE = "stale"
+STATUS_SUPERSEDED = "superseded"
+STATUS_INVALID = "invalid"
+STATUS_REJECTED = "rejected"
+
 # Per-subsystem config key. Intentionally a single boolean with no "block all writes"
 # state — to disable a subsystem use its own enable flag (e.g. ``memory.memory_enabled``).
 CONFIG_KEY = "write_approval"
@@ -85,8 +102,18 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
     Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
-    the safe failure for an approval gate (nothing silently committed)."""
+    the safe failure for an approval gate (nothing silently committed).
+
+    Memory dedup: a background-review destructive proposal that pins an entry some still-active
+    pending record already pins (same target) supersedes that record first — the old file is kept
+    on disk, marked ``superseded``/``superseded_by`` the new id — so one entry change never queues
+    for review twice. Foreground staging and hygiene failures never block the proposal."""
     pid = uuid.uuid4().hex[:8]
+    try:
+        if subsystem == MEMORY and origin == "background_review":
+            _supersede_dups_before_staging(pid, payload)
+    except Exception as e:  # never block a proposal on queue hygiene
+        logger.warning("Pending-dedup scan failed; staging anyway: %s", e, exc_info=True)
     record = {
         "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
         "summary": (summary or "").strip(), "origin": origin or "foreground",
@@ -97,6 +124,69 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
     return record
+
+
+def _pinned_entries_of(payload: Dict[str, Any]) -> set:
+    """Exact pinned-entry strings of a memory payload's destructive ops (empty when unpinned
+    or non-destructive)."""
+    pinned = set()
+    for op in _memory_destructive_ops(payload):
+        entry = op.get("matched_entry")
+        if isinstance(entry, str) and entry:
+            pinned.add(entry)
+    return pinned
+
+
+def _memory_destructive_ops(payload: Any) -> List[Dict[str, Any]]:
+    """``memory_tool.destructive_ops`` guarded: it can only fail on shapes the memory gate
+    itself refuses (non-dict payloads); a helper must not import its failures."""
+    if not isinstance(payload, dict):
+        return []
+    with suppress(Exception):
+        from tools.memory_tool import destructive_ops
+        return [op for op in (destructive_ops(payload) or []) if isinstance(op, dict)]
+    return []
+
+
+def _supersede_dups_before_staging(new_id: str, payload: Dict[str, Any]) -> None:
+    """Mark still-active pending memory records that pin an entry the NEW payload also pins
+    (same target) as superseded by ``new_id``. Old files stay on disk (audit evidence)."""
+    target = payload.get("target", "memory")
+    new_pins = _pinned_entries_of(payload)
+    if not new_pins:
+        return
+    for old in list_pending(MEMORY):
+        if old.get("status") not in (None, "", "ready"):
+            continue  # already archived (stale/superseded/invalid/rejected)
+        old_payload = old.get("payload") or {}
+        if not isinstance(old_payload, dict) or old_payload.get("target", "memory") != target:
+            continue
+        if _pinned_entries_of(old_payload) & new_pins:
+            update_pending_status(MEMORY, old["id"], STATUS_SUPERSEDED, superseded_by=new_id)
+
+
+def update_pending_status(subsystem: str, pending_id: str, status: Optional[str], *,
+                          superseded_by: Optional[str] = None) -> bool:
+    """Rewrite one pending record's file atomically with ``status`` set (plus
+    ``status_updated_at`` and ``superseded_by`` when given); every other field is preserved.
+    The record is NEVER deleted — statused files stay as audit evidence. True when rewritten;
+    False when the record is missing or unreadable."""
+    record = get_pending(subsystem, pending_id)
+    if not isinstance(record, dict):
+        return False
+    if status is None:  # canonical active form: field absent
+        record.pop("status", None)
+    else:
+        record["status"] = status
+    record["status_updated_at"] = time.time()
+    if superseded_by is not None:
+        record["superseded_by"] = superseded_by
+    try:
+        atomic_json_write(_pending_path(subsystem, pending_id), record)
+    except Exception as e:
+        logger.error("Failed to status pending %s/%s -> %s: %s", subsystem, pending_id, status, e)
+        return False
+    return True
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
@@ -146,6 +236,109 @@ def pending_count(subsystem: str) -> int:
     with suppress(Exception):
         return sum(1 for _ in d.glob("*.json"))
     return 0
+
+
+# --- Memory pending-queue lifecycle (classification) ---
+
+_MEMORY_ACTIONS = frozenset({"add", "replace", "remove", "batch"})
+
+
+def classify_pending_memory(record: Dict[str, Any], store, records: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Lifecycle classification of one pending MEMORY record against a loaded ``store``:
+    ``'rejected'`` (terminal), ``'invalid'`` (fail closed forever), ``'stale'``,
+    ``'superseded'`` or ``'ready'``. ``records`` (all pending records, oldest first)
+    enables the superseded check — newer ACTIVE/ready records on the same target pinning
+    an identical ``matched_entry`` make this one redundant. Any unexpected store error
+    also classifies 'invalid' (fail closed)."""
+    if not isinstance(record, dict) or record.get("status") == STATUS_REJECTED:
+        return STATUS_REJECTED
+    payload = record.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if payload.get("action") not in _MEMORY_ACTIONS:
+        return STATUS_INVALID
+    destructive = _memory_destructive_ops(payload)
+    if any(not (op.get("matched_entry") if isinstance(op, dict) else None) for op in destructive):
+        return STATUS_INVALID  # legacy pre-pinning record: fail closed forever
+    target = payload.get("target", "memory")
+    if target not in ("memory", "user"):
+        return STATUS_INVALID
+    try:
+        entries = store._entries_for(target)
+        if any(op.get("matched_entry") not in entries for op in destructive):
+            return STATUS_STALE
+        if _is_superseded(record, records, target):
+            return STATUS_SUPERSEDED
+    except Exception:
+        logger.warning("Memory pending classification failed; failing closed", exc_info=True)
+        return STATUS_INVALID
+    return "ready"
+
+
+def _is_superseded(record: Dict[str, Any], records: Optional[List[Dict[str, Any]]], target: str) -> bool:
+    """True when a strictly NEWER record — still active or ready, same target — pins at least
+    one identical ``matched_entry``. A stale/superseded newer record does NOT supersede: each
+    record is judged by its own pins. ``records=None`` fetches the queue (best-effort)."""
+    if records is None:
+        with suppress(Exception):
+            records = list_pending(MEMORY)
+    if not records:
+        return False
+    pinned = {op.get("matched_entry") for op in _memory_destructive_ops(record.get("payload"))}
+    if not pinned:
+        return False
+    for other in records:
+        if other.get("id") == record.get("id"):
+            continue
+        if other.get("status") not in (None, "", "ready"):
+            continue
+        if other.get("created_at", 0) <= record.get("created_at", 0):
+            continue
+        payload = other.get("payload") or {}
+        if not isinstance(payload, dict) or payload.get("target", "memory") != target:
+            continue
+        if pinned & {op.get("matched_entry") for op in _memory_destructive_ops(payload)}:
+            return True
+    return False
+
+
+def reclassify_pending_memory(store, subsystem: str = MEMORY) -> Dict[str, int]:
+    """Re-classify every non-terminal pending ``subsystem`` record and persist changed
+    statuses. Returns counts: ``{'ready', 'stale', 'superseded', 'invalid', 'rejected',
+    'changed'}`` where ``changed`` counts records whose status field actually changed.
+    'invalid' persists too (audit evidence); records already 'invalid'/'rejected' stay as
+    they are (no churn)."""
+    counts = {STATUS_STALE: 0, STATUS_SUPERSEDED: 0, STATUS_INVALID: 0, STATUS_REJECTED: 0,
+              "ready": 0, "changed": 0}
+    records = [r for r in list_pending(subsystem) if isinstance(r, dict)]
+    # NEWEST first: when an older record runs its superseded check, every newer record
+    # already carries its freshly-persisted status on this shared snapshot — a newer
+    # record that just classified 'stale' must not supersede it.
+    for record in reversed(records):
+        current = record.get("status") or ""
+        if current in (STATUS_REJECTED, STATUS_INVALID):
+            counts[current] += 1
+            continue
+        verdict = classify_pending_memory(record, store, records)
+        counts[verdict] += 1
+        # '' (absent) and 'ready' are the same lifecycle state: a ready record is not
+        # rewritten (no churn), while a stale→ready recovery persists the new status.
+        current_norm = "" if current in ("", "ready") else current
+        verdict_norm = "" if verdict == "ready" else verdict
+        if verdict_norm != current_norm:
+            update_pending_status(subsystem, record["id"], verdict)
+            record["status"] = verdict  # shared snapshot: later (older) records see it
+            counts["changed"] += 1
+    return counts
+
+
+def reject_pending_bulk(subsystem: str, status_value: str) -> int:
+    """Status-mark every pending record whose status == ``status_value`` as 'rejected'
+    (never delete — the files remain on disk as audit evidence). Returns how many were marked."""
+    if status_value == STATUS_REJECTED:
+        return 0
+    return sum(1 for record in list_pending(subsystem)
+               if record.get("status") == status_value
+               and update_pending_status(subsystem, record["id"], STATUS_REJECTED))
 
 
 # --- Write origin ---

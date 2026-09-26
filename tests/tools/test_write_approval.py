@@ -204,6 +204,10 @@ def test_approve_refuses_staged_remove_whose_entry_changed(hermes_home, shape):
     from tools.memory_tool import load_on_disk_store, memory_tool
     from tools import write_approval as wa
     store, pid = _review_stages_remove(shape)
+    # The pending list shows the whole entry the write targets, not just its search string
+    # (checked BEFORE the entry changes; a later failed approve marks the record stale and
+    # archives it out of the approval list).
+    assert _REVIEWED in handle_pending_subcommand(wa.MEMORY, ["pending"])
     newer = "Staging DB: pg-staging-3 (migrated 2026-09-20, creds in vault 'stg')"
     assert json.loads(memory_tool(action="replace", old_text="pg-staging-2", content=newer, store=store))["success"]
 
@@ -212,8 +216,9 @@ def test_approve_refuses_staged_remove_whose_entry_changed(hermes_home, shape):
     assert load_on_disk_store().memory_entries == [_KEPT, newer], out
     assert "changed since it was staged" in out
     assert wa.get_pending(wa.MEMORY, pid) is not None
-    # The pending list shows the whole entry the write targets, not just its search string.
-    assert _REVIEWED in handle_pending_subcommand(wa.MEMORY, ["pending"])
+    # The failed attempt persisted its lifecycle classification: the record is archived
+    # out of the approval candidates but still on disk (operator can reject or re-derive).
+    assert wa.get_pending(wa.MEMORY, pid).get("status") == "stale"
 
 
 @pytest.mark.parametrize("shape", ["single", "batch"])
