@@ -434,29 +434,37 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     _resweep_timer.start()
 
 def _lease_child_credential(child: Any) -> tuple[Any, Optional[str]]:
-    """Lease a credential from the child's pool (if any) and bind it; ``(pool, lease_id)``. The bound entry must
-    serve the child's endpoint: on a mixed same-provider pool the least-leased pick may target another host, so it is
-    released and an endpoint-matching entry is leased by id instead (#68237)."""
+    """Lease a credential from the child's pool (if any) and bind it; ``(pool, lease_id)``.
+
+    Only entries the child's bound authority admits (same auth type, the child's endpoint — see
+    ``tools.delegate_tool_auth``) are candidates, so neither this lease nor a later rotation can move an OAuth child
+    onto an API-key entry or another host (#68237). OAuth refresh tokens are single-use, so an OAuth child shares
+    its bound entry (one refresh owner) while that entry is available; otherwise, and for API keys, least-leased
+    spreading over admitted entries. Nothing admitted: the child keeps the credential it was built with."""
     child_pool = getattr(child, "_credential_pool", None)
     if child_pool is None:
         return None, None
-    from agent.credential_pool import credential_pool_entry_serves_endpoint as _entry_serves_endpoint
+    from agent.auth_authority import AUTH_OAUTH, AuthAuthority
+    from tools.delegate_tool_auth import log_child_auth_route
+    authority = getattr(child, "_auth_authority", None)
     base_url = getattr(child, "base_url", None)
-    leased_cred_id = child_pool.acquire_lease()
-    if leased_cred_id is not None:
+    if isinstance(authority, AuthAuthority):
+        admits = lambda entry: authority.admits(entry, base_url)  # noqa: E731
+    else:  # not built by _build_child_agent (direct callers, test doubles): endpoint identity only
+        from agent.credential_pool import credential_pool_entry_serves_endpoint
+        admits = lambda entry: credential_pool_entry_serves_endpoint(entry, base_url)  # noqa: E731
+    leased_cred_id = None
+    if isinstance(authority, AuthAuthority) and authority.auth_type == AUTH_OAUTH and authority.entry_id:
+        leased_cred_id = child_pool.acquire_lease(predicate=lambda e: e.id == authority.entry_id and admits(e))
+    if leased_cred_id is None:
+        leased_cred_id = child_pool.acquire_lease(predicate=admits)
+    # Resolve the leased entry by id: the pool is shared with the parent/siblings, so current() is a mutable cursor
+    # that may already point at someone else's pick.
+    leased_entry = next((e for e in child_pool.entries() if e.id == leased_cred_id), None)
+    if leased_entry is not None and hasattr(child, "_swap_credential"):
         with _quiet("Failed to bind child to leased credential: %s"):
-            # Resolve the leased entry by id: the pool is shared with the parent/siblings, so current() is a
-            # mutable cursor that may already point at someone else's pick.
-            leased_entry = next((e for e in child_pool.entries() if e.id == leased_cred_id), None)
-            if not _entry_serves_endpoint(leased_entry, base_url):
-                child_pool.release_lease(leased_cred_id)
-                leased_entry = next(
-                    (e for e in child_pool.entries() if e.last_status != "dead" and _entry_serves_endpoint(e, base_url)),
-                    None,
-                )
-                leased_cred_id = child_pool.acquire_lease(leased_entry.id) if leased_entry is not None else None
-            if leased_entry is not None and hasattr(child, "_swap_credential"):
-                child._swap_credential(leased_entry)
+            child._swap_credential(leased_entry)
+    log_child_auth_route(child, authority if isinstance(authority, AuthAuthority) else None)
     return child_pool, leased_cred_id
 
 def _merge_late_steer(result: Dict[str, Any], subagent_id: Optional[str], child: Any) -> None:

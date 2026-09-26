@@ -91,9 +91,9 @@ def test_acquire_lease_without_pending_refresh_does_not_double_select():
     passes = {"n": 0}
     original = pool._acquire_lease_under_lock
 
-    def counting(credential_id):
+    def counting(credential_id, *args):
         passes["n"] += 1
-        return original(credential_id)
+        return original(credential_id, *args)
 
     pool._acquire_lease_under_lock = counting
 

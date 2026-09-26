@@ -2298,26 +2298,30 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     # ---- leases ------------------------------------------------------------
 
-    def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
+    def acquire_lease(
+        self, credential_id: Optional[str] = None, *,
+        predicate: Optional[Callable[[PooledCredential], bool]] = None,
+    ) -> Optional[str]:
         """Acquire a soft lease on a credential.
 
         With *credential_id*, lease that entry directly. Otherwise prefer the
         least-leased available credential (priority as tie-breaker); when
         every credential is at the soft cap, still return the least-leased
-        one instead of blocking.
+        one instead of blocking. *predicate* restricts the candidates (e.g. a
+        delegated child's endpoint and pinned auth type); None when none fit.
         """
-        chosen_id, pending_refresh = self._acquire_lease_under_lock(credential_id)
+        chosen_id, pending_refresh = self._acquire_lease_under_lock(credential_id, predicate)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
             # Mirror select(): a pool whose entries all needed a deferred
             # refresh must retry once they are back in rotation, or the caller
             # sees "no credentials available" after a successful refresh.
             if chosen_id is None:
-                chosen_id, _ = self._acquire_lease_under_lock(credential_id)
+                chosen_id, _ = self._acquire_lease_under_lock(credential_id, predicate)
         return chosen_id
 
     def _acquire_lease_under_lock(
-        self, credential_id: Optional[str],
+        self, credential_id: Optional[str], predicate: Optional[Callable[[PooledCredential], bool]] = None,
     ) -> Tuple[Optional[str], List[PooledCredential]]:
         with self._lock:
             if credential_id:
@@ -2326,6 +2330,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 return credential_id, []
 
             available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+            if predicate is not None:
+                available = [e for e in available if predicate(e)]
             if not available:
                 return None, pending_refresh
 

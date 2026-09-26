@@ -273,11 +273,18 @@ class TestDelegateTask(unittest.TestCase):
 
 
     def test_child_inherits_runtime_credentials(self):
+        from agent.credential_pool import CredentialPool, PooledCredential
+
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://chatgpt.com/backend-api/codex"
-        parent.api_key="***"
+        parent.api_key = "codex-oauth-token"
         parent.provider = "openai-codex"
         parent.api_mode = "codex_responses"
+        # The inherited token is backed by the parent's OAuth pool entry (its authentication authority, #216).
+        parent._credential_pool = CredentialPool("openai-codex", [PooledCredential(
+            provider="openai-codex", id="dc", label="dc", auth_type="oauth", priority=0, source="device_code",
+            access_token="codex-oauth-token", base_url=parent.base_url)])
+        parent._credential_pool_entry_id = "dc"
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
@@ -425,7 +432,10 @@ class TestDelegateTask(unittest.TestCase):
         """Portal is dual-wire — same provider + different model prefix must
         not inherit the parent's Messages/chat_completions mode verbatim.
         Native wire selected (opt-in since 2026-09-06, ``nous.anthropic_wire``)."""
-        with patch("hermes_cli.providers._nous_anthropic_wire", return_value="native"):
+        # The inherited Portal token is the one the provider's own login store resolves (its OAuth authority).
+        portal = {"api_key": "portal-jwt", "base_url": "https://inference-api.nousresearch.com/v1", "source": "portal"}
+        with patch("hermes_cli.providers._nous_anthropic_wire", return_value="native"), \
+                patch("hermes_cli.runtime_provider.resolve_oauth_store_runtime", return_value=portal):
             self._nous_child_rederives_api_mode_from_model()
 
     def _nous_child_rederives_api_mode_from_model(self):
@@ -1379,7 +1389,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
-        child._credential_pool.acquire_lease.assert_called_once_with()
+        child._credential_pool.acquire_lease.assert_called_once()
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
 
