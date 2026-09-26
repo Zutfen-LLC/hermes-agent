@@ -1343,6 +1343,9 @@ def pending_memory_proposals_context(
             if line is None:
                 continue
             if len(lines) < limit and (not lines or used + len(line) + 1 <= char_budget):
+                if not lines:
+                    # The first line never bypasses the budget: hard-truncate to fit.
+                    line = line[:char_budget]
                 lines.append(line)
                 used += len(line) + 1
             else:

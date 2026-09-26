@@ -59,7 +59,7 @@ def _utc_now_iso() -> str:
 
 
 def record_begin(target: str, ops: List[Dict[str, Any]], before_raw: str,
-                 before_entries: List[str]) -> str:
+                 before_entries: List[str], origin: str = "background_review") -> str:
     """Snapshot the pre-mutation state BEFORE anything is applied. Fail-closed:
     raises MemoryConsolidationAuditError when the ledger cannot be written —
     the caller must then refuse the consolidation entirely. Returns the audit id."""
@@ -74,7 +74,7 @@ def record_begin(target: str, ops: List[Dict[str, Any]], before_raw: str,
     record = {
         "event": "begin", "id": audit_id, "ts": _utc_now_iso(),
         "hermes_home": str(get_hermes_home()), "target": target,
-        "origin": "background_review", "ops": destructive,
+        "origin": origin, "ops": destructive,
         "before_raw": before_raw or "",
         "before_entries": list(before_entries or []),
         "before_sha256": _sha256(before_raw or ""),

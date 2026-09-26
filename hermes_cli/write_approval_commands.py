@@ -166,6 +166,11 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         rec = wa.get_pending(subsystem, target)
         if not rec:
             return f"No pending {subsystem} write with id '{target}'."
+        if rec.get("status") == wa.STATUS_REJECTED:
+            # Rejected records are terminal evidence: applying (then unlinking) one
+            # here would destroy the audit trail the rejection decision rests on.
+            return (f"Record '{target}' was rejected and is kept as evidence only; "
+                    f"recreate the change instead if you still want it.")
         targets = [rec]
 
     applied, failed, overwritten, removed = 0, [], [], []

@@ -411,6 +411,29 @@ def test_approve_single_ready_still_applies(hermes_home):
     assert store._entries_for("memory") == ["applied entry"]
 
 
+def test_approve_single_rejected_refused_and_kept_as_evidence(hermes_home):
+    """A rejected record is terminal: explicit approve must not resurrect it (which
+    would apply it AND unlink the evidence file). Refuse, keep the file on disk
+    with status 'rejected', leave the store unchanged."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "rejected single entry")
+    rec = _stage_remove("rejected single entry", "rejected single")
+    out = handle_pending_subcommand(wa.MEMORY, ["reject", rec["id"]], memory_store=store)
+    assert "Rejected pending memory write" in out
+
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", rec["id"]], memory_store=store)
+    assert "was rejected and is kept as evidence only" in out
+    assert "recreate the change" in out
+    # The evidence file survives, still marked rejected.
+    path = wa._pending_path(wa.MEMORY, rec["id"])
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "rejected"
+    # The store never changed: the remove was NOT applied.
+    assert "rejected single entry" in store._entries_for("memory")
+
+
 # ---------------------------------------------------------------------------
 # /memory rendering
 # ---------------------------------------------------------------------------
