@@ -1290,6 +1290,73 @@ def _run_review_in_thread(
         _set_thread_approval_callback(None)
 
 
+# Bounded digest of the pending-approval queue for the memory review prompt (#81671): the
+# unattended fork must not re-derive maintenance a previous fork already staged for a human.
+# Defaults cap both record count and total characters so a long queue cannot bloat the prompt.
+_PENDING_PROPOSALS_DEFAULT_LIMIT = 8
+_PENDING_PROPOSALS_DEFAULT_CHAR_BUDGET = 1200
+
+
+def pending_memory_proposals_context(
+    limit: int = _PENDING_PROPOSALS_DEFAULT_LIMIT,
+    char_budget: int = _PENDING_PROPOSALS_DEFAULT_CHAR_BUDGET,
+) -> str:
+    """Bounded digest of ACTIVE (statusless/ready) pending background-review memory proposals
+    for the memory review prompt (#81671): the fork must not re-derive maintenance that is
+    already queued for a human. Only background_review-origin records with destructive ops;
+    oldest-first; hard caps on records and characters; any failure returns '' (the review
+    must never fail because queue hygiene did)."""
+    try:
+        import hashlib
+
+        from tools.memory_tool import destructive_ops
+        from tools.write_approval import list_pending
+
+        def _emit(record: Dict[str, Any]) -> Optional[str]:
+            payload = record.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            ops = destructive_ops(payload)
+            if not ops:
+                return None
+            rid = str(record.get("id") or "?")
+            status = str(record.get("status") or "ready")
+            action = str(record.get("action") or "")
+            target = str(payload.get("target") or "")
+            summary = str(record.get("summary") or "").replace("\n", " ")[:80]
+            matched = ops[0].get("matched_entry") if isinstance(ops[0], dict) else None
+            pin = (
+                f" (pinned: {hashlib.sha256(matched.encode('utf-8', 'replace')).hexdigest()[:8]})"
+                if isinstance(matched, str) and matched else ""
+            )
+            return f"- [{rid}] {status} {action} on {target}: {summary}{pin}"
+
+        records = list_pending("memory")  # resolves HERMES_HOME at call time
+        lines: List[str] = []
+        used = 0
+        more = 0
+        for record in records:
+            if not isinstance(record, dict) or record.get("origin") != "background_review":
+                continue
+            if record.get("status") not in (None, "", "ready"):
+                continue
+            line = _emit(record)
+            if line is None:
+                continue
+            if len(lines) < limit and (not lines or used + len(line) + 1 <= char_budget):
+                lines.append(line)
+                used += len(line) + 1
+            else:
+                more += 1
+        if not lines:
+            return ""
+        if more:
+            lines.append(f"(+{more} more — /memory pending)")
+        return "\n".join(lines)
+    except Exception:
+        logger.debug("pending memory proposals context unavailable", exc_info=True)
+        return ""
+
+
 # (review_memory, review_skills) -> prompt attribute name; skills-only is also the default.
 _PROMPT_NAME_BY_SCOPE = {
     (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
@@ -1319,6 +1386,17 @@ def spawn_background_review_thread(
             f"{prompt}\n\nThe user explicitly requested this review with the following "
             f"focus — prioritize it over the general instructions above:\n{focus}"
         )
+    # Bounded queue digest (#81671): the fork must not re-derive maintenance a previous fork
+    # already staged for a human. Appended to the LOCAL prompt only (same as focus) — module
+    # constants and agent attributes stay untouched; tools[] advertised to the fork is
+    # unchanged, so parent prompt-cache parity is not affected.
+    if review_memory:
+        ctx = pending_memory_proposals_context()
+        if ctx:
+            prompt += (
+                "\n\nAlready-proposed memory maintenance awaiting review (do NOT re-derive "
+                f"or re-propose the same change; these are queued for a human):\n{ctx}"
+            )
 
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
         _run_review_in_thread(

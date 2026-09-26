@@ -197,3 +197,99 @@ class TestConsolidationProposalSurfaces:
         ]
         actions = bg.summarize_background_review_actions(review_messages, [])
         assert any("staged for your approval" in a for a in actions)
+
+
+class TestPendingProposalsContext:
+    """``pending_memory_proposals_context`` (#81671): a bounded digest of ACTIVE
+    background-review memory proposals so the fork does not re-derive maintenance
+    already queued for a human — and its wiring into the memory review prompt."""
+
+    def _home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    def _stage(self, tmp_path, *, origin="background_review", status=None,
+               action="replace", matched_entry=None, summary="consolidate duplicates", target="memory"):
+        """Stage one pending record via the real write_approval path; return its record dict."""
+        from tools import write_approval as wa
+
+        payload = {"action": action, "target": target, "old_text": "seed entry", "content": "merged"}
+        if action == "batch":
+            payload = {"action": "batch", "target": target, "operations": [
+                {"action": "replace", "old_text": "seed entry", "content": "merged",
+                 **({"matched_entry": matched_entry} if matched_entry else {})}]}
+        elif matched_entry is not None:
+            payload["matched_entry"] = matched_entry
+        record = wa.stage_write("memory", payload, summary=summary, origin=origin)
+        if status is not None:  # stage_write has no status param (added by a sibling change)
+            path = wa._pending_path("memory", record["id"])
+            record["status"] = status
+            import json as _json
+
+            path.write_text(_json.dumps(record), encoding="utf-8")
+        return record
+
+    def test_empty_queue_returns_empty_and_prompt_unchanged(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        assert bg.pending_memory_proposals_context() == ""
+
+        agent = SimpleNamespace()
+        with patch.object(bg, "_run_review_in_thread", lambda *a, **k: None):
+            _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
+        assert prompt == bg._MEMORY_REVIEW_PROMPT
+
+    def test_qualifying_record_appears_in_context_and_prompt(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        import hashlib
+
+        record = self._stage(tmp_path, matched_entry="seed entry one", summary="a" * 200)
+        ctx = bg.pending_memory_proposals_context()
+        assert record["id"] in ctx
+        assert "replace" in ctx and "memory" in ctx
+        assert ("a" * 80) in ctx and ("a" * 81) not in ctx  # summary truncated to 80 chars
+        digest = hashlib.sha256(b"seed entry one").hexdigest()[:8]
+        assert f"pinned: {digest}" in ctx and len(digest) == 8
+
+        agent = SimpleNamespace()
+        with patch.object(bg, "_run_review_in_thread", lambda *a, **k: None):
+            _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
+        marker = "Already-proposed memory maintenance awaiting review"
+        assert marker in prompt
+        assert prompt.endswith(ctx)
+
+    def test_non_qualifying_records_skipped(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        # foreground origin
+        self._stage(tmp_path, origin="foreground", matched_entry="seed entry one")
+        assert bg.pending_memory_proposals_context() == ""
+        # archived status
+        self._stage(tmp_path, status="stale", matched_entry="seed entry one")
+        assert bg.pending_memory_proposals_context() == ""
+        # adds only — harmless duplicates the fork can already see
+        self._stage(tmp_path, action="add")
+        assert bg.pending_memory_proposals_context() == ""
+
+    def test_caps_limit_lines_and_characters(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        for i in range(12):
+            self._stage(tmp_path, matched_entry=f"seed entry {i}", summary=f"consolidate dupes {i:02d}")
+        ctx = bg.pending_memory_proposals_context()
+        lines = [ln for ln in ctx.splitlines() if ln.startswith("- ")]
+        assert len(lines) == 8  # default record limit
+        assert "(+4 more — /memory pending)" in ctx
+        assert len(ctx) < 1500  # char budget + slack for the truncation note
+
+    def test_import_failure_returns_empty_and_spawn_survives(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+
+        def boom(subsystem):
+            raise RuntimeError("queue unavailable")
+
+        from tools import write_approval as wa
+
+        with patch.object(wa, "list_pending", boom):
+            assert bg.pending_memory_proposals_context() == ""
+            agent = SimpleNamespace()
+            with patch.object(bg, "_run_review_in_thread", lambda *a, **k: None):
+                _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
+            assert "Already-proposed" not in prompt
+            assert prompt == bg._MEMORY_REVIEW_PROMPT
