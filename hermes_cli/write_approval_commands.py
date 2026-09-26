@@ -105,6 +105,8 @@ def handle_pending_subcommand(
         return _memory_diff(rest, memory_store)
     if sub == "diff" and subsystem == wa.SKILLS:
         return _diff(rest)
+    if sub == "undo" and subsystem == wa.MEMORY:
+        return _memory_undo(rest, memory_store)
     if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
         return _set_approval(subsystem, rest, set_mode_fn)
     return None  # not ours — caller handles
@@ -337,6 +339,44 @@ def _memory_diff(rest: List[str], memory_store=None) -> str:
     if not rec:
         return f"No pending memory write with id '{rest[0]}'."
     return f"# Pending memory write {rec['id']}: {rec.get('summary', '')}\n\n" + memory_pending_diff(rec)
+
+
+def _memory_undo(rest: List[str], memory_store=None) -> str:
+    """/memory undo <audit_id>: restore the recorded before-state of one autonomous
+    consolidation as a single atomic batch. ``undo list`` shows recent audit ids."""
+    if not rest:
+        return "Usage: /memory undo <audit_id>  (ids: /memory undo list)"
+    if rest[0].lower() == "list":
+        return _memory_undo_list()
+    audit_id = rest[0]
+    if memory_store is None:
+        return "memory store unavailable"
+    try:
+        from tools.memory_consolidation import restore
+        result = restore(audit_id, memory_store) or {}
+    except Exception as e:
+        return f"Undo failed: {e}"
+    detail = result.get("message") or result.get("error") or "no result"
+    return f"Undo {audit_id}: {detail}"
+
+
+def _memory_undo_list(limit: int = 10) -> str:
+    """Up to *limit* most-recent 'applied' ledger records, newest first."""
+    from tools.memory_consolidation import list_records
+    try:
+        applied = [r for r in list_records() if r.get("event") == "applied"]
+    except Exception:
+        applied = []
+    if not applied:
+        return "No autonomous consolidations recorded yet."
+    lines = ["Recent autonomous consolidations (most recent first):"]
+    for r in reversed(applied[-limit:]):
+        counts = r.get("counts") or {}
+        lines.append(f"  {r.get('id', '?')}  {r.get('ts', '?')}  {r.get('target', 'memory')}  "
+                     f"replaced {counts.get('replaced', 0)}, removed {counts.get('removed', 0)}, "
+                     f"added {counts.get('added', 0)}")
+    lines.append("Restore one: /memory undo <audit_id>")
+    return "\n".join(lines)
 
 
 _APPROVAL_VALUES = {
