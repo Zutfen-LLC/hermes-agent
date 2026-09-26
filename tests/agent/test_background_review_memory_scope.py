@@ -245,7 +245,10 @@ class TestPendingProposalsContext:
         ctx = bg.pending_memory_proposals_context()
         assert record["id"] in ctx
         assert "replace" in ctx and "memory" in ctx
-        assert ("a" * 80) in ctx and ("a" * 81) not in ctx  # summary truncated to 80 chars
+        # The brief is the OP text, which tells the reviewer WHICH entry is queued; the
+        # staging summary's boilerplate never appears (it used to eat the whole 80 chars).
+        assert "replace entry matching 'seed entry'" in ctx
+        assert ("a" * 80) not in ctx and "background review consolidation" not in ctx
         digest = hashlib.sha256(b"seed entry one").hexdigest()[:8]
         assert f"pinned: {digest}" in ctx and len(digest) == 8
 
@@ -255,6 +258,19 @@ class TestPendingProposalsContext:
         marker = "Already-proposed memory maintenance awaiting review"
         assert marker in prompt
         assert prompt.endswith(ctx)
+
+    def test_op_brief_is_capped_at_the_character_budget(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        from tools import write_approval as wa
+
+        long_entry = "E" * 150
+        wa.stage_write("memory", {"action": "remove", "target": "memory",
+                                  "old_text": long_entry, "matched_entry": long_entry},
+                       summary="staging summary that must not be used", origin="background_review")
+        ctx = bg.pending_memory_proposals_context()
+        # "- remove: " (10 chars) + 70 E's fills the 80-char brief exactly.
+        assert ("E" * 70) in ctx and ("E" * 71) not in ctx
+        assert "staging summary that must not be used" not in ctx
 
     def test_non_qualifying_records_skipped(self, tmp_path, monkeypatch):
         self._home(tmp_path, monkeypatch)

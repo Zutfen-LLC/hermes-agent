@@ -1309,7 +1309,7 @@ def pending_memory_proposals_context(
     try:
         import hashlib
 
-        from tools.memory_tool import destructive_ops
+        from tools.memory_tool import _batch_op_line, destructive_ops
         from tools.write_approval import list_pending
 
         def _emit(record: Dict[str, Any]) -> Optional[str]:
@@ -1322,13 +1322,19 @@ def pending_memory_proposals_context(
             status = str(record.get("status") or "ready")
             action = str(record.get("action") or "")
             target = str(payload.get("target") or "")
-            summary = str(record.get("summary") or "").replace("\n", " ")[:80]
+            summary = str(record.get("summary") or "").replace("\n", " ").strip()
+            # The semantic brief comes from the OPS, not the staging summary: the summary
+            # leads with boilerplate ("background review consolidation (remove on memory): …"),
+            # which would eat the whole 80-char budget and leave the reviewer unable to tell
+            # WHICH entry is queued — the one thing the digest exists to communicate.
+            op_brief = "; ".join(_batch_op_line(op) for op in ops).replace("\n", " ").strip()
+            brief = (op_brief or summary)[:80]
             matched = ops[0].get("matched_entry") if isinstance(ops[0], dict) else None
             pin = (
                 f" (pinned: {hashlib.sha256(matched.encode('utf-8', 'replace')).hexdigest()[:8]})"
                 if isinstance(matched, str) and matched else ""
             )
-            return f"- [{rid}] {status} {action} on {target}: {summary}{pin}"
+            return f"- [{rid}] {status} {action} on {target}: {brief}{pin}"
 
         records = list_pending("memory")  # resolves HERMES_HOME at call time
         lines: List[str] = []
