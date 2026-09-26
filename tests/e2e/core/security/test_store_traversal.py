@@ -109,6 +109,10 @@ class Store:
         d = self.hermes_home / "pending" / subsystem
         return {p.stem for p in d.glob("*.json")} if d.is_dir() else set()
 
+    def record_status(self, subsystem: str, pending_id: str) -> str:
+        path = self.hermes_home / "pending" / subsystem / f"{pending_id}.json"
+        return json.loads(path.read_text(encoding="utf-8")).get("status", "") if path.exists() else ""
+
     def memory_blob(self) -> str:
         d = self.hermes_home / "memories"
         return "".join(p.read_text(encoding="utf-8", errors="replace") for p in d.glob("*")) if d.is_dir() else ""
@@ -177,12 +181,21 @@ def test_pending_id_never_leaves_the_store(store: Store, scenario: str) -> None:
             raise H.BoundaryBreach(f"/{command} {spelled!r}: " + "; ".join(breaches) + f"\noutput: {out[:400]}")
 
 
-def test_control_valid_reject_drops_only_that_record(store: Store) -> None:
+def test_control_valid_reject_retires_only_that_record(store: Store) -> None:
+    """A valid reject retires exactly that record: it is never listed or approvable again,
+    but its file stays on disk as audit evidence (memory rejects are status-marked, never
+    deleted — retiring with evidence is the point of the pending-queue lifecycle)."""
     target, keep = store.memory_ids[0], set(store.memory_ids[2:])
     out = _slash(store.b, store.sid, f"/memory reject {target}")
-    assert target in out and target not in store.pending_ids("memory"), f"valid reject did not drop {target}: {out}"
-    assert keep <= store.pending_ids("memory"), "rejecting one record dropped another"
+    assert target in out, f"reject did not report {target}: {out}"
+    # Evidence preserved: the record file is still there, marked rejected.
+    assert target in store.pending_ids("memory"), "reject dropped the record instead of retiring it"
+    assert store.record_status("memory", target) == "rejected", "reject did not mark the record"
+    assert keep <= store.pending_ids("memory"), "rejecting one record affected another"
     assert store.memory_texts[0] not in store.memory_blob(), "a rejected write reached the memory store"
+    # ...and it is no longer an approval candidate.
+    assert target not in _slash(store.b, store.sid, "/memory pending"), \
+        "a rejected record is still offered for approval"
 
 
 def test_control_valid_approve_applies_the_staged_write(store: Store) -> None:
