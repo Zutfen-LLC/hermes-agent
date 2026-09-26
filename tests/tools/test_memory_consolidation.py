@@ -66,6 +66,34 @@ def _disk_entries(store, target="memory"):
 
 
 # =========================================================================
+# Existing pending backlog: enabling the option never auto-applies staged work
+# =========================================================================
+
+class TestExistingBacklogNotAutoApplied:
+    def test_enabling_the_flag_leaves_a_staged_proposal_pending(self, store):
+        """Work staged under the old consent model is never applied because the option
+        was switched on afterwards: the flag is only consulted when a NEW destructive
+        proposal is written, and merely listing/re-classifying the queue never applies."""
+        from tools import write_approval as wa
+        _set_flag(False)
+        _set_approval(False)
+        store.add("memory", "entry staged under the old policy")
+        store.add("memory", "keeper entry")
+        with unattended_review():
+            staged = json.loads(memory_tool(action="remove", old_text="entry staged",
+                                            store=store))
+        assert staged["staged"] is True
+
+        _set_flag(True)  # operator opts in AFTER the proposal was staged
+        from tools.write_approval import reclassify_pending_memory
+        counts = reclassify_pending_memory(store, wa.MEMORY)
+        assert counts["ready"] == 1 and counts["changed"] == 0
+        assert "entry staged under the old policy" in _disk_entries(store)  # untouched
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1 and (records[0].get("status") or "ready") == "ready"
+
+
+# =========================================================================
 # Default safety: the flag is off unless explicitly opted in
 # =========================================================================
 
@@ -198,6 +226,53 @@ class TestValidationFailClosed:
             r = json.loads(memory_tool(action="remove", old_text="vanishes first", store=store))
         assert r["success"] is False
         assert _disk_entries(store) == ["only a replacement fact"]
+
+    def test_concurrent_target_drift_applies_nothing(self, store, monkeypatch):
+        """A writer that changes the pinned entry AFTER the fresh load/pin and BEFORE the
+        commit makes the whole consolidation a no-op: the pinned replay re-reads disk under
+        the store lock and must fail closed rather than remove a different entry."""
+        from tools import memory_consolidation as mc
+        real_begin = mc.record_begin
+
+        def drift_then_begin(target, ops, before_raw, before_entries, **kwargs):
+            # Simulate a concurrent writer landing between the audit snapshot and the apply.
+            store._path_for(target).write_text(
+                "the entry was rewritten by someone else", encoding="utf-8")
+            return real_begin(target, ops, before_raw, before_entries, **kwargs)
+
+        monkeypatch.setattr(mc, "record_begin", drift_then_begin)
+        _set_flag(True)
+        store.add("memory", "entry pinned for consolidation")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="entry pinned", store=store))
+        assert r["success"] is False
+        assert _disk_entries(store) == ["the entry was rewritten by someone else"]
+
+    def test_concurrent_batch_drift_applies_nothing(self, store, monkeypatch):
+        """Batch variant: one drifted pinned entry voids the entire batch (all-or-nothing)."""
+        from tools import memory_consolidation as mc
+        from tools.memory_tool_store import ENTRY_DELIMITER
+        real_begin = mc.record_begin
+        drifted_raw = ENTRY_DELIMITER.join(
+            ["drifted pinned entry", "a second untouched entry"])
+
+        def drift_then_begin(target, ops, before_raw, before_entries, **kwargs):
+            store._path_for(target).write_text(drifted_raw, encoding="utf-8")
+            return real_begin(target, ops, before_raw, before_entries, **kwargs)
+
+        monkeypatch.setattr(mc, "record_begin", drift_then_begin)
+        _set_flag(True)
+        store.add("memory", "first entry to consolidate")
+        store.add("memory", "second entry to consolidate")
+        with unattended_review():
+            r = json.loads(memory_tool(operations=[
+                {"action": "remove", "old_text": "first entry to consolidate"},
+                {"action": "add", "content": "an addition that must not land"},
+            ], store=store))
+        assert r["success"] is False
+        # The concurrent writer's content is intact: not the remove, not the add.
+        assert store._path_for("memory").read_text(encoding="utf-8") == drifted_raw
+        assert _disk_entries(store) == ["drifted pinned entry", "a second untouched entry"]
 
     def test_over_budget_replace_refused(self, home):
         _set_flag(True)
