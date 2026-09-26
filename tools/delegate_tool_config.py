@@ -96,6 +96,58 @@ def _resolve_task_execution_overrides(
     return creds, reasoning
 
 
+# Native auth mechanisms a logical profile may require (agent.auth_authority vocabulary).
+_PROFILE_AUTH_TYPES = frozenset({"oauth", "api_key", "external_process", "cloud_sdk", "none"})
+# Route keys a profile late-binds through the same resolver as the delegation block. No api_key: profiles use the
+# provider's native authentication (credential pool, OAuth login, external process), never a literal in config.
+_PROFILE_ROUTE_KEYS = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers")
+
+
+def enabled_delegation_profiles(cfg: dict) -> Dict[str, Dict[str, Any]]:
+    """``delegation.profiles`` entries that are well-formed and not disabled, by name."""
+    profiles = cfg.get("profiles") if isinstance(cfg, dict) else None
+    if not isinstance(profiles, dict):
+        return {}
+    return {name: p for name, p in profiles.items()
+            if isinstance(name, str) and name and isinstance(p, dict)
+            and is_truthy_value(p.get("enabled"), default=True)}
+
+
+def _resolve_profile_execution(cfg: dict, name: Any, parent_agent) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Late-bind logical delegation profile *name* to a concrete route: ``(creds, reasoning_config)``.
+
+    The profile names a provider (plus optional model, endpoint, api_mode, reasoning and required ``auth_type``);
+    credentials are resolved at spawn time by the provider system, exactly like ``delegation.provider``, and the
+    child's auth authority is then checked against ``auth_type`` (``tools.delegate_tool_auth``). Unknown, disabled
+    or malformed profiles fail closed with ValueError."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("profile must be a non-empty string when provided")
+    raw = (cfg.get("profiles") or {}).get(name) if isinstance(cfg.get("profiles"), dict) else None
+    if not isinstance(raw, dict):
+        raise ValueError(f"delegation profile {name!r} is not configured")
+    if not is_truthy_value(raw.get("enabled"), default=True):
+        raise ValueError(f"delegation profile {name!r} is disabled")
+    if not str(raw.get("provider") or "").strip():
+        raise ValueError(f"delegation profile {name!r} must name a provider")
+    if raw.get("api_key"):
+        raise ValueError(f"delegation profile {name!r} must not carry an api_key; profiles use the provider's "
+                         "native authentication (hermes auth / credential pool)")
+    auth_type = str(raw.get("auth_type") or "").strip().lower() or None
+    if auth_type is not None and auth_type not in _PROFILE_AUTH_TYPES:
+        raise ValueError(f"delegation profile {name!r} has unknown auth_type {auth_type!r}")
+    route_cfg = {k: raw.get(k) for k in _PROFILE_ROUTE_KEYS if raw.get(k) is not None}
+    creds = dict(_resolve_delegation_credentials(route_cfg, parent_agent))
+    creds.update(auth_type=auth_type, profile=name, routing_cfg=route_cfg)
+    reasoning = None
+    effort = raw.get("reasoning_effort")
+    if effort or effort is False:
+        from hermes_constants import parse_reasoning_effort
+        reasoning = parse_reasoning_effort(effort)
+        if reasoning is None:
+            raise ValueError(f"delegation profile {name!r} has invalid reasoning_effort {effort!r}")
+    return creds, reasoning
+
+
 # ── Subagent approval callbacks ─────────────────────────────────────────────
 # Subagent worker threads don't inherit the CLI's threading.local approval
 # callback, so prompt_dangerous_approval() would fall back to input() and
@@ -383,7 +435,11 @@ def _require_pinned_command(command: Optional[str], message: str) -> None:
         raise ValueError(message)
 
 def _credential_bundle(model, provider, base_url, api_key, api_mode, request_overrides, **extra) -> dict:
-    """The child credential dict every branch of ``_resolve_delegation_credentials`` returns."""
+    """The child credential dict every branch of ``_resolve_delegation_credentials`` returns. ``key_origin`` /
+    ``key_source`` say where ``api_key`` came from (runtime-resolved vs. operator literal) so the child's auth
+    authority can be bound (``tools.delegate_tool_auth``); both None when the key is inherited from the parent."""
+    extra.setdefault("key_origin", None)
+    extra.setdefault("key_source", None)
     return {
         "model": model, "provider": provider, "base_url": base_url, "api_key": api_key, "api_mode": api_mode,
         "request_overrides": request_overrides, **extra,
@@ -425,10 +481,12 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,
             )
-    # api_key None → inherited from parent in _build_child_agent
+    # api_key None → inherited from parent in _build_child_agent (never across an OAuth route: see
+    # tools.delegate_tool_auth)
     return _credential_bundle(
         v["model"], provider, v["base_url"], v["api_key"], api_mode,
         _merge_request_overrides(request_overrides, explicit_request_overrides),
+        key_origin="explicit" if v["api_key"] else None,
     )
 
 def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
@@ -475,6 +533,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         runtime.get("base_url"), api_key, runtime.get("api_mode"),
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
+        key_origin="runtime", key_source=runtime.get("source"),
     )
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:

@@ -842,16 +842,23 @@ def _codex_pool_dicts(entries: Optional[List[Any]]) -> Iterator[Dict[str, Any]]:
             yield entry
 
 
+def _codex_oauth_pool_dicts() -> Iterator[Dict[str, Any]]:
+    """Codex pool rows that can stand in for the OAuth login: the Codex endpoint rejects API keys, so an
+    ``api_key`` row is never handed out (or reported) as the subscription credential (ops-supervisor#216)."""
+    from hermes_cli.auth import read_credential_pool
+    return (e for e in _codex_pool_dicts(read_credential_pool("openai-codex")) if e.get("auth_type") != "api_key")
+
+
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
     """Return metadata for a pool-only Codex credential in quota cooldown.
 
     Reads through ``read_credential_pool`` so a named profile with no Codex rows of its own sees
     the global-root pool (the per-provider fallback every other pool read uses)."""
-    from hermes_cli.auth import _nonempty_str, read_credential_pool
+    from hermes_cli.auth import _nonempty_str
     from agent.credential_pool import _parse_absolute_timestamp
     try:
         now = time.time()
-        for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
+        for entry in _codex_oauth_pool_dicts():
             token = entry.get("access_token")
             if not _nonempty_str(token) or not _entry_is_rate_limit_exhausted(entry):
                 continue
@@ -882,9 +889,9 @@ def _pool_codex_access_token() -> str:
     through ``read_credential_pool`` so a profile inherits the global-root pool (#34143).
     """
     from agent.credential_pool import _parse_absolute_timestamp
-    from hermes_cli.auth import _nonempty_str, read_credential_pool
+    from hermes_cli.auth import _nonempty_str
     try:
-        for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
+        for entry in _codex_oauth_pool_dicts():
             token = entry.get("access_token")
             # Same normaliser as ``_codex_pool_rate_limit_status``: a millisecond epoch compared
             # raw reads as far-future here and as elapsed there, hiding a usable entry (#103349).

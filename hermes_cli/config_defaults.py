@@ -1349,6 +1349,9 @@ DEFAULT_CONFIG = {
         "allow_model_selection": False,
         "allowed_models": [],
         "allowed_reasoning_efforts": [],
+        # Logical subagent profiles (name -> {provider, model, base_url, api_mode, auth_type, reasoning_effort,
+        # enabled, description}); each late-binds to a provider route with its native auth at spawn time.
+        "profiles": {},
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,

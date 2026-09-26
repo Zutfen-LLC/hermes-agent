@@ -433,66 +433,38 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     _resweep_timer.daemon = True
     _resweep_timer.start()
 
-def _child_authority_entry(child: Any, entries: List[Any]) -> Any:
-    """Pool entry backing the credential the child was built with: the parent's bound entry id (stable across an
-    OAuth refresh the pool already applied), else an exact runtime-key match. None when the pool does not hold it."""
-    bound_id = getattr(child, "_credential_pool_entry_id", None)
-    by_id = next((e for e in entries if isinstance(bound_id, str) and bound_id and e.id == bound_id), None)
-    if by_id is not None:
-        return by_id
-    api_key = getattr(child, "api_key", None)
-    return next((e for e in entries if isinstance(api_key, str) and api_key and e.runtime_api_key == api_key), None)
-
-
-def _log_child_auth_route(child: Any, entry: Any) -> None:
-    """Non-secret route facts for the child's bound authentication (never a key, token or bearer value)."""
-    from utils import base_url_hostname
-    logger.info(
-        "subagent auth route: provider=%s model=%s auth_type=%s auth_source=%s endpoint=%s",
-        getattr(child, "provider", None) or "-", getattr(child, "model", None) or "-",
-        getattr(entry, "auth_type", None) or getattr(child, "_pinned_auth_type", None) or "unknown",
-        getattr(entry, "source", None) or "inherited", base_url_hostname(getattr(child, "base_url", None) or "") or "-",
-    )
-
-
 def _lease_child_credential(child: Any) -> tuple[Any, Optional[str]]:
     """Lease a credential from the child's pool (if any) and bind it; ``(pool, lease_id)``.
 
-    The child inherits the parent's authentication AUTHORITY, not whatever the pool hands out: the auth type of the
-    entry backing the child's credential is pinned, so neither this lease nor a later rotation can move an
-    OAuth child onto an API-key entry (an ``openai-codex`` child leasing a stale ``sk-`` key 401s while the parent
-    keeps working). With no backing entry, providers with one native auth type pin that type; others keep
-    least-leased sharing. The bound entry must also serve the child's endpoint: on a mixed same-provider pool the
-    least-leased pick may target another host (#68237)."""
+    Only entries the child's bound authority admits (same auth type, the child's endpoint — see
+    ``tools.delegate_tool_auth``) are candidates, so neither this lease nor a later rotation can move an OAuth child
+    onto an API-key entry or another host (#68237). OAuth refresh tokens are single-use, so an OAuth child shares
+    its bound entry (one refresh owner) while that entry is available; otherwise, and for API keys, least-leased
+    spreading over admitted entries. Nothing admitted: the child keeps the credential it was built with."""
     child_pool = getattr(child, "_credential_pool", None)
     if child_pool is None:
         return None, None
-    from agent.credential_pool import (
-        credential_pool_entry_matches_auth_type as _entry_has_auth_type,
-        AUTH_TYPE_OAUTH, credential_pool_entry_serves_endpoint as _entry_serves_endpoint, native_pool_auth_type,
-    )
+    from agent.auth_authority import AUTH_OAUTH, AuthAuthority
+    from tools.delegate_tool_auth import log_child_auth_route
+    authority = getattr(child, "_auth_authority", None)
     base_url = getattr(child, "base_url", None)
-    authority = _child_authority_entry(child, child_pool.entries())
-    pinned = getattr(authority, "auth_type", None) or native_pool_auth_type(getattr(child, "provider", None))
-    child._pinned_auth_type = pinned
-
-    def _serves(entry: Any) -> bool:
-        return _entry_serves_endpoint(entry, base_url) and _entry_has_auth_type(entry, pinned)
-
-    # OAuth refresh tokens are single-use, so an OAuth child shares the parent's exact entry (one refresh owner)
-    # while it is available; otherwise, and for API keys, least-leased spreading over compatible entries only.
+    if isinstance(authority, AuthAuthority):
+        admits = lambda entry: authority.admits(entry, base_url)  # noqa: E731
+    else:  # not built by _build_child_agent (direct callers, test doubles): endpoint identity only
+        from agent.credential_pool import credential_pool_entry_serves_endpoint
+        admits = lambda entry: credential_pool_entry_serves_endpoint(entry, base_url)  # noqa: E731
     leased_cred_id = None
-    if authority is not None and pinned == AUTH_TYPE_OAUTH:
-        leased_cred_id = child_pool.acquire_lease(predicate=lambda e: e.id == authority.id and _serves(e))
+    if isinstance(authority, AuthAuthority) and authority.auth_type == AUTH_OAUTH and authority.entry_id:
+        leased_cred_id = child_pool.acquire_lease(predicate=lambda e: e.id == authority.entry_id and admits(e))
     if leased_cred_id is None:
-        leased_cred_id = child_pool.acquire_lease(predicate=_serves)
+        leased_cred_id = child_pool.acquire_lease(predicate=admits)
     # Resolve the leased entry by id: the pool is shared with the parent/siblings, so current() is a mutable cursor
     # that may already point at someone else's pick.
     leased_entry = next((e for e in child_pool.entries() if e.id == leased_cred_id), None)
     if leased_entry is not None and hasattr(child, "_swap_credential"):
         with _quiet("Failed to bind child to leased credential: %s"):
             child._swap_credential(leased_entry)
-    _log_child_auth_route(child, leased_entry)
+    log_child_auth_route(child, authority if isinstance(authority, AuthAuthority) else None)
     return child_pool, leased_cred_id
 
 def _merge_late_steer(result: Dict[str, Any], subagent_id: Optional[str], child: Any) -> None:

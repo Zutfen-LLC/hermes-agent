@@ -774,6 +774,15 @@ def _resolve_oauth_runtime(provider, requested_provider, model_cfg, target_model
                     **{spec.expiry_key: creds.get(spec.expiry_key)}, requested_provider=requested_provider)
 
 
+def resolve_oauth_store_runtime(provider: str, *, target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Runtime from *provider*'s own OAuth login store (the ladder's OAuth rung, refresh and write-through
+    included), skipping the credential-pool rung, whose selection does not look at auth type. None when the
+    provider keeps no singleton login store; raises AuthError when it does but the login is unusable."""
+    if provider in _OAUTH_RUNTIME_PROVIDERS:
+        return _resolve_oauth_runtime(provider, provider, _get_model_config(), target_model)
+    return _minimax_oauth_runtime(provider, provider)
+
+
 def _minimax_oauth_runtime(provider, requested_provider) -> Optional[Dict[str, Any]]:
     pconfig = PROVIDER_REGISTRY.get(provider)
     if not (pconfig and pconfig.auth_type == "oauth_minimax"):

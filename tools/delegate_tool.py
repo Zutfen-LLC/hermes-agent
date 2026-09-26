@@ -32,7 +32,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _SELECTION_UNSET, _inherit_parent_capabilities, _load_config, _merge_request_overrides,
     _resolve_child_credential_pool, _resolve_child_runtime, _resolve_delegation_credentials,
-    _resolve_task_execution_overrides, _selection_allowlists,
+    _resolve_task_execution_overrides, _selection_allowlists, _resolve_profile_execution, enabled_delegation_profiles,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -174,6 +174,12 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Where override_api_key came from ("runtime" = resolved by the provider system, "explicit" = operator
+    # literal) and the runtime's credential-source category; the auth type a logical profile demands.
+    override_key_origin: Optional[str] = None,
+    override_key_source: Optional[str] = None,
+    override_auth_type: Optional[str] = None,
+    override_profile: Optional[str] = None,
     # Configuration block that owns the selected provider/model route. Internal
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
@@ -226,6 +232,22 @@ def _build_child_agent(
         override_reasoning_config=override_reasoning_config,
         routing_cfg=routing_cfg,
     )
+    # Bind the child to ONE authentication authority before it exists: provider, endpoint, auth type and credential
+    # source together. No canonical authority → DelegationAuthError (a ValueError: the spawn is refused, the parent
+    # keeps running) instead of a child built on whatever string the parent holds (ops-supervisor#216).
+    from tools.delegate_tool_auth import KEY_EXPLICIT, KEY_PARENT, bind_child_authority
+    child_pool = _resolve_child_credential_pool(
+        rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
+    )
+    if override_profile and not override_api_key:
+        rt["api_key"] = None  # a logical profile is a complete route: it never inherits the parent's credential
+    child_authority = bind_child_authority(
+        rt, parent_agent=parent_agent, pool=child_pool,
+        key_origin=(override_key_origin or KEY_EXPLICIT) if override_api_key else (KEY_PARENT if rt.get("api_key") else None),
+        key_source=override_key_source,
+        same_route=not (override_provider or override_base_url or override_acp_command),
+        expected_auth_type=override_auth_type, profile=override_profile,
+    )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -276,18 +298,18 @@ def _build_child_agent(
         child._delegate_parent_ref = None  # non-weakref-able test doubles
     # Sidebar marker: subagent sessions stay out of session pickers even when a
     # parent delete orphans them (mirrors /branch's ``_branched_from``).
-    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = parent_sid
-    # Shared pool lets children rotate credentials on rate limits.
-    child_pool = _resolve_child_credential_pool(
-        rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
-    )
-    if child_pool is not None:
+    if getattr(child, "_session_init_model_config", None) is not None:
+        if parent_sid:
+            child._session_init_model_config["_delegate_from"] = parent_sid
+        # Secret-free provenance of the child's authentication authority.
+        child._session_init_model_config["_delegate_auth"] = child_authority.as_metadata()
+    # The authority is fixed for the child's lifetime: the lease and every rotation only adopt entries it admits.
+    child._auth_authority = child_authority
+    child._credential_pool_entry_id = child_authority.entry_id
+    # Shared pool lets children rotate credentials on rate limits — except an operator-configured key no pool entry
+    # carries: that key IS the authority, and the lease must not swap it for a pooled one.
+    if child_pool is not None and not (child_authority.auth_source == KEY_EXPLICIT and not child_authority.entry_id):
         child._credential_pool = child_pool
-        if child_pool is getattr(parent_agent, "_credential_pool", None) and rt.get("api_key") == parent_api_key:
-            # Shared pool on the parent's exact credential: the lease reacquires the entry the parent is bound to
-            # (see _lease_child_credential). An explicitly configured key is never replaced by the parent's entry.
-            child._credential_pool_entry_id = getattr(parent_agent, "_credential_pool_entry_id", None)
 
     _attach_child(parent_agent, child)  # interrupt propagation
     # spawn_requested now — the child may queue for seconds when the pool is
@@ -388,8 +410,13 @@ def _build_children(
             "override_request_overrides": creds.get("request_overrides"),
             "override_acp_command": creds.get("command"),
             "override_acp_args": creds.get("args"),
+            "override_key_origin": creds.get("key_origin"),
+            "override_key_source": creds.get("key_source"),
+            "override_auth_type": creds.get("auth_type"),
+            "override_profile": creds.get("profile"),
             "override_reasoning_config": reasoning_override,
-            "routing_cfg": routing_cfg,
+            # A profile owns its route's fallback policy; otherwise the call's routing block does.
+            "routing_cfg": creds.get("routing_cfg") or routing_cfg,
         }
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
@@ -453,7 +480,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None,
     model: Any = _SELECTION_UNSET, reasoning_effort: Any = _SELECTION_UNSET, parent_agent=None,
-    credentials_cfg: Optional[Dict[str, Any]] = None,
+    credentials_cfg: Optional[Dict[str, Any]] = None, profile: Any = _SELECTION_UNSET,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -520,13 +547,25 @@ def delegate_task(
     # Preflight every task before charging one-shot budget, creating transcripts,
     # or constructing a child. Per-task values override the call-level default.
     task_execution: List[tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
+    resolved_profiles: Dict[str, tuple] = {}
     for i, task in enumerate(task_list):
         task_model = task["model"] if "model" in task else model
         task_effort = task["reasoning_effort"] if "reasoning_effort" in task else reasoning_effort
+        task_profile = task["profile"] if "profile" in task else profile
         try:
-            task_creds, task_reasoning = _resolve_task_execution_overrides(
-                cfg, creds, task_model, task_effort
-            )
+            if task_profile is not _SELECTION_UNSET:
+                # A logical profile is a complete route (provider, model, auth, reasoning): it late-binds here and
+                # is not combined with per-task model/reasoning selection.
+                if task_model is not _SELECTION_UNSET or task_effort is not _SELECTION_UNSET:
+                    raise ValueError("profile cannot be combined with model or reasoning_effort")
+                key = task_profile if isinstance(task_profile, str) else repr(task_profile)
+                if key not in resolved_profiles:
+                    resolved_profiles[key] = _resolve_profile_execution(cfg, task_profile, parent_agent)
+                task_creds, task_reasoning = resolved_profiles[key]
+            else:
+                task_creds, task_reasoning = _resolve_task_execution_overrides(
+                    cfg, creds, task_model, task_effort
+                )
         except ValueError as exc:
             return tool_error(f"Task {i}: {exc}")
         task_execution.append((task_creds, task_reasoning))
@@ -688,6 +727,18 @@ def _build_dynamic_schema_overrides() -> dict:
                 enum=efforts,
             )
 
+    profiles = enabled_delegation_profiles(cfg)
+    if profiles:
+        catalog = "; ".join(
+            f"{name}: {str(p.get('description') or '').strip() or 'operator-configured route'}"
+            for name, p in sorted(profiles.items()))
+        overrides_params["properties"]["profile"] = _p(
+            "string", f"Operator-configured subagent profile (a complete provider/model route) for every task in "
+            f"this call; a task-level profile overrides it. Not combinable with model/reasoning_effort. {catalog}",
+            enum=sorted(profiles))
+        tasks["items"]["properties"]["profile"] = _p(
+            "string", "Operator-configured subagent profile for this child only.", enum=sorted(profiles))
+
     return {
         "description": _build_top_level_description(independent_completions=independent_completions),
         "parameters": overrides_params,
@@ -809,7 +860,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         model=args.get("model", _SELECTION_UNSET), reasoning_effort=args.get("reasoning_effort", _SELECTION_UNSET),
-        parent_agent=kw.get("parent_agent"),
+        profile=args.get("profile", _SELECTION_UNSET), parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

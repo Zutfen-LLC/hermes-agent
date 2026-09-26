@@ -263,6 +263,15 @@ def resolve_credential_runtime(
         raise ProviderCredentialError(
             f"Request-scoped provider runtime requires {PROVIDER_API_KEY_HEADER}.",
             code="provider_api_key_required")
+    # The header carries API keys only. A provider whose registered metadata mandates OAuth or an external
+    # process has no API-key rung — an explicit value there would ride as its OAuth bearer (openai-codex's
+    # explicit rung forwards any string), i.e. an OAuth token smuggled through an API-key header.
+    from agent.auth_authority import AUTH_EXTERNAL_PROCESS, AUTH_OAUTH, provider_auth_mechanism
+    if provider_auth_mechanism(credential.provider) in (AUTH_OAUTH, AUTH_EXTERNAL_PROCESS):
+        raise ProviderCredentialError(
+            f"Provider '{credential.provider}' does not accept request-scoped API keys "
+            "(its credentials resolve through a login or external process).",
+            code="provider_credential_unsupported")
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         runtime = resolve_runtime_provider(

@@ -951,12 +951,13 @@ class ClientLifecycleMixin:
         if not route_can_serve_model(getattr(self, "provider", None), stripped_base, getattr(self, "model", None)):
             logger.info("Credential %s skipped: its route cannot serve model %s", getattr(entry, "id", "?"), self.model)
             return False
-        # A session pinned to one authentication authority (delegated children) never changes auth type on rotation.
-        pinned_auth_type = getattr(self, "_pinned_auth_type", None)
-        from agent.credential_pool import credential_pool_entry_matches_auth_type
-        if not credential_pool_entry_matches_auth_type(entry, pinned_auth_type):
-            logger.info("Credential %s skipped: auth_type=%s differs from the session's pinned auth_type=%s",
-                        getattr(entry, "id", "?"), getattr(entry, "auth_type", None), pinned_auth_type)
+        # A session bound to one authentication authority (delegated children) never rotates onto another auth
+        # type or endpoint: only entries the authority admits are adopted.
+        from agent.auth_authority import AuthAuthority
+        authority = getattr(self, "_auth_authority", None)
+        if isinstance(authority, AuthAuthority) and not authority.admits(entry, self.base_url):
+            logger.info("Credential %s skipped: auth_type=%s is outside the session's bound authority (%s)",
+                        getattr(entry, "id", "?"), getattr(entry, "auth_type", None), authority.describe())
             return False
         if actual_route:
             self.api_mode = "chat_completions"
