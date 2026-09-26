@@ -105,7 +105,10 @@ def _read_ledger() -> List[Dict[str, Any]]:
         return []
     records: List[Dict[str, Any]] = []
     with suppress(Exception):
-        for line in path.read_text(encoding="utf-8").splitlines():
+        # utf-8-sig: same BOM tolerance as the memory store's own reads — Windows
+        # tooling (PowerShell Set-Content/Out-File) BOMs files it touches, and
+        # json.loads on the resulting first line fails without it.
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if not line:
                 continue
