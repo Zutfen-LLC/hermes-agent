@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import uuid
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -39,17 +40,46 @@ def _ledger_path() -> Path:
     return _backups_dir() / "consolidations.jsonl"
 
 
+def _ensure_backups_dir() -> Path:
+    """Create the backups dir owner-only, repairing bits left loose by an older run.
+
+    ``mkdir`` modes are filtered through the process umask (and are frequently
+    looser than intended), so the mode is applied explicitly afterwards.
+    """
+    directory = _backups_dir()
+    mkdir_under_hermes_home(directory)
+    with suppress(Exception):
+        os.chmod(directory, 0o700)
+    return directory
+
+
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _append_record(record: Dict[str, Any]) -> None:
-    """Append one JSONL record atomically-ish. Any failure raises
+    """Append one JSONL record, owner-only. Any failure raises
     MemoryConsolidationAuditError — callers must not proceed without the ledger."""
     try:
-        mkdir_under_hermes_home(_backups_dir())
-        with _ledger_path().open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _ensure_backups_dir()
+        # The ledger holds the FULL raw memory file content, so it is exactly as
+        # sensitive as MEMORY.md/USER.md (written 0o600) — never looser. Same
+        # convention as the memory store's lock file: O_NOFOLLOW where available,
+        # and fchmod on the fd (not the path) both to repair a record left loose by
+        # an older Hermes and to avoid a path-swap window.
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        raw_fd = os.open(_ledger_path(), flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(raw_fd, 0o600)
+            with os.fdopen(raw_fd, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            with suppress(Exception):
+                os.close(raw_fd)
+            raise
     except Exception as e:  # OSError, permission, disk-full, guardian refusal…
         raise MemoryConsolidationAuditError(f"failed to append audit record: {e}") from e
 

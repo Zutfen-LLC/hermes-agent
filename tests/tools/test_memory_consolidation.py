@@ -340,3 +340,51 @@ class TestRecovery:
         assert _disk_entries(store) == ["second original entry", "fresh fork conclusion"]
         assert restore(r["audit_id"], store)["success"] is True
         assert _disk_entries(store) == before  # exact, order included
+
+
+# =========================================================================
+# Ledger custody: the audit ledger holds the full raw memory file, so it must
+# never be readable by anyone MEMORY.md itself is not readable by.
+# =========================================================================
+
+class TestLedgerPermissions:
+    def _modes(self):
+        import os
+        import stat
+        from tools.memory_consolidation import _ledger_path
+        path = _ledger_path()
+        return (stat.S_IMODE(os.stat(path).st_mode),
+                stat.S_IMODE(os.stat(path.parent).st_mode))
+
+    @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission bits")
+    def test_ledger_and_dir_are_owner_only(self, store):
+        self._unattended_remove_inline(store)
+        ledger_mode, dir_mode = self._modes()
+        assert ledger_mode == 0o600, oct(ledger_mode)
+        assert dir_mode == 0o700, oct(dir_mode)
+
+    @pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX permission bits")
+    def test_loose_bits_from_an_older_run_are_repaired(self, store):
+        import os
+        from tools.memory_consolidation import _ledger_path
+        self._unattended_remove_inline(store)
+        path = _ledger_path()
+        os.chmod(path, 0o664)
+        os.chmod(path.parent, 0o775)
+        # A second consolidation must tighten the existing inode again.
+        store.add("memory", "another entry to consolidate")
+        self._unattended_remove_inline(store, "another entry")
+        assert self._modes() == (0o600, 0o700)
+
+    def _unattended_remove_inline(self, store, text="ledger custody fact"):
+        # Seed a keeper (the store refuses to empty a non-empty memory file) plus the
+        # target entry, then consolidate unattended.
+        if "ledger keeper fact" not in store._entries_for("memory"):
+            store.add("memory", "ledger keeper fact")
+        if text not in store._entries_for("memory"):
+            store.add("memory", text)
+        _set_flag(True)
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text=text, store=store))
+        assert r["success"] is True, r
+        return r
