@@ -232,6 +232,7 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         override_reasoning_config=override_reasoning_config,
         routing_cfg=routing_cfg,
+        override_profile=override_profile,
     )
     # Bind the child to ONE authentication authority before it exists: provider, endpoint, auth type and credential
     # source together. No canonical authority → DelegationAuthError (a ValueError: the spawn is refused, the parent
@@ -240,13 +241,11 @@ def _build_child_agent(
     child_pool = _resolve_child_credential_pool(
         rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
     )
-    if override_profile and not override_api_key:
-        rt["api_key"] = None  # a logical profile is a complete route: it never inherits the parent's credential
     child_authority = bind_child_authority(
         rt, parent_agent=parent_agent, pool=child_pool,
         key_origin=(override_key_origin or KEY_EXPLICIT) if override_api_key else (KEY_PARENT if rt.get("api_key") else None),
         key_source=override_key_source, key_auth_type=override_key_auth_type,
-        same_route=not (override_provider or override_base_url or override_acp_command),
+        same_route=not (override_provider or override_base_url or override_acp_command or override_profile),
         expected_auth_type=override_auth_type, profile=override_profile,
     )
     if override_request_overrides is not None:

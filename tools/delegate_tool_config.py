@@ -483,8 +483,7 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,
             )
-    # api_key None → inherited from parent in _build_child_agent (never across an OAuth route: see
-    # tools.delegate_tool_auth)
+    # An explicit endpoint never inherits the parent credential.
     return _credential_bundle(
         v["model"], provider, v["base_url"], v["api_key"], api_mode,
         _merge_request_overrides(request_overrides, explicit_request_overrides),
@@ -540,7 +539,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
-    endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work);
+    endpoint (an omitted key never inherits the parent credential);
     ``provider`` set → full bundle via the runtime provider system (same path as CLI/gateway startup); neither →
     None values, child inherits everything. ``request_overrides`` is honored on every branch. Raises ValueError
     with a user-facing message."""
@@ -616,6 +615,7 @@ def _resolve_child_runtime(
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     override_reasoning_config: Optional[Dict[str, Any]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
+    override_profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -715,8 +715,13 @@ def _resolve_child_runtime(
         except Exception as exc:
             logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    from tools.delegate_tool_auth import inherits_parent_authority
+    inherit_key = inherits_parent_authority(
+        parent_agent, {"provider": effective_provider, "base_url": effective_base_url},
+        same_route=not (override_provider or override_base_url or override_acp_command), profile=override_profile,
+    )
     kwargs: Dict[str, Any] = {
-        "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
+        "base_url": effective_base_url, "api_key": override_api_key or (parent_api_key if inherit_key else None), "model": effective_model,
         "provider": effective_provider, "requested_provider": effective_requested_provider,
         "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,

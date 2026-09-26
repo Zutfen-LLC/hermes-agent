@@ -91,16 +91,18 @@ def parent_auth_type(parent_agent: Any) -> Optional[str]:
     return provider_auth_mechanism(getattr(parent_agent, "provider", None))
 
 
-def _parent_may_hold_oauth(parent_agent: Any) -> bool:
-    """Whether the parent's credential may be an OAuth token: proven OAuth, or undetermined on a provider that
-    accepts OAuth (or a token format that means OAuth). Fail closed: unknown on an OAuth-capable provider is OAuth."""
-    known = parent_auth_type(parent_agent)
-    if known is not None:
-        return known == AUTH_OAUTH
-    provider = getattr(parent_agent, "provider", None)
-    key = getattr(parent_agent, "api_key", None)
-    return AUTH_OAUTH in (provider_accepted_mechanisms(provider) or ()) or (
-        isinstance(key, str) and _unpooled_auth_type(provider, key) == AUTH_OAUTH)
+def inherits_parent_authority(parent_agent: Any, rt: dict, *, same_route: bool, profile=None) -> bool:
+    """Check the provider and frozen route before inheriting a parent credential."""
+    if not same_route or profile:
+        return False
+    authority = getattr(parent_agent, "_auth_authority", None)
+    if isinstance(authority, AuthAuthority):
+        return authority.provider == rt.get("provider") and authority.route == route_identity(rt.get("base_url"))
+    from tools.delegate_tool_config import _inherit_parent_endpoint
+    parent_url, _ = _inherit_parent_endpoint(
+        parent_agent, getattr(parent_agent, "base_url", None), getattr(parent_agent, "api_key", None))
+    return (getattr(parent_agent, "provider", None) == rt.get("provider")
+            and route_identity(parent_url) == route_identity(rt.get("base_url")))
 
 
 def _unpooled_auth_type(provider: Any, key: str) -> str:
@@ -173,10 +175,16 @@ def bind_child_authority(
     provider, base_url, model = rt.get("provider"), rt.get("base_url"), rt.get("model")
     mechanism = provider_auth_mechanism(provider)
     key = rt.get("api_key") if isinstance(rt.get("api_key"), str) else None
+    same_route = inherits_parent_authority(parent_agent, rt, same_route=same_route, profile=profile)
+    if key_origin == KEY_PARENT and not same_route:
+        key, key_origin = None, None
+        rt["api_key"] = None
     acp_command = rt.get("acp_command")
     if (isinstance(acp_command, str) and acp_command) or mechanism == AUTH_EXTERNAL_PROCESS:
+        rt["api_key"] = NO_KEY_PLACEHOLDER
         authority = _authority(provider, base_url, AUTH_EXTERNAL_PROCESS, "external-process", profile=profile)
     elif mechanism == AUTH_CLOUD_SDK:
+        rt["api_key"] = NO_KEY_PLACEHOLDER
         authority = _authority(provider, base_url, AUTH_CLOUD_SDK, key_source or "cloud-sdk", profile=profile)
     else:
         authority = _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanism, key, key_origin,
@@ -190,17 +198,18 @@ def bind_child_authority(
 def _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanism, key, key_origin, key_source,
                      key_auth_type, same_route, profile) -> AuthAuthority:
     accepted = provider_accepted_mechanisms(provider)
-    if key_origin == KEY_PARENT and not same_route and (mechanism == AUTH_OAUTH or _parent_may_hold_oauth(parent_agent)):
-        # The parent's credential belongs to the parent's authority: an OAuth token never leaves its own route, and
-        # an OAuth-only route never adopts whatever the parent holds.
-        key, key_origin = None, None
-        rt["api_key"] = None
     entries = _pool_entries(pool)
     entry = None
     if key_origin == KEY_PARENT and same_route:
         # The parent's bound entry by id survives an OAuth refresh the pool applied after the parent read its token.
         entry = _entry_by_id(entries, getattr(parent_agent, "_credential_pool_entry_id", None))
+    probe = _authority(provider, base_url, AUTH_API_KEY, "-")
+    entries = [e for e in entries if _authority(provider, base_url, getattr(e, "auth_type", None), "-").admits(e, base_url)]
+    entry = entry if entry in entries else None
     entry = entry or _entry_for_key(entries, key)
+    if entry is None and not key:
+        entry = next((e for e in entries if _live(e) and getattr(e, "runtime_api_key", None)
+                      and probe.admits(e, base_url)), None)
     if entry is not None and accepted is not None and getattr(entry, "auth_type", None) not in accepted:
         if key_origin == KEY_EXPLICIT:
             raise DelegationAuthError(AUTH_TYPE_MISMATCH, provider, f"pool entry {entry.id} is "
@@ -228,6 +237,10 @@ def _bind_credential(rt, parent_agent, pool, provider, base_url, model, mechanis
         source = key_source if key_origin == KEY_RUNTIME and key_source else (key_origin or "inherited")
         return _authority(provider, base_url, _unpooled_key_auth_type(parent_agent, provider, key, key_origin,
                                                                        key_auth_type, accepted), source, None, profile)
+    from hermes_cli.auth_plugin_providers import registry_lookup
+    registration = registry_lookup(provider or "")
+    if getattr(registration, "auth_type", None) == AUTH_API_KEY:
+        raise DelegationAuthError(AUTH_UNAVAILABLE, provider, "no credential is configured for the target route.")
     # Local / no-auth endpoint: no credential is manufactured. The placeholder keeps AIAgent on the child's own
     # endpoint (a falsy key would re-route it through the configured provider's credentials instead).
     rt["api_key"] = NO_KEY_PLACEHOLDER if base_url else None

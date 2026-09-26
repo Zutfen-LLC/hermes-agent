@@ -217,3 +217,103 @@ def test_child_secrets_stay_out_of_logs_errors_and_persisted_state(caplog):
     persisted = "".join(p.read_text(errors="ignore") for p in get_hermes_home().rglob("*") if p.is_file())
     for text in (caplog.text, result, failed, metadata, persisted):
         assert not any(secret in text for secret in SECRETS)
+
+
+PARENT_KEY = "PARENT-GLM-SECRET-FIXTURE"
+TARGET_KEY = "TARGET-KEY-FIXTURE"
+
+
+@pytest.mark.parametrize("route, expected", [
+    ({"override_provider": "custom", "override_base_url": "https://foreign.example/v1"}, "no-key-required"),
+    ({"override_provider": "custom", "override_base_url": "http://127.0.0.1:11434/v1"}, "no-key-required"),
+    ({"override_base_url": "https://foreign.example/v1"}, None),
+    ({"override_base_url": ZAI_URL}, None),
+    ({"override_provider": "deepseek", "override_base_url": "https://api.deepseek.com/v1"}, None),
+    ({"override_provider": "deepseek", "override_base_url": "https://api.deepseek.com/v1",
+      "override_api_key": TARGET_KEY, "override_key_origin": "runtime", "override_key_source": "env:DEEPSEEK_API_KEY"}, TARGET_KEY),
+    ({"override_base_url": "https://foreign.example/v1", "override_api_key": TARGET_KEY}, TARGET_KEY),
+    ({"override_profile": "isolated"}, None),
+    ({}, PARENT_KEY),
+])
+def test_parent_credential_requires_unchanged_authenticated_route(route, expected, caplog):
+    from tools.delegate_tool_config import _resolve_child_runtime
+    from hermes_constants import get_hermes_home
+
+    parent = _parent("zai", ZAI_URL, PARENT_KEY)
+    with caplog.at_level(logging.DEBUG), patch("run_agent.AIAgent", side_effect=_fake_child) as constructor:
+        if expected is None:
+            with pytest.raises(DelegationAuthError) as failure:
+                _build_child_agent(0, "g", None, None, None, 3, 1, parent, **route)
+            constructor.assert_not_called()
+            assert failure.value.code == AUTH_UNAVAILABLE
+            assert PARENT_KEY not in str(failure.value)
+        else:
+            child = _build_child_agent(0, "g", None, None, None, 3, 1, parent, **route)
+            assert constructor.call_args.kwargs["api_key"] == expected
+            assert PARENT_KEY not in json.dumps(child._session_init_model_config)
+            assert PARENT_KEY not in json.dumps(child._auth_authority.as_metadata())
+    assert PARENT_KEY not in caplog.text
+    persisted = "".join(p.read_text(errors="ignore") for p in get_hermes_home().rglob("*") if p.is_file())
+    assert PARENT_KEY not in persisted
+    runtime = _resolve_child_runtime(
+        parent, {}, PARENT_KEY, model=None, override_provider=route.get("override_provider"),
+        override_base_url=route.get("override_base_url"), override_api_key=route.get("override_api_key"),
+        override_api_mode=None, override_acp_command=None, override_acp_args=None,
+        override_profile=route.get("override_profile"))
+    assert runtime["api_key"] == (PARENT_KEY if not route else route.get("override_api_key"))
+
+
+@pytest.mark.parametrize("case", ["pool", "frozen-scheme", "frozen-provider", "oauth", "external", "cloud", "profile"])
+def test_target_authority_is_independent_of_parent_key(case, caplog, monkeypatch, tmp_path):
+    from agent.auth_authority import AuthAuthority
+    from tools.delegate_tool_config import _resolve_profile_execution
+
+    parent = _parent("zai", ZAI_URL, PARENT_KEY)
+    route = {"override_provider": "deepseek", "override_base_url": "https://api.deepseek.com/v1"}
+    expected = TARGET_KEY
+    if case == "pool":
+        pool = CredentialPool("deepseek", [_entry("target", auth_type="api_key", token=TARGET_KEY,
+                              provider="deepseek", url=route["override_base_url"])])
+        monkeypatch.setattr("tools.delegate_tool._resolve_child_credential_pool", lambda *a, **k: pool)
+    elif case.startswith("frozen"):
+        parent._auth_authority = AuthAuthority.for_route(
+            "deepseek" if case == "frozen-provider" else "zai", ZAI_URL, "api_key", "fixture")
+        if case == "frozen-scheme":
+            parent.base_url = ZAI_URL.replace("https:", "http:")
+            parent._client_kwargs["base_url"] = parent.base_url
+        route, expected = {}, None
+    elif case == "oauth":
+        route = {"override_provider": "openai-codex", "override_base_url": CODEX_URL}
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_oauth_store_runtime",
+                            lambda *a, **k: {"api_key": TARGET_KEY, "base_url": CODEX_URL, "source": "hermes-auth-store"})
+    elif case in ("external", "cloud"):
+        route = {"override_provider": "copilot-acp" if case == "external" else "bedrock"}
+        expected = "no-key-required"
+    else:
+        # Resolve real provider credentials in two isolated homes, then return to the first home.
+        cfg = {"profiles": {"target": {"provider": "deepseek", "auth_type": "api_key"}}}
+        for home, key in ((tmp_path / "a", TARGET_KEY), (tmp_path / "b", "SECOND-TARGET-FIXTURE"),
+                          (tmp_path / "a", TARGET_KEY)):
+            home.mkdir(exist_ok=True)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            monkeypatch.setenv("DEEPSEEK_API_KEY", key)
+            creds, _ = _resolve_profile_execution(cfg, "target", parent)
+            child, constructor = _build(parent, override_provider=creds["provider"],
+                override_base_url=creds["base_url"], override_api_key=creds["api_key"],
+                override_key_origin=creds["key_origin"], override_key_source=creds["key_source"],
+                override_profile=creds["profile"], override_auth_type=creds["auth_type"])
+            assert constructor.call_args.kwargs["api_key"] == key
+            assert child._auth_authority.profile == "target"
+            assert PARENT_KEY not in json.dumps(child._session_init_model_config)
+        return
+    with caplog.at_level(logging.DEBUG), patch("run_agent.AIAgent", side_effect=_fake_child) as constructor:
+        if expected is None:
+            with pytest.raises(DelegationAuthError) as failure:
+                _build_child_agent(0, "g", None, None, None, 3, 1, parent, **route)
+            constructor.assert_not_called()
+            assert PARENT_KEY not in str(failure.value)
+        else:
+            child = _build_child_agent(0, "g", None, None, None, 3, 1, parent, **route)
+            assert constructor.call_args.kwargs["api_key"] == expected
+            assert PARENT_KEY not in json.dumps(child._session_init_model_config)
+    assert PARENT_KEY not in caplog.text
