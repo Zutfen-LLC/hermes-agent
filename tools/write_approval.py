@@ -51,6 +51,17 @@ def write_approval_enabled(subsystem: str) -> bool:
         return False
 
 
+def unattended_memory_consolidation_enabled() -> bool:
+    """True only when the operator explicitly opted in AND the ordinary approval gate is off
+    (write_approval=true stays authoritative: staging then remains the only path)."""
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        opted_in = _normalize_enabled(cfg_get(load_config(), MEMORY, "allow_unattended_consolidation", default=False))
+    except Exception:
+        return False
+    return opted_in and not write_approval_enabled(MEMORY)
+
+
 def _normalize_enabled(value: Any) -> bool:
     """Coerce a config value to bool; unknown → False (gate off). The string branch
     covers hand-edited configs (YAML already parses bare on/off/yes/no)."""

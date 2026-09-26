@@ -327,3 +327,39 @@ def test_memory_invalid_params_rejected_before_staging(hermes_home):
     r = json.loads(memory_tool("add", "memory", None, store=store))
     assert r["success"] is False
     assert wa.pending_count("memory") == 0
+
+# ---------------------------------------------------------------------------
+# Autonomous unattended consolidation opt-in (memory.allow_unattended_consolidation)
+# ---------------------------------------------------------------------------
+
+def _set_consolidation(enabled):
+    import hermes_cli.config as cfg
+    c = cfg.load_config()
+    c.setdefault("memory", {})["allow_unattended_consolidation"] = enabled
+    cfg.save_config(c)
+
+def test_unattended_consolidation_default_off(hermes_home):
+    from tools import write_approval as wa
+    # No explicit config: DEFAULT_CONFIG carries allow_unattended_consolidation=False.
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_consolidation_opt_in_requires_gate_off(hermes_home):
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    # write_approval is off (default) → opt-in is honored.
+    assert wa.unattended_memory_consolidation_enabled() is True
+    # The approval gate stays authoritative: with it on, staging remains the only path.
+    _set_approval("memory", True)
+    assert wa.unattended_memory_consolidation_enabled() is False
+    # A malformed value must not enable autonomous consolidation.
+    _set_consolidation("not-a-bool!")
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_consolidation_malformed_config_fails_closed(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+    def _boom():
+        raise RuntimeError("config unreadable")
+    # write_approval.py imports load_config lazily inside the function, so patching
+    # the module attribute is what the call-time import resolves to.
+    monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+    assert wa.unattended_memory_consolidation_enabled() is False
