@@ -1069,3 +1069,181 @@ def test_queue_classification_agrees_with_persisted_lifecycle(hermes_home):
     # 'ready' is persisted as a missing status field; normalize both sides.
     assert persisted[older["id"]] == "superseded" == pure[older["id"]]
     assert (persisted[newer["id"]] or "ready") == pure[newer["id"]] == "ready"
+
+
+# ---------------------------------------------------------------------------
+# CORRECTION ROUND 3 — sequential-batch lifecycle classification
+#
+# resolve_batch_entries() walks a batch's ops SEQUENTIALLY over the working
+# state (op 2 may consume an entry op 1 just produced), exactly as
+# apply_batch() executes it. The classifier must share those semantics: no
+# flat "every destructive pin must pre-exist in the initial entry list"
+# pre-check, and the verdict must come from CURRENT disk state — never a
+# possibly stale long-lived CLI store snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_sequential_pinned_chain_classifies_ready(hermes_home):
+    """Required test 1: current [A], staged pinned batch replace A->B then replace
+    B->C (matched_entry B exists only mid-batch) => READY, not stale."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "chain entry a")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "chain entry", "content": "chain entry b",
+         "matched_entry": "chain entry a"},
+        {"action": "replace", "old_text": "chain entry", "content": "chain entry c",
+         "matched_entry": "chain entry b"},
+    ]})
+    assert wa.classify_pending_memory(batch, store) == "ready"
+
+
+def test_approve_all_applies_sequential_chain_to_c(hermes_home):
+    """Required test 2: `approve all` applies the chained batch and produces C."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "chain entry a")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "chain entry", "content": "chain entry b",
+         "matched_entry": "chain entry a"},
+        {"action": "replace", "old_text": "chain entry", "content": "chain entry c",
+         "matched_entry": "chain entry b"},
+    ]})
+    out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
+    assert "Approved 1" in out, out
+    assert store._entries_for("memory") == ["chain entry c"]
+
+
+def test_genuinely_stale_first_pin_classifies_stale(hermes_home):
+    """Required test 3: current [A] but the batch's FIRST pin is absent (drifted)
+    => STALE, not ready and not invalid."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "unrelated current entry")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "gone entry", "content": "replacement b",
+         "matched_entry": "gone entry original text"},
+    ]})
+    assert wa.classify_pending_memory(batch, store) == "stale"
+
+
+def test_classification_uses_disk_not_stale_live_store(hermes_home):
+    """Required test 4: disk changes AFTER a long-lived MemoryStore was loaded;
+    classification through that live store still reports the CURRENT disk verdict
+    (the resolver re-reads disk under the lock — the old flat pin check consulted
+    the stale in-memory list and could disagree)."""
+    from tools import write_approval as wa
+    live = _store()  # the "CLI agent's" long-lived store
+    live.add("memory", "original a")
+    rec = _stage_remove("original a", "original a")
+    # Disk moves on behind the live store's back: the pinned entry is edited out.
+    live._path_for("memory").write_text("different content entirely", encoding="utf-8")
+    # The live store still holds the ORIGINAL in-memory view...
+    assert "original a" in live._entries_for("memory")
+    # ...but classification reports the CURRENT disk verdict: stale.
+    assert wa.classify_pending_memory(rec, live) == "stale"
+    # And the mirror image: a record staged against a DIFFERENT pin that disk now
+    # satisfies even though the live store never saw it.
+    rec2 = _stage_remove("different content entirely", "different content")
+    assert wa.classify_pending_memory(rec2, live) == "ready"
+
+
+def test_sequential_batch_keeps_final_state_budget_semantics(hermes_home):
+    """Required test 5: a valid mixed sequential batch retains final-state budget
+    semantics — an intermediate over-budget state is fine when the FINAL state is
+    within the limit; a final over-budget state classifies invalid."""
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+    store = MemoryStore(memory_char_limit=200, user_char_limit=4000)
+    store.load_from_disk()
+    # Seed one big entry; the sequential batch replaces it with a big intermediate
+    # (still within final budget once the second op shrinks it).
+    store.add("memory", "A" * 150)
+    ok = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "A", "content": "B" * 190,
+         "matched_entry": "A" * 150},
+        {"action": "replace", "old_text": "B", "content": "C" * 50,
+         "matched_entry": "B" * 190},
+    ]})
+    assert wa.classify_pending_memory(ok, store) == "ready"
+    # Same chain but the FINAL state itself is over budget => invalid.
+    over = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "A", "content": "B" * 190,
+         "matched_entry": "A" * 150},
+        {"action": "replace", "old_text": "B", "content": "D" * 250,
+         "matched_entry": "B" * 190},
+    ]})
+    assert wa.classify_pending_memory(over, store) == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# CORRECTION ROUND 3 — read-only preflight must actually be read-only
+#
+# /memory pending, bare /memory, bulk hygiene and queue classification dry-run
+# payloads through MemoryStore._batch_failure -> _consolidation_failure, which
+# increments the per-turn failure budget that governs the LIVE agent's memory
+# retry behavior. Inspection must not consume that budget; real commit/write
+# attempts keep existing semantics.
+# ---------------------------------------------------------------------------
+
+
+def test_classification_does_not_consume_failure_budget_over_budget_record(hermes_home):
+    """Required tests 1-3: set/read _consolidation_failures; classify an over-budget
+    pending proposal; the counter stays value-identical."""
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+    store = MemoryStore(memory_char_limit=120, user_char_limit=4000)
+    store.load_from_disk()
+    store.add("memory", "budget witness entry")
+    store._consolidation_failures = 2  # mid-turn budget already partially consumed
+    rec = _stage({"action": "replace", "target": "memory", "old_text": "budget witness",
+                  "content": "X" * 300, "matched_entry": "budget witness entry"})
+    assert wa.classify_pending_memory(rec, store) == "invalid"
+    assert store._consolidation_failures == 2  # byte-for-byte unchanged
+
+
+def test_classification_does_not_consume_failure_budget_invalid_queue(hermes_home):
+    """Required tests 4-5: classify several INVALID queue records; counter unchanged."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "invalid queue witness")
+    store._consolidation_failures = 1
+    bad_ops = [
+        {"action": "purge", "target": "memory", "old_text": "x"},                 # unknown action
+        {"action": "replace", "target": "memory", "old_text": "witness",
+         "content": "Y" * 9999, "matched_entry": "invalid queue witness"},        # over budget
+        {"action": "batch", "target": "memory", "operations": []},                # empty batch
+        {"action": "remove", "target": "memory", "old_text": "not on disk",
+         "matched_entry": "not on disk at all"},                                  # stale pin
+    ]
+    recs = [_stage(op) for op in bad_ops]
+    verdicts = dict(zip([r["id"] for r in recs],
+                        [wa.classify_pending_memory(r, store) for r in recs]))
+    assert verdicts[recs[0]["id"]] == "invalid"
+    assert verdicts[recs[1]["id"]] == "invalid"
+    assert verdicts[recs[2]["id"]] == "invalid"
+    assert verdicts[recs[3]["id"]] == "stale"
+    assert wa.classify_pending_memory_queue(store, recs)  # whole-queue path too
+    assert store._consolidation_failures == 1  # unchanged through all of it
+
+
+def test_real_failing_writes_still_increment_and_success_resets(hermes_home):
+    """Required tests 6-7: real failing memory writes still increment the guard exactly
+    as before; successful real writes still reset it."""
+    store = _store()
+    store.add("memory", "real write witness")
+    assert store._consolidation_failures == 0
+    r = store.apply_batch("memory", [{"action": "replace", "old_text": "nope",
+                                      "content": "x"}])
+    assert r["success"] is False
+    assert store._consolidation_failures == 1  # the commit path still counts
+    ok = store.apply_batch("memory", [{"action": "replace", "old_text": "real write",
+                                       "content": "replaced real write"}])
+    assert ok["success"] is True
+    assert store._consolidation_failures == 0  # success still resets
+    # And a dry-run of the SAME failing batch stays free:
+    dry = store.resolve_batch_entries("memory", [{"action": "replace", "old_text": "nope",
+                                                  "content": "x"}])
+    assert dry["success"] is False
+    assert store._consolidation_failures == 0

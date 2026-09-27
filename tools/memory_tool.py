@@ -233,9 +233,11 @@ def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], det
        the store changed between snapshot and commit — including an unrelated entry —
        the store refuses under the lock and NOTHING is applied.
 
-    ``/memory undo <audit_id>`` restores the recorded before-state; it proves from the
-    journal (before/applied/planned-after digests) that the consolidation committed and
-    that memory has not drifted since before touching anything."""
+    ``/memory undo <audit_id>`` restores the recorded before-state; it requires durable
+    COMMIT evidence (a ledger 'applied' event whose after-digest matches the plan) and
+    that memory has not drifted since before touching anything. When the post-commit
+    'applied' append fails, the change is reported with automatic undo explicitly
+    unavailable and a manual-recovery pointer instead of an undo hint."""
     from tools.memory_consolidation import MemoryConsolidationAuditError, record_applied, record_begin
     from tools.memory_tool_store import ENTRY_DELIMITER
 
@@ -302,15 +304,21 @@ def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], det
         # full-store expected-before precondition, so the committed state IS the
         # planned state; applied.after_sha256 therefore always equals the begin
         # record's planned_after_sha256 (asserted by the ledger regression tests).
-        with suppress(Exception):  # best-effort: the commit is already durable
-            record_applied(audit_id, target, planned_after_raw, counts)
+        applied_recorded = False
+        with suppress(Exception):  # the commit is already durable; reporting must not lose it
+            applied_recorded = record_applied(audit_id, target, planned_after_raw, counts)
         tool_result = {
             "success": True, "done": True, "target": target,
             "autonomously_consolidated": True, "audit_id": audit_id,
             "replaced": counts["replaced"], "removed": counts["removed"], "added": counts["added"],
             "usage": result.get("usage"), "entry_count": result.get("entry_count"),
-            "message": f"Unattended memory consolidation applied automatically. "
-                       f"Recovery: /memory undo {audit_id}",
+            "message": (f"Unattended memory consolidation applied automatically. "
+                        + ("Recovery: /memory undo " + audit_id if applied_recorded else
+                           "Automatic undo is UNAVAILABLE for this change: the post-commit "
+                           "audit record could not be written, so its commit cannot be "
+                           "proven later; recover manually from the begin record "
+                           f"(audit id {audit_id}) in memory_backups/consolidations.jsonl "
+                           "if you ever need to reverse it.")),
         }
         for extra in ("replaced_entries", "removed_entries", "replaced_entry", "removed_entry"):
             if result.get(extra) is not None:

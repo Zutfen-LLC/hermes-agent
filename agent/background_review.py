@@ -1320,21 +1320,25 @@ def pending_memory_proposals_context(
     against the fresh verdicts of newer records) against ONE store load — the same
     semantics ``/memory pending`` persists, so the digest, the lifecycle UI and bulk
     reject can never disagree about which records are active. Nothing is persisted from
-    here; the verdicts are consumed and dropped."""
+    here; the verdicts are consumed and dropped. The RENDERING consumes those fresh
+    verdicts, not the persisted ``status`` field: a record persisted 'superseded' whose
+    fresh verdict recovered to 'ready' is rendered immediately (the digest is read-only
+    and must not wait for ``/memory pending`` to re-persist statuses); persisted
+    statuses are consulted only in the classification-unavailable fallback."""
     try:
         import hashlib
 
         from tools.memory_tool import _batch_op_line, destructive_ops, load_on_disk_store
         from tools.write_approval import classify_pending_memory_queue, list_pending
 
-        def _emit(record: Dict[str, Any]) -> Optional[str]:
+        def _emit(record: Dict[str, Any], status: Optional[str] = None) -> Optional[str]:
             payload = record.get("payload")
             payload = payload if isinstance(payload, dict) else {}
             ops = destructive_ops(payload)
             if not ops:
                 return None
             rid = str(record.get("id") or "?")
-            status = str(record.get("status") or "ready")
+            status = str(status if status is not None else (record.get("status") or "ready"))
             action = str(record.get("action") or "")
             target = str(payload.get("target") or "")
             summary = str(record.get("summary") or "").replace("\n", " ").strip()
@@ -1358,19 +1362,26 @@ def pending_memory_proposals_context(
         # exact set semantics the persisted lifecycle uses. Best-effort — hygiene must
         # never break the digest (same failure contract as everything in this function).
         try:
-            verdicts = classify_pending_memory_queue(load_on_disk_store(), records)
-            records = [r for r, verdict in verdicts if verdict in ("ready", "")]
+            verdicted = classify_pending_memory_queue(load_on_disk_store(), records)
         except Exception:
             logger.debug("pending memory classification unavailable; using raw statuses", exc_info=True)
+            # Fallback ONLY when fresh classification was unavailable at all: raw
+            # persisted statuses, the pre-lifecycle behavior.
+            verdicted = [(r, str(r.get("status") or "ready")) for r in records if isinstance(r, dict)]
         lines: List[str] = []
         used = 0
         more = 0
-        for record in records:
+        for record, verdict in verdicted:
             if not isinstance(record, dict) or record.get("origin") != "background_review":
                 continue
-            if record.get("status") not in (None, "", "ready"):
+            # The FRESH verdict rules (correction round 3): a record whose persisted
+            # status is 'superseded'/'stale' but whose fresh verdict recovered to ready
+            # IS rendered — the digest is read-only and must not wait for /memory
+            # pending to re-persist statuses first. Genuinely stale/superseded/
+            # invalid/rejected records stay absent.
+            if verdict not in ("ready", ""):
                 continue
-            line = _emit(record)
+            line = _emit(record, status=verdict or None)
             if line is None:
                 continue
             if len(lines) < limit and (not lines or used + len(line) + 1 <= char_budget):

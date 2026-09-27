@@ -161,3 +161,92 @@ def test_registry_exposes_undo_subcommand():
     assert cmd.args_hint == "[pending|approve|reject|diff|undo|approval] [id|on|off]"
     assert SUBCOMMANDS["/memory"] == \
         ["pending", "approve", "reject", "diff", "undo", "approval"]
+
+
+# ---------------------------------------------------------------------------
+# CORRECTION ROUND 3 — automatic undo requires durable commit evidence
+# ---------------------------------------------------------------------------
+
+
+def test_undo_begin_only_with_independent_change_refused(home):
+    """Begin record exists, the commit failed, and memory later changed independently:
+    /memory undo must REFUSE (a begin record proves intent, not commit) and preserve
+    the independent state. The refusal names the manual recovery path."""
+    from tools import memory_consolidation as mc
+    from tools.memory_tool_store import ENTRY_DELIMITER
+    store = _store()
+    store.add("memory", "cli undo witness a")
+    store.add("memory", "cli undo witness b")
+    before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+    audit_id = mc.record_begin(
+        "memory", [{"action": "remove", "old_text": "cli undo witness a",
+                    "matched_entry": "cli undo witness a"}],
+        before_raw, ["cli undo witness a", "cli undo witness b"],
+        planned_after_raw=ENTRY_DELIMITER.join(["cli undo witness b"]))
+    # The consolidation never committed; an independent actor then removed A anyway.
+    store.remove("memory", "cli undo witness a")
+    out = _undo(["undo", audit_id], store)
+    assert "Refusing to automatically undo" in out
+    assert "no durable 'applied' event" in out
+    assert _disk_entries(store) == ["cli undo witness b"]  # independent state preserved
+
+
+def test_undo_commit_failed_current_before_is_noop(home):
+    """Begin exists, commit failed, current still equals before: idempotent no-op via
+    the CLI surface (memory not rewritten)."""
+    from tools import memory_consolidation as mc
+    from tools.memory_tool_store import ENTRY_DELIMITER
+    store = _store()
+    store.add("memory", "noop witness a")
+    store.add("memory", "noop witness b")
+    before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+    audit_id = mc.record_begin(
+        "memory", [{"action": "remove", "old_text": "noop witness a",
+                    "matched_entry": "noop witness a"}],
+        before_raw, ["noop witness a", "noop witness b"],
+        planned_after_raw=ENTRY_DELIMITER.join(["noop witness b"]))
+    out = _undo(["undo", audit_id], store)
+    assert "nothing to restore" in out
+    assert _disk_entries(store) == ["noop witness a", "noop witness b"]
+
+
+def test_undo_after_real_consolidation_with_applied_event_works(home):
+    """Positive control: begin + committed batch + applied event + current == after =>
+    the CLI undo restores the exact before-state."""
+    from tools.memory_tool import memory_tool
+    from tools.skill_provenance import set_current_write_origin, reset_current_write_origin
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    cfg.setdefault("memory", {})["allow_unattended_consolidation"] = True
+    save_config(cfg)
+    store = _store()
+    store.add("memory", "applied path witness")
+    store.add("memory", "applied path keeper")
+    token = set_current_write_origin("background_review")
+    try:
+        r = json.loads(memory_tool(action="remove", old_text="applied path witness", store=store))
+    finally:
+        reset_current_write_origin(token)
+    assert r["success"] is True, r
+    out = _undo(["undo", r["audit_id"]], store)
+    assert "Restored memory to the state recorded before consolidation" in out
+    assert _disk_entries(store) == ["applied path witness", "applied path keeper"]
+
+
+def test_undo_list_hides_begin_only_records(home):
+    """``undo list`` advertises only commit-evidenced (applied) ids; a begin-only failed
+    consolidation is not offered as undoable."""
+    from tools import memory_consolidation as mc
+    store = _store()
+    store.add("memory", "list applied witness")
+    store.add("memory", "list applied keeper")
+    audit_id = _record_consolidation(store)
+    store.add("memory", "list begin witness")
+    before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+    begin_only = mc.record_begin(
+        "memory", [{"action": "remove", "old_text": "list begin witness",
+                    "matched_entry": "list begin witness"}],
+        before_raw, ["list begin witness"])
+    out = _undo(["undo", "list"], store)
+    assert audit_id in out
+    assert begin_only not in out

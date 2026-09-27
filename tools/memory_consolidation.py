@@ -97,8 +97,9 @@ def record_begin(target: str, ops: List[Dict[str, Any]], before_raw: str,
 
     ``planned_after_raw`` is the deterministic planned final state derived from the
     validated plan against this exact before-state; its sha256 lands in the record as
-    ``planned_after_sha256`` — recovery evidence that lets a later undo prove the
-    consolidation committed even when the best-effort 'applied' append failed."""
+    ``planned_after_sha256`` — plan-consistency evidence used to VALIDATE the later
+    'applied' event and to detect inconsistent journal records. It is NOT by itself
+    commit evidence: automatic undo requires a durable 'applied' event."""
     audit_id = uuid.uuid4().hex[:12]
     destructive = [
         {"action": op.get("action"),
@@ -137,9 +138,14 @@ def record_undone(audit_id: str, target: str, restored_sha256: str) -> None:
                        "persist.", audit_id, exc_info=True)
 
 
-def record_applied(audit_id: str, target: str, after_raw: str, counts: Dict[str, int]) -> None:
-    """Best-effort completion record. The commit is already durable in the store;
-    a ledger failure here is logged, never fatal, and never invalidates it."""
+def record_applied(audit_id: str, target: str, after_raw: str, counts: Dict[str, int]) -> bool:
+    """Best-effort completion record — now REPORTS success (correction round 3): the
+    commit is already durable in the store and a ledger failure never invalidates it,
+    but the CALLER must know when the durable commit-evidence event is missing, because
+    ``/memory undo`` refuses automatic undo without an ``applied`` event. Returns True
+    when the event was appended; False when it failed (the caller surfaces the degraded
+    recovery state instead of silently advertising an undo command that cannot be
+    safely honored; manual recovery stays possible from the begin record)."""
     record = {
         "event": "applied", "id": audit_id, "ts": _utc_now_iso(), "target": target,
         "after_sha256": _sha256(after_raw or ""),
@@ -150,7 +156,10 @@ def record_applied(audit_id: str, target: str, after_raw: str, counts: Dict[str,
         _append_record(record)
     except Exception:
         logger.warning("Consolidation %s applied but its audit 'applied' record failed to "
-                       "persist; the begin record remains as evidence.", audit_id, exc_info=True)
+                       "persist; automatic undo is unavailable for it (manual recovery "
+                       "from the begin record remains possible).", audit_id, exc_info=True)
+        return False
+    return True
 
 
 def _read_ledger() -> List[Dict[str, Any]]:
@@ -189,22 +198,35 @@ def list_records() -> List[Dict[str, Any]]:
 def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
     """Undo one recorded consolidation, fail-closed on the CURRENT state.
 
-    The transaction journal contract: the begin record carries ``before_sha256`` (and the
-    full before-state), an ``applied`` event (when its append succeeded) carries
-    ``after_sha256``, and the begin's ``planned_after_sha256`` (when planned deterministically)
-    is recovery evidence for the applied-append-failure case.
+    The transaction journal contract (correction round 3 — planned-after is NOT commit
+    evidence): the begin record carries ``before_sha256`` (and the full before-state).
+    An ``applied`` event is the ONLY durable proof that the mutation happened. A
+    begin/prepare record proves intent, not commit — current state accidentally equaling
+    ``planned_after_sha256`` (e.g. the commit FAILED and an independent manual change
+    later produced that same state) must not make undo restore the before-state and
+    erase that independent change.
 
     Decision table on the CURRENT raw store digest:
 
     - current == before  -> idempotent no-op (never committed, or already restored);
       memory is NOT rewritten.
-    - current == expected-after (applied.after_sha256, else planned_after_sha256)
+    - an ``applied``/committed event exists AND its ``after_sha256`` equals the begin's
+      ``planned_after_sha256`` (when the begin planned one — consistency check) AND
+      current == applied.after_sha256
       -> the consolidation provably committed and nothing else changed since: restore the
       exact before-state as ONE atomic public batch, then append a best-effort 'undone'
       event. Repeated undo is the no-op above.
-    - anything else      -> REFUSE: memory changed since the consolidation (a later
-      legitimate write would be erased by an exact restore). Current memory stays
-      untouched; the audit id is returned for manual inspection.
+    - no applied/commit event exists AND current != before
+      -> REFUSE automatic undo. Preserve memory. Surface the audit id and the recorded
+      before snapshot for manual recovery (a begin record alone cannot prove the
+      mutation happened; restoring on it alone could undo an independent change).
+    - an applied event exists but is INCONSISTENT with the begin's plan
+      (after_sha256 != planned_after_sha256) -> REFUSE: the journal itself is
+      inconsistent; manual recovery only.
+
+    ``planned_after_sha256`` remains recovery-evidence DIAGNOSTICS: it validates the
+    applied event against the transaction plan and detects inconsistent journal records.
+    It must never by itself prove that the mutation happened.
 
     Also refuses cross-profile records and an empty recorded before-state (the store
     refuses emptying a non-empty file; that stays explicit rather than generic)."""
@@ -251,19 +273,44 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
                           f"empty recorded state. Refusing — edit {store._path_for(target).name} "
                           f"manually if that is really intended.")}
 
-    # The expected committed after-state: the applied event when it landed, else the
-    # deterministic planned_after recorded in the begin (post-commit ledger-write-failure
-    # recovery — see the contract above).
+    # Commit evidence (correction round 3): ONLY a durable 'applied' event proves the
+    # mutation happened. Its after-digest must also match the begin's plan when the begin
+    # recorded one — an 'applied' event that disagrees with planned_after_sha256 is an
+    # inconsistent journal, refused outright rather than trusted. The begin's
+    # planned_after_sha256 alone proves nothing about commit and is never a fallback.
     events = [r for r in _read_ledger() if r.get("id") == audit_id]
     applied = next((r for r in reversed(events) if r.get("event") == "applied"), None)
-    expected_after = (applied or {}).get("after_sha256") or record.get("planned_after_sha256")
-    if not expected_after or current_sha != expected_after:
+    if applied is None:
+        # No durable commit evidence. current != before (checked above), so this is NOT
+        # the idempotent no-op: either the commit failed and memory was later changed by
+        # something else, or the post-commit 'applied' append failed. In both cases an
+        # automatic restore could erase an independent change — refuse and hand the
+        # operator the audit id + the recorded before snapshot for manual recovery.
+        return {"success": False,
+                "error": (f"Refusing to automatically undo '{audit_id}': the ledger holds "
+                          f"no durable 'applied' event for it, so the consolidation's "
+                          f"commit cannot be proven (its commit may have failed, or the "
+                          f"post-commit audit append failed). Memory is preserved as-is. "
+                          f"For manual recovery the begin record holds the full before-state "
+                          f"(before_sha256={before_sha[:12]}…, "
+                          f"{len(before_entries)} entries) — inspect "
+                          f"'{_ledger_path().name}' and restore by hand if intended.")}
+    planned_sha = record.get("planned_after_sha256")
+    after_sha = applied.get("after_sha256")
+    if planned_sha and after_sha != planned_sha:
+        return {"success": False,
+                "error": (f"Refusing to undo '{audit_id}': its 'applied' event's "
+                          f"after-digest does not match the begin record's "
+                          f"planned_after_sha256 — the journal is inconsistent. Memory "
+                          f"is untouched; recover manually from the begin record.")}
+    if not after_sha or current_sha != after_sha:
         return {"success": False,
                 "error": (f"Refusing to undo '{audit_id}': memory has changed since that "
-                          f"consolidation (current state matches neither the recorded "
-                          f"before-state nor its committed/planned after-state), so an exact "
-                          f"restore would erase those later changes. Memory is untouched; "
-                          f"inspect audit id '{audit_id}' and recover manually if intended.")}
+                          f"consolidation committed (current state matches neither the "
+                          f"recorded before-state nor its applied after-state), so an "
+                          f"exact restore would erase those later changes. Memory is "
+                          f"untouched; inspect audit id '{audit_id}' and recover manually "
+                          f"if intended.")}
 
     current = current_entries  # derived from the SAME raw snapshot as current_sha above
     before_set, current_set = set(before_entries), set(current)

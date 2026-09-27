@@ -371,8 +371,10 @@ def _memory_diff(rest: List[str], memory_store=None) -> str:
 
 
 def _memory_undo(rest: List[str], memory_store=None) -> str:
-    """/memory undo <audit_id>: restore the recorded before-state of one autonomous
-    consolidation as a single atomic batch. ``undo list`` shows recent audit ids."""
+    """``/memory undo <audit_id>``: restore the recorded before-state of one autonomous
+    consolidation as a single atomic batch — automatic undo requires durable commit
+    evidence (a ledger 'applied' event); without it the restore refuses and points at
+    manual recovery. ``undo list`` shows recent audit ids."""
     if not rest:
         return "Usage: /memory undo <audit_id>  (ids: /memory undo list)"
     if rest[0].lower() == "list":

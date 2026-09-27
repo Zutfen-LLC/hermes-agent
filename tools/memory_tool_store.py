@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager, suppress
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -235,10 +236,18 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message, current_entries=self._entries_for(target), usage=self._usage(target)))
 
-    def _batch_failure(self, target: str, message: str) -> Dict[str, Any]:
+    def _batch_failure(self, target: str, message: str, *, count_failure: bool = True) -> Dict[str, Any]:
         """Batch-abort failure WITHOUT ``current_entries``: the store did not change and the
         caller already holds the inventory, so echoing it made each consolidation retry
-        grow the context it was invoked to shrink (#97316)."""
+        grow the context it was invoked to shrink (#97316).
+
+        ``count_failure=False`` (read-only dry-runs via ``resolve_batch_entries``) skips the
+        per-turn failure budget: inspecting the queue — ``/memory pending``, bare ``/memory``,
+        bulk hygiene, lifecycle classification — must not consume the retry budget that
+        governs the LIVE agent's real memory writes. Commit-path failures keep counting."""
+        if not count_failure:
+            return _error(message + " No operations were applied (batch is all-or-nothing).",
+                          usage=self._usage(target))
         return self._consolidation_failure(
             _error(message + " No operations were applied (batch is all-or-nothing).", usage=self._usage(target)))
 
@@ -440,6 +449,9 @@ class MemoryStore:
 
     def _batch(self, target: str, operations: List[Dict[str, Any]], *, commit: bool,
                expected_before_raw: Optional[str] = None, allow_empty: bool = False) -> Dict[str, Any]:
+        # Read-only dry-run (commit=False) failures never touch the per-turn failure
+        # budget: classification/preflight inspection is not a consolidation attempt.
+        _fail = self._batch_failure if commit else partial(self._batch_failure, count_failure=False)
         if not operations:
             return _error("operations list is empty.")
         ops = [op or {} for op in operations]
@@ -459,21 +471,21 @@ class MemoryStore:
                     (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})",
                     op.get("matched_entry"))
                 if msg:
-                    return self._batch_failure(target, msg)
+                    return _fail(target, msg)
                 matched.append(previous_content)
             if entries and not working and not allow_empty:
                 # #103419: a consolidation batch that removes the last entry would
                 # commit an empty file as a normal successful write. Refuse; single
                 # remove() is the deliberate-wipe path.
                 label = self._path_for(target).name
-                return self._batch_failure(target, (
+                return _fail(target, (
                     f"Refusing to empty {label}: this batch would remove every entry from a "
                     f"previously non-empty store. Keep at least one entry — merge overlapping "
                     f"entries into a shorter one instead of removing the last one. To delete the "
                     f"final entry deliberately, use single remove() calls."))
             new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
             if new_total > limit:
-                return self._batch_failure(target, (
+                return _fail(target, (
                     f"After applying all {len(operations)} operations, memory would be at "
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
                     f"entries in the same batch, then retry."))

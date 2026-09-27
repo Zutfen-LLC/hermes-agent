@@ -566,10 +566,12 @@ class TestUndoCurrentStatePrecondition:
         assert "changed since" in result["error"]
         assert _disk_entries(store) == drifted  # the later replace is preserved
 
-    def test_applied_append_failure_planned_after_recovery(self, store, monkeypatch):
-        """Post-commit ledger-write failure: the 'applied' event never lands, but the
-        begin carries planned_after_sha256; when current memory EXACTLY equals that
-        planned after-state, safe undo remains possible (recovery evidence adopted)."""
+    def test_applied_append_failure_undo_refused_manual_recovery(self, store, monkeypatch):
+        """CORRECTION ROUND 3 FLIP (was: planned_after fallback made this undo succeed).
+        Post-commit ledger-write failure: the 'applied' event never lands. The begin's
+        planned_after_sha256 is NOT commit evidence — current memory exactly equaling the
+        planned after-state must NOT enable an automatic restore. Undo refuses safely,
+        names the manual-recovery path, and memory is preserved exactly as committed."""
         from tools import memory_consolidation as mc
         real_applied = mc.record_applied
 
@@ -582,13 +584,16 @@ class TestUndoCurrentStatePrecondition:
         with unattended_review():
             r = json.loads(memory_tool(action="remove", old_text="planned after", store=store))
         assert r["success"] is True, r  # the commit is durable; only the ledger append failed
+        assert "UNAVAILABLE" in r["message"]  # the tool result itself reports degraded undo
         # Restore the real record_applied WITHOUT monkeypatch.undo() (it would also undo
         # the home fixture's HERMES_HOME and point the ledger read at the real ~/.hermes).
         mc.record_applied = real_applied
         assert _disk_entries(store) == []
         result = mc.restore(r["audit_id"], store)
-        assert result["success"] is True, result
-        assert _disk_entries(store) == ["planned after keeper"]  # exactly the before-state
+        assert result["success"] is False
+        assert "no durable 'applied' event" in result["error"]
+        assert "manual recovery" in result["error"] or "by hand" in result["error"]
+        assert _disk_entries(store) == []  # the committed state is preserved untouched
 
     def test_wrong_profile_refused(self, store):
         from tools import memory_consolidation as _mc
@@ -950,7 +955,12 @@ class TestAtomicUndoPrecondition:
             assert "nothing to restore" in again["message"]
         assert _disk_entries(store) == expected
 
-    def test_applied_ledger_failure_recovers_from_planned_after(self, store, monkeypatch):
+    def test_applied_ledger_failure_undo_refused_safely(self, store, monkeypatch):
+        """CORRECTION ROUND 3 FLIP (was: planned_after recovery made this undo succeed).
+        A successful commit whose 'applied' append failed leaves NO durable commit
+        evidence; automatic undo refuses safely and identifies the manual recovery path
+        (the begin record + its before snapshot), instead of treating the begin's
+        planned-after digest as proof the mutation happened."""
         from tools import memory_consolidation as mc
         real_applied = mc.record_applied
 
@@ -965,7 +975,161 @@ class TestAtomicUndoPrecondition:
         mc.record_applied = real_applied
 
         assert r["success"] is True, r
+        assert "UNAVAILABLE" in r["message"]
         assert _disk_entries(store) == []
         result = mc.restore(r["audit_id"], store)
+        assert result["success"] is False
+        assert "no durable 'applied' event" in result["error"]
+        # The refusal surfaces the manual recovery ingredients...
+        assert "before_sha256" in result["error"] or "begin record" in result["error"]
+        assert _disk_entries(store) == []
+
+
+# =========================================================================
+# CORRECTION ROUND 3 — planned-after is NOT commit evidence
+#
+# A begin/prepare record proves intent, not commit. current == before stays
+# the idempotent no-op; automatic undo REQUIRES a durable 'applied' event
+# (validated against the begin's plan); begin-only + current != before is
+# REFUSED with the manual-recovery path surfaced. record_applied() reports
+# success so the caller can advertise (or refuse to advertise) undo.
+# =========================================================================
+
+
+class TestUndoRequiresCommitEvidence:
+    """The defect-3 reproduction matrix from the correction instruction."""
+
+    def test_1_begin_exists_commit_failed_current_before_noop(self, store):
+        """Required test 1: begin exists, commit failed, current still before => no-op."""
+        from tools import memory_consolidation as mc
+        _set_flag(True)
+        store.add("memory", "keep one")
+        store.add("memory", "keep two")
+        before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+        before_entries = list(store._entries_for("memory"))
+        planned_entries = ["keep one"]  # what the failed consolidation intended
+        from tools.memory_tool_store import ENTRY_DELIMITER
+        audit_id = mc.record_begin(
+            "memory", [{"action": "remove", "old_text": "keep two",
+                        "matched_entry": "keep two"}],
+            before_raw, before_entries,
+            planned_after_raw=ENTRY_DELIMITER.join(planned_entries))
+        # The commit NEVER happened (simulated failure); memory still equals before.
+        result = mc.restore(audit_id, store)
+        assert result["success"] is True
+        assert "nothing to restore" in result["message"]
+        assert _disk_entries(store) == ["keep one", "keep two"]
+
+    def test_2_begin_only_current_equals_planned_after_refused(self, store):
+        """Required test 2 — THE defect reproduction. Begin journal: before=[A,B],
+        planned after=[B]. The consolidation commit FAILS (no applied event). Later an
+        INDEPENDENT manual removal of A lands memory exactly on the planned after-state.
+        The reviewed implementation saw current == planned_after and restored [A,B],
+        undoing the independent change. Correction: AUTO UNDO REFUSED; the independent
+        state is preserved."""
+        from tools import memory_consolidation as mc
+        from tools.memory_tool_store import ENTRY_DELIMITER
+        _set_flag(True)
+        store.add("memory", "A independent change witness")
+        store.add("memory", "B untouched witness")
+        before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+        before_entries = ["A independent change witness", "B untouched witness"]
+        planned_after_raw = ENTRY_DELIMITER.join(["B untouched witness"])
+        audit_id = mc.record_begin(
+            "memory", [{"action": "remove", "old_text": "A independent",
+                        "matched_entry": "A independent change witness"}],
+            before_raw, before_entries, planned_after_raw=planned_after_raw)
+        # The consolidation commit fails; later, an independent actor removes A.
+        store.remove("memory", "A independent change witness")
+        independent_state = _disk_entries(store)
+        assert independent_state == ["B untouched witness"]
+        result = mc.restore(audit_id, store)
+        assert result["success"] is False
+        assert "no durable 'applied' event" in result["error"]
+        # The independent state is PRESERVED — undo did not resurrect A.
+        assert _disk_entries(store) == independent_state == ["B untouched witness"]
+
+    def test_3_normal_commit_applied_event_undo_works(self, store):
+        """Required test 3: normal successful commit + applied event + current == after
+        => undo works."""
+        from tools.memory_consolidation import restore
+        _set_flag(True)
+        store.add("memory", "alpha commit evidence target")
+        store.add("memory", "commit evidence keeper")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="alpha commit",
+                                       store=store))
+        assert r["success"] is True, r
+        assert "Recovery: /memory undo" in r["message"]
+        result = restore(r["audit_id"], store)
         assert result["success"] is True, result
-        assert _disk_entries(store) == ["planned after recovery witness"]
+        assert _disk_entries(store) == ["alpha commit evidence target",
+                                        "commit evidence keeper"]
+
+    def test_5_applied_after_must_equal_planned_after(self, store, monkeypatch):
+        """Required test 5: applied.after_sha256 must equal planned_after_sha256; an
+        inconsistent journal (applied digest != planned digest) => refuse."""
+        from tools import memory_consolidation as mc
+        _set_flag(True)
+        store.add("memory", "consistency check witness")
+        store.add("memory", "consistency keeper")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="consistency check",
+                                       store=store))
+        assert r["success"] is True, r
+        # Tamper with the ledger's applied event: rewrite after_sha256 to an unrelated
+        # digest, leaving the begin's planned_after_sha256 intact.
+        path = mc._ledger_path()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        tampered = []
+        for line in lines:
+            rec = json.loads(line)
+            if rec.get("event") == "applied" and rec.get("id") == r["audit_id"]:
+                rec["after_sha256"] = "f" * 64  # unrelated digest
+            tampered.append(json.dumps(rec))
+        path.write_text("\n".join(tampered) + "\n", encoding="utf-8")
+        result = mc.restore(r["audit_id"], store)
+        assert result["success"] is False
+        assert "planned_after_sha256" in result["error"] and "inconsistent" in result["error"]
+        assert _disk_entries(store) == ["consistency keeper"]
+
+
+    def test_record_applied_reports_success_and_failure(self, store):
+        """record_applied() returns True on a good append and False on a failed one, so
+        the caller can report the degraded recovery state."""
+        from tools import memory_consolidation as mc
+        _set_flag(True)
+        store.add("memory", "report witness")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="report", store=store))
+        assert r["success"] is True, r
+        assert mc.record_applied("deadbeef0000", "memory", "x", {"removed": 1}) is True
+        def boom(*a, **kw):
+            raise mc.MemoryConsolidationAuditError("nope")
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(mc, "_append_record", boom)
+        try:
+            assert mc.record_applied("deadbeef0001", "memory", "x", {}) is False
+        finally:
+            monkeypatch.undo()
+
+
+    def test_undo_list_only_shows_applied(self, store):
+        """``undo list`` shows only applied (commit-evidenced) ids: a begin-only failed
+        consolidation is not advertised as undoable."""
+        from hermes_cli.write_approval_commands import _memory_undo_list
+        from tools import memory_consolidation as mc
+        _set_flag(True)
+        store.add("memory", "list alpha")
+        with unattended_review():
+            applied_r = json.loads(memory_tool(action="remove", old_text="list alpha",
+                                               store=store))
+        store.add("memory", "list beta")
+        before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+        mc.record_begin("memory", [{"action": "remove", "old_text": "list beta"}],
+                        before_raw, ["list beta"])
+        out = _memory_undo_list()
+        assert applied_r["audit_id"] in out
+        begin_only = [rec["id"] for rec in mc.list_records()
+                      if rec.get("event") == "begin" and rec["id"] != applied_r["audit_id"]]
+        assert begin_only and all(b not in out for b in begin_only)

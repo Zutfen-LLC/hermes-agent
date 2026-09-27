@@ -363,11 +363,18 @@ staged write:
   later re-read), so a write landing right after the commit can never be
   claimed by the transaction. Every applied consolidation reports its audit
   id, and `/memory undo <audit_id>` restores the recorded before-state — but
-  only after proving from the journal that the consolidation committed and
-  that memory has not drifted since: an uncommitted (begin-only) transaction
-  is a no-op, a consolidation followed by later writes is refused (with the
-  audit id for manual recovery) rather than erasing them, and the restore
-  itself commits atomically against the exact state it validated.
+  only with durable commit evidence: the ledger's `applied` event (whose
+  after-digest must match the recorded plan) is what proves the mutation
+  happened. The begin record alone proves intent, not commit — if memory
+  later differs from the recorded before-state without an `applied` event
+  (the commit failed and something else changed the file, or the post-commit
+  audit append failed), automatic undo refuses and points at the audit id
+  and the recorded before snapshot for manual recovery instead of risking an
+  overwrite of an independent change. A consolidation followed by later
+  writes is likewise refused, and the restore itself commits atomically
+  against the exact state it validated. When the post-commit audit record
+  cannot be written, the change is reported with automatic undo explicitly
+  unavailable rather than an undo hint that could not be safely honored.
   `/memory undo list` shows recent audit records.
 
 Scope guardrails: only the unattended background **memory** review is affected —
@@ -411,6 +418,10 @@ pending proposals (ids, statuses, pinned-entry digests — capped at 8 records /
 already queued for you. The digest classifies the whole queue as one set
 against a single snapshot of the store — the same verdicts `/memory pending`
 persists — so the two can never disagree about which proposals are active.
+The digest is read-only and consumes those FRESH verdicts rather than the
+persisted status fields: a proposal persisted `superseded` whose superseder
+you later rejected shows up again immediately, without waiting for a
+`/memory pending` run to re-persist its recovered status.
 
 ## Background review notifications (`display.memory_notifications`)
 

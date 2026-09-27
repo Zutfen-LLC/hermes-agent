@@ -337,13 +337,16 @@ def classify_pending_memory(record: Dict[str, Any], store, records: Optional[Lis
     an identical ``matched_entry`` make this one redundant. Any unexpected store error
     also classifies 'invalid' (fail closed).
 
-    Classification order (correction round 2): rejected terminal → malformed structural
-    shape → legacy unpinned destructive → stale exact pins → semantic preflight failure
-    that is not merely stale → supersession → ready. The semantic preflight is a
-    NON-MUTATING dry-run of the record's own ops through the store's public batch
-    resolver, so 'ready' also proves the record can actually APPLY: an over-budget
-    pinned replacement, an over-budget batch, an empty batch or a malformed op classify
-    'invalid' instead of eternally failing ``/memory approve all``."""
+    Classification order (correction round 3): rejected terminal → malformed structural
+    shape → semantic preflight → supersession → ready. The semantic preflight is THE one
+    authoritative applicability verdict: the record's own ops, normalized to a batch, are
+    dry-runned through the store's public batch resolver — which re-reads disk under the
+    lock and walks ops SEQUENTIALLY, so a staged chain ``replace A→B`` then ``replace
+    B→C`` resolves B from the batch's own working state, exactly as apply_batch would
+    execute it. No independent flat "every pin must pre-exist in the initial entry list"
+    check runs first (correction round 2's flat check misclassified such legitimate
+    sequential batches as stale, and a long-lived CLI store snapshot older than disk
+    could make it disagree with the resolver's fresh view)."""
     if not isinstance(record, dict) or record.get("status") == STATUS_REJECTED:
         return STATUS_REJECTED
     payload = record.get("payload")
@@ -357,12 +360,9 @@ def classify_pending_memory(record: Dict[str, Any], store, records: Optional[Lis
     if target not in ("memory", "user"):
         return STATUS_INVALID
     try:
-        entries = store._entries_for(target)
-        if any(op.get("matched_entry") not in entries for op in destructive):
-            return STATUS_STALE
         preflight = _preflight_memory_payload(payload, target, store)
-        if preflight == STATUS_INVALID:
-            return STATUS_INVALID
+        if preflight is not None:
+            return preflight  # 'stale' (pin drifted at its point of consumption) or 'invalid'
         if _is_superseded(record, records, target):
             return STATUS_SUPERSEDED
     except Exception:
@@ -375,15 +375,20 @@ _STALE_PREFLIGHT_MARKERS = ("no entry matched", "matched multiple distinct", "is
 
 
 def _preflight_memory_payload(payload: Dict[str, Any], target: str, store) -> Optional[str]:
-    """NON-MUTATING semantic dry-run of one pending payload against the CURRENT loaded
-    store: the exact op set ``/memory approve`` would replay, normalized to a batch and
-    resolved through ``resolve_batch_entries`` (same content scan, op walk, empty-store
-    and final-budget checks as the real apply). Returns ``STATUS_INVALID`` when the
-    payload could not apply for a reason OTHER than the pinned target having drifted
-    (that is ordinary staleness, reported by the caller's exact-pin check instead — a
-    stale record can recover, an invalid one must never be retried by approve-all), and
-    ``None`` when the payload applies cleanly. ``store`` is never mutated: the resolver
-    runs under ``skip_drift``/no-commit and only reads."""
+    """THE authoritative semantic preflight of one pending payload against CURRENT disk
+    state: the exact op set ``/memory approve`` would replay, normalized to a batch and
+    resolved through ``resolve_batch_entries`` — which takes the store's file lock,
+    re-reads disk, and walks the ops SEQUENTIALLY over the working state (a staged
+    ``replace A→B`` then ``replace B→C`` resolves B from the batch's own intermediate
+    state, never from a possibly stale long-lived store snapshot).
+
+    Returns ``None`` when the payload applies cleanly; ``STATUS_STALE`` when it fails
+    because an exact staged pin is genuinely gone/changed at the point in the sequential
+    walk where it is consumed (ordinary drift — recoverable, re-derivable); otherwise
+    ``STATUS_INVALID`` (malformed shape, invalid content, budget failure, …) — a record
+    that could never apply and must not be retried by approve-all. ``store`` is never
+    mutated: the resolver runs read-only (skip_drift, no commit, no failure-budget
+    counting — inspecting the queue must not consume the live agent's retry budget)."""
     action = payload.get("action")
     if action == "batch":
         operations = payload.get("operations")
@@ -406,7 +411,7 @@ def _preflight_memory_payload(payload: Dict[str, Any], target: str, store) -> Op
         return None
     message = str(dry.get("error") or "")
     if any(marker in message for marker in _STALE_PREFLIGHT_MARKERS):
-        return None  # target drift, not a structural defect: classify by exact pins
+        return STATUS_STALE  # pin drift at its point of consumption: recoverable
     return STATUS_INVALID
 
 
