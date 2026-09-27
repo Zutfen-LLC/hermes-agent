@@ -134,9 +134,11 @@ it.each([
     // Only the release branch writes the shared cache; commit and channel
     // builds of unreviewed inputs run the read-only leg.
     const needs = admitted(targetOf(job))
-    expect(evaluate(job.if, { inputs: dispatches.tag, needs })).toBe(cacheMode === 'write')
-    expect(evaluate(job.if, { inputs: dispatches.commit, needs })).toBe(cacheMode === 'read')
-    expect(evaluate(job.if, { inputs: dispatches.channel, needs })).toBe(cacheMode === 'read')
+    // The fork disables native client jobs with a literal false condition.
+    const enabled = job.if !== false
+    expect(evaluate(job.if, { inputs: dispatches.tag, needs })).toBe(enabled && cacheMode === 'write')
+    expect(evaluate(job.if, { inputs: dispatches.commit, needs })).toBe(enabled && cacheMode === 'read')
+    expect(evaluate(job.if, { inputs: dispatches.channel, needs })).toBe(enabled && cacheMode === 'read')
   }
   const cacheSteps = job.steps.filter(step => step.uses === BUILD_CACHE)
   expect(cacheSteps.map(step => step.with.phase)).toEqual(['restore', 'save'])
@@ -203,7 +205,7 @@ it('each selection gate joins exactly one target\'s two trust branches after adm
     // The gate runs always() to judge a skipped branch, so it must still
     // refuse a failed admission itself.
     const needs = admitted([label])
-    expect(evaluate(gate.if, { inputs: dispatches.tag, needs })).toBe(true)
+    expect(evaluate(gate.if, { inputs: dispatches.tag, needs })).toBe(gate.if !== false)
     expect(evaluate(gate.if, { inputs: dispatches.tag,
       needs: { validate: { ...needs.validate, result: 'failure' } } })).toBe(false)
   }
