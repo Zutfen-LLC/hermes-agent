@@ -122,9 +122,9 @@ jobs:
   # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
   # Same `python` lane gate: if no Python changed, neither runs.
   tests-os:
+    if: false # Fork supports Linux only.
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -297,7 +297,6 @@ jobs:
     needs:
       - detect
       - tests
-      - tests-os
       - lint
       - js-tests
       - rust-tests

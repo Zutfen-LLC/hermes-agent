@@ -127,6 +127,7 @@ jobs:
         run: bash scripts/run_tests.sh tests/scripts/test_fresh_source_install.py -q -j 1
 
   windows:
+    if: false # Fork supports Linux only.
     name: install.ps1 protocol surface
     runs-on: windows-latest
     timeout-minutes: 10

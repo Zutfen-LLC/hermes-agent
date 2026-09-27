@@ -112,6 +112,8 @@ def test_claim_flags_remove_exactly_the_jobs_the_gate_expects_skipped():
 
     def removed_by(name, flag):
         condition = str(jobs[name].get("if", ""))
+        if condition.lower() == "false":
+            return True
         if f"{outputs[flag]} != 'true'" in condition:
             return True
         # Without a status function a job skips when any job it needs skipped.
@@ -140,7 +142,8 @@ def test_claim_flags_remove_exactly_the_jobs_the_gate_expects_skipped():
 
 def test_all_applicable_ci_jobs_are_aggregated_and_desktop_e2e_stays_deferred():
     jobs = workflow("ci.yaml")["jobs"]
-    checks = {name for name, job in jobs.items() if "uses" in job}
+    checks = {name for name, job in jobs.items()
+              if "uses" in job and str(job.get("if", "")).lower() != "false"}
     assert checks <= set(jobs["all-checks-pass"]["needs"])
     assert not gate(jobs["e2e-desktop"]["if"], {}, {})
     assert "workflow_call" in workflow("ci.yaml")["on"]
