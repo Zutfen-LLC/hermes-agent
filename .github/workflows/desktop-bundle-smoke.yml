@@ -64,9 +64,9 @@ jobs:
           esac
 
   macos:
+    if: false # Fork supports Linux only.
     name: macOS install and chat
     needs: validate
-    if: inputs.platform == 'darwin'
     runs-on: ${{ inputs.arch == 'x64' && 'macos-15-intel' || 'macos-15' }}
     timeout-minutes: 30
     # Also constrains the recording action's nested cache to read-only.
@@ -227,9 +227,9 @@ jobs:
           retention-days: 14
 
   windows:
+    if: false # Fork supports Linux only.
     name: Windows install and chat
     needs: validate
-    if: inputs.platform == 'win32'
     runs-on: ${{ inputs.arch == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
     # windows-11-arm runners are much slower (npm ci alone runs 12+ minutes and
     # the MSIX leg exceeds 30 total); x64 legs complete in ~14.

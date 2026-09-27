@@ -5,11 +5,15 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
+import runpy
 
 import pytest
+from ruamel.yaml import YAML
 
 REPO = Path(__file__).resolve().parents[2]
-_spec = importlib.util.spec_from_file_location("fork_ci_policy", REPO / "scripts/ci/fork_ci_policy.py")
+_spec = importlib.util.spec_from_file_location(
+    "fork_ci_policy", REPO / "scripts/ci/fork_ci_policy.py"
+)
 policy = importlib.util.module_from_spec(_spec)
 sys.modules["fork_ci_policy"] = policy  # @dataclass resolves its module here
 _spec.loader.exec_module(policy)
@@ -21,6 +25,8 @@ jobs:
   build:
     # sized for ubuntu-latest-32-core
     runs-on: ${{ inputs.arm && 'windows-latest-32-arm-core' || 'windows-latest-32-core' }}
+  linux:
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
@@ -33,11 +39,16 @@ def test_no_private_runner_label_survives_and_policy_is_idempotent():
     once = policy.apply_policy("some-new-upstream-workflow.yml", UPSTREAM_STYLE)
     assert not PRIVATE_LABEL.search(once)
     assert policy.apply_policy("some-new-upstream-workflow.yml", once) == once
+    jobs = YAML(typ="base").load(once)["jobs"]
+    assert jobs["build"]["if"].startswith("false")
+    assert "if" not in jobs["linux"]
 
 
 def test_a_rule_whose_upstream_anchor_changed_fails_by_name():
     with pytest.raises(policy.PolicyError, match="js: check concurrency"):
-        policy.apply_policy("js-tests.yml", "run: node .github/scripts/renamed-runner.mjs\n")
+        policy.apply_policy(
+            "js-tests.yml", "run: node .github/scripts/renamed-runner.mjs\n"
+        )
 
 
 def test_committed_upstream_workflows_are_already_policy_fixed_points():
@@ -48,3 +59,41 @@ def test_committed_upstream_workflows_are_already_policy_fixed_points():
             continue
         text = path.read_text(encoding="utf-8")
         assert policy.apply_policy(path.name, text) == text, path.name
+
+
+def test_native_clients_are_disabled_and_linux_validation_remains_strict():
+    yaml = YAML(typ="base")
+    workflows = {
+        path.name: yaml.load(path.read_text(encoding="utf-8"))
+        for path in (REPO / policy.WORKFLOWS).glob("*.y*ml")
+    }
+    for filename, workflow in workflows.items():
+        for name, job in workflow["jobs"].items():
+            selector = str(job.get("runs-on", "")) + str(job.get("strategy", {}))
+            native = any(label in selector for label in ("windows-", "macos-"))
+            if native or name in policy._DISABLED_JOBS.get(filename, ()):
+                assert job.get("if") == "false", (filename, name)
+    ci = workflows["ci.yaml"]["jobs"]
+    required = ci["all-checks-pass"]["needs"]
+    assert "tests-os" not in required
+    assert {"tests", "lint", "js-tests", "bootstrap-installer"} <= set(required)
+    assert ci["tests"].get("if") != "false"
+    assert workflows["bootstrap-installer.yml"]["jobs"]["posix"].get("if") != "false"
+    gate = runpy.run_path(str(REPO / "scripts/ci/required_results.py"))["evaluate_gate"]
+    results = {name: {"result": "success"} for name in required}
+    assert gate(results, release=True)["ok"]
+    results["tests"] = {"result": "skipped"}
+    assert gate(results, release=True)["failed"] == ["tests"]
+    with pytest.raises(policy.PolicyError, match="mixed Linux/native client matrix"):
+        policy.apply_policy(
+            "new.yml",
+            """jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: windows-latest
+""",
+        )

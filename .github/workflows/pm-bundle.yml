@@ -55,6 +55,7 @@ concurrency:
 
 jobs:
   bundle:
+    if: false # Fork supports Linux only.
     name: bundle ${{ matrix.target.label }}
     runs-on: ${{ matrix.target.runner }}
     # Leave time for setup, cache saves and smoke tests around the wheel build.

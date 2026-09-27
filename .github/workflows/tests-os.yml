@@ -51,6 +51,7 @@ concurrency:
 
 jobs:
   os-tests:
+    if: false # Fork supports Linux only.
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout || 30 }}
@@ -169,6 +170,7 @@ jobs:
           NOUS_API_KEY: ''
 
   e2e-windows:
+    if: false # Fork supports Linux only.
     # Real Hermes processes on a real Windows host (tests/e2e/core/windows): hermes.exe,
     # `hermes serve`, `hermes gateway run/stop`, the tui_gateway stdio process, cron script
     # jobs, the terminal tool's Git Bash / PowerShell / cmd children and a ConPTY console,
