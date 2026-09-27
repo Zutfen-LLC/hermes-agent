@@ -204,6 +204,10 @@ def test_approve_refuses_staged_remove_whose_entry_changed(hermes_home, shape):
     from tools.memory_tool import load_on_disk_store, memory_tool
     from tools import write_approval as wa
     store, pid = _review_stages_remove(shape)
+    # The pending list shows the whole entry the write targets, not just its search string
+    # (checked BEFORE the entry changes; a later failed approve marks the record stale and
+    # archives it out of the approval list).
+    assert _REVIEWED in handle_pending_subcommand(wa.MEMORY, ["pending"])
     newer = "Staging DB: pg-staging-3 (migrated 2026-09-20, creds in vault 'stg')"
     assert json.loads(memory_tool(action="replace", old_text="pg-staging-2", content=newer, store=store))["success"]
 
@@ -212,8 +216,9 @@ def test_approve_refuses_staged_remove_whose_entry_changed(hermes_home, shape):
     assert load_on_disk_store().memory_entries == [_KEPT, newer], out
     assert "changed since it was staged" in out
     assert wa.get_pending(wa.MEMORY, pid) is not None
-    # The pending list shows the whole entry the write targets, not just its search string.
-    assert _REVIEWED in handle_pending_subcommand(wa.MEMORY, ["pending"])
+    # The failed attempt persisted its lifecycle classification: the record is archived
+    # out of the approval candidates but still on disk (operator can reject or re-derive).
+    assert wa.get_pending(wa.MEMORY, pid).get("status") == "stale"
 
 
 @pytest.mark.parametrize("shape", ["single", "batch"])
@@ -327,3 +332,169 @@ def test_memory_invalid_params_rejected_before_staging(hermes_home):
     r = json.loads(memory_tool("add", "memory", None, store=store))
     assert r["success"] is False
     assert wa.pending_count("memory") == 0
+
+# ---------------------------------------------------------------------------
+# Autonomous unattended consolidation opt-in (memory.allow_unattended_consolidation)
+# ---------------------------------------------------------------------------
+
+def _set_consolidation(enabled):
+    import hermes_cli.config as cfg
+    c = cfg.load_config()
+    c.setdefault("memory", {})["allow_unattended_consolidation"] = enabled
+    cfg.save_config(c)
+
+def test_unattended_consolidation_default_off(hermes_home):
+    from tools import write_approval as wa
+    # No explicit config: DEFAULT_CONFIG carries allow_unattended_consolidation=False.
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_consolidation_opt_in_requires_gate_off(hermes_home):
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    # write_approval is off (default) → opt-in is honored.
+    assert wa.unattended_memory_consolidation_enabled() is True
+    # The approval gate stays authoritative: with it on, staging remains the only path.
+    _set_approval("memory", True)
+    assert wa.unattended_memory_consolidation_enabled() is False
+    # A malformed value must not enable autonomous consolidation.
+    _set_consolidation("not-a-bool!")
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_consolidation_malformed_config_fails_closed(hermes_home, monkeypatch):
+    from tools import write_approval as wa
+    def _boom():
+        raise RuntimeError("config unreadable")
+    # write_approval.py imports load_config lazily inside the function, so patching
+    # the module attribute is what the call-time import resolves to.
+    monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+# ---------------------------------------------------------------------------
+# Single-config-snapshot resolution (correction round: fail-closed invariant)
+# ---------------------------------------------------------------------------
+
+def test_unattended_policy_resolves_from_one_config_snapshot(hermes_home, monkeypatch):
+    """Both booleans (allow_unattended_consolidation, write_approval) must come from ONE
+    load_config() result. The reviewed implementation called write_approval_enabled()
+    afterwards — a second, independent config read whose failure would silently report
+    the gate OFF and turn autonomous destructive consolidation ON."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    calls = {"n": 0}
+    real_load = cfg.load_config
+
+    def counting_load():
+        calls["n"] += 1
+        return real_load()
+
+    monkeypatch.setattr("hermes_cli.config.load_config", counting_load)
+    assert wa.unattended_memory_consolidation_enabled() is True
+    assert calls["n"] == 1  # exactly ONE configuration read
+
+def test_unattended_policy_second_read_failure_cannot_enable_it(hermes_home, monkeypatch):
+    """Regression for the reviewed defect: the config has opt-in=true AND
+    write_approval=true (gate authoritative), but the SECOND config read (the old
+    write_approval_enabled() call) fails transiently. The reviewed implementation
+    swallowed that failure, reported the gate OFF, and ENABLED autonomous destructive
+    consolidation against a config that explicitly says the gate is on. The corrected
+    single-snapshot policy reads both from one load_config() and stays disabled."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    _set_approval("memory", True)  # the authoritative gate is ON in the config
+
+    real_load = cfg.load_config
+    state = {"n": 0}
+
+    def fail_on_second_call():
+        state["n"] += 1
+        if state["n"] >= 2:
+            raise RuntimeError("second config read failed")
+        return real_load()
+
+    monkeypatch.setattr("hermes_cli.config.load_config", fail_on_second_call)
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_policy_write_approval_truthy_string_blocks(hermes_home):
+    """opt-in=true + write_approval=true => False, including hand-edited string forms."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    c = cfg.load_config()
+    c.setdefault("memory", {})["write_approval"] = "on"  # hand-edited truthy spelling
+    cfg.save_config(c)
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+# ---------------------------------------------------------------------------
+# Correction round 2: malformed boolean config must FAIL CLOSED (validity must be
+# distinguishable from value — _normalize_enabled collapsed both into False)
+# ---------------------------------------------------------------------------
+
+def test_parse_bool_setting_separates_validity_from_value():
+    from tools import write_approval as wa
+    assert wa._parse_bool_setting(True) is True
+    assert wa._parse_bool_setting(False) is False
+    for spelling in ("on", "true", "yes", "1", "approve", "enabled", " true "):
+        assert wa._parse_bool_setting(spelling) is True, spelling
+    for spelling in ("off", "false", "no", "0", "disable", "disabled"):
+        assert wa._parse_bool_setting(spelling) is False, spelling
+    # Malformed / unrecognized values are INVALID (None), not a legitimate false.
+    for bad in ("garbage", "not-a-bool", "2", "maybe", "", None, 5, [], {}):
+        assert wa._parse_bool_setting(bad) is None, bad
+
+def test_unattended_malformed_write_approval_fails_closed(hermes_home):
+    """THE defect: allow_unattended_consolidation=true + write_approval='garbage' used to
+    ENABLE autonomous destructive consolidation (the lossy coercion read the malformed
+    gate value as off). Validity must be separate from value: a malformed value on either
+    key disables the policy."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    c = cfg.load_config()
+    c.setdefault("memory", {})["write_approval"] = "not-a-bool"
+    cfg.save_config(c)
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_malformed_opt_in_fails_closed(hermes_home):
+    """Malformed opt-in spelling is not consent: 'maybe' must disable, never enable."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    c = cfg.load_config()
+    c.setdefault("memory", {})["allow_unattended_consolidation"] = "perhaps"
+    cfg.save_config(c)
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_valid_false_write_approval_still_disables(hermes_home):
+    """A LEGITIMATE false on write_approval is a recognized value: the policy stays
+    resolvable (opt-in honored), unlike the malformed case above."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    c = cfg.load_config()
+    c.setdefault("memory", {})["write_approval"] = "off"
+    cfg.save_config(c)
+    assert wa.unattended_memory_consolidation_enabled() is True
+
+def test_unattended_malformed_memory_section_fails_closed(hermes_home, monkeypatch):
+    """A memory section that is not a dict => disabled."""
+    from tools import write_approval as wa
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda: {"memory": "garbage"})
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_policy_still_exactly_one_config_read(hermes_home, monkeypatch):
+    """The strict parse keeps the single-snapshot invariant: exactly ONE load_config()."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    calls = {"n": 0}
+    real_load = cfg.load_config
+
+    def counting_load():
+        calls["n"] += 1
+        return real_load()
+
+    monkeypatch.setattr("hermes_cli.config.load_config", counting_load)
+    assert wa.unattended_memory_consolidation_enabled() is True
+    assert calls["n"] == 1

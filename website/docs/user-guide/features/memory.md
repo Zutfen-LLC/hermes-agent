@@ -273,6 +273,7 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
+  allow_unattended_consolidation: false  # true = unattended reviews may consolidate directly
 ```
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
@@ -309,7 +310,7 @@ Review staged writes from the CLI or any messaging platform:
 ```
 /memory pending             # list staged memory writes (auto ones tagged [auto])
 /memory approve <id>        # apply one (or 'all')
-/memory reject <id>         # drop one (or 'all')
+/memory reject <id>         # reject one (or 'all') — kept on disk as evidence
 /memory approval on         # turn the gate on (or 'off') and persist it
 ```
 
@@ -324,6 +325,103 @@ the write is refused and stays pending for you to reject. A `replace`/`remove`
 staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
+
+### Letting unattended reviews consolidate (`allow_unattended_consolidation`)
+
+`memory.allow_unattended_consolidation` (default `false`, #106919) removes the
+staging hop for **one narrow case**: the *unattended* background memory review
+(that's the automatic post-turn one — an explicit `/refine` runs attended and
+keeps the full operation set). With the flag on, such a fork may apply
+`replace`/`remove` consolidation — including batches that contain them —
+directly instead of staging it for your approval.
+
+The opt-in only takes effect while `memory.write_approval` is **`false`**.
+`write_approval: true` stays authoritative: everything stages, exactly as
+before, and the opt-in is simply ignored.
+
+The enabled path wraps every application in the same guarantees as an approved
+staged write:
+
+- **Exact-entry binding** — the fork pins and snapshots the *full matched
+  entry*, never an `old_text` substring; a missing, ambiguous, or changed
+  anchor refuses the whole operation with nothing applied.
+- **Atomic batches** — a batch is validated and applied all-or-nothing against
+  the final character budget, on a freshly loaded, authoritative view of the
+  store.
+- **Fail-closed everywhere** — unreadable policy, store drift, over-budget
+  results, or an unusable audit record each refuse the consolidation; the safe
+  fallback is always "stage it for a human instead."
+- **Audit + undo** — the full before-state is written to an append-only ledger
+  at `~/.hermes/memory_backups/consolidations.jsonl` *before* anything is
+  applied (no ledger write, no mutation), together with the deterministic
+  digest of the planned final state. Both the audit's before-view and its
+  planned-after digest come from one authoritative snapshot of the store, and
+  the commit itself is a transactional batch carrying a full-store
+  precondition — if ANY entry changed between the audit snapshot and the
+  commit (even one the consolidation never touches), nothing is applied. The
+  applied record's after-digest is that same planned final state (never a
+  later re-read), so a write landing right after the commit can never be
+  claimed by the transaction. Every applied consolidation reports its audit
+  id, and `/memory undo <audit_id>` restores the recorded before-state — but
+  only with durable commit evidence: the ledger's `applied` event (whose
+  after-digest must match the recorded plan) is what proves the mutation
+  happened. The begin record alone proves intent, not commit — if memory
+  later differs from the recorded before-state without an `applied` event
+  (the commit failed and something else changed the file, or the post-commit
+  audit append failed), automatic undo refuses and points at the audit id
+  and the recorded before snapshot for manual recovery instead of risking an
+  overwrite of an independent change. A consolidation followed by later
+  writes is likewise refused, and the restore itself commits atomically
+  against the exact state it validated. When the post-commit audit record
+  cannot be written, the change is reported with automatic undo explicitly
+  unavailable rather than an undo hint that could not be safely honored.
+  `/memory undo list` shows recent audit records.
+
+Scope guardrails: only the unattended background **memory** review is affected —
+skill-only reviews never receive the memory tool at all, foreground turns are
+unchanged, and turning the flag on never auto-applies proposals that are
+already sitting in your pending queue; those keep waiting for your approval.
+
+## Pending-proposal lifecycle and statuses
+
+Staged proposals can outlive the state they were pinned to. `/memory` and
+`/memory pending` re-classify the queue idempotently against the current store
+and only list **ready** items as approval candidates (#109215):
+
+| Status | Meaning |
+|--------|---------|
+| `ready` | Active — pinned entries still match the store exactly; listed for approval. |
+| `stale` | A pinned entry is gone or has changed since staging; can recover to `ready` if the entry returns. |
+| `superseded` | A newer active single-op background-review proposal pins the same exact entry on the same target. Multi-op batches are never auto-superseded on partial pin overlap — their distinct work stays independently reviewable. |
+| `invalid` | Malformed payload, a legacy pre-pinning `replace`/`remove` with no verifiable target, or a payload that could not apply against the current store (over-budget replacement/batch, empty or malformed batch) — permanently fail-closed; reject it and recreate the change. |
+| `rejected` | You rejected it. The record is kept on disk as audit evidence but never listed again. |
+
+Statused records are archived, not deleted. The listing shows per-status counts
+and an `Archived:` footer; `/memory approve all` applies **only** ready
+records, while `/memory approve <id>` remains an operator override that will
+still tell you when a record fails. Legacy pre-pinning records are refused on
+apply and classify `invalid` — reject them to clean the list.
+
+```
+/memory pending                      # re-classify + list ready items, counts, archived footer
+/memory diff <id>                    # bounded BEFORE/AFTER per op (whole pinned entry vs whole new entry)
+/memory approve <id> | all           # apply one (override) or every ready record
+/memory reject <id...> | all         # status-mark rejected; evidence kept on disk
+/memory reject --stale               # bulk-reject every stale record (--superseded / --invalid too)
+/memory undo <audit_id>              # restore the before-state of an autonomous consolidation
+/memory undo list                    # recent consolidation audit records
+```
+
+The background review prompt also carries a bounded digest of the active
+pending proposals (ids, statuses, pinned-entry digests — capped at 8 records /
+1200 chars, #81671), so a later fork doesn't re-derive maintenance that is
+already queued for you. The digest classifies the whole queue as one set
+against a single snapshot of the store — the same verdicts `/memory pending`
+persists — so the two can never disagree about which proposals are active.
+The digest is read-only and consumes those FRESH verdicts rather than the
+persisted status fields: a proposal persisted `superseded` whose superseder
+you later rejected shows up again immediately, without waiting for a
+`/memory pending` run to re-persist its recovered status.
 
 ## Background review notifications (`display.memory_notifications`)
 

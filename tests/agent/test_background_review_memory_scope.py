@@ -197,3 +197,280 @@ class TestConsolidationProposalSurfaces:
         ]
         actions = bg.summarize_background_review_actions(review_messages, [])
         assert any("staged for your approval" in a for a in actions)
+
+
+class TestPendingProposalsContext:
+    """``pending_memory_proposals_context`` (#81671): a bounded digest of ACTIVE
+    background-review memory proposals so the fork does not re-derive maintenance
+    already queued for a human — and its wiring into the memory review prompt."""
+
+    def _home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    def _stage(self, tmp_path, *, origin="background_review", status=None,
+               action="replace", matched_entry=None, summary="consolidate duplicates", target="memory"):
+        """Stage one pending record via the real write_approval path; return its record dict."""
+        from tools import write_approval as wa
+
+        payload = {"action": action, "target": target, "old_text": "seed entry", "content": "merged"}
+        if action == "batch":
+            payload = {"action": "batch", "target": target, "operations": [
+                {"action": "replace", "old_text": "seed entry", "content": "merged",
+                 **({"matched_entry": matched_entry} if matched_entry else {})}]}
+        elif matched_entry is not None:
+            payload["matched_entry"] = matched_entry
+        record = wa.stage_write("memory", payload, summary=summary, origin=origin)
+        if status is not None:  # stage_write has no status param (added by a sibling change)
+            path = wa._pending_path("memory", record["id"])
+            record["status"] = status
+            import json as _json
+
+            path.write_text(_json.dumps(record), encoding="utf-8")
+        return record
+
+    def test_empty_queue_returns_empty_and_prompt_unchanged(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        assert bg.pending_memory_proposals_context() == ""
+
+        agent = SimpleNamespace()
+        with patch.object(bg, "_run_review_in_thread", lambda *a, **k: None):
+            _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
+        assert prompt == bg._MEMORY_REVIEW_PROMPT
+
+    def _seeded_store(self):
+        """A store actually holding the entries these tests pin to — the digest now
+        classifies statusless records against the CURRENT store, so a proposal pinning
+        a nonexistent entry is (correctly) stale and drops out."""
+        from tools.memory_tool import MemoryStore
+
+        store = MemoryStore(memory_char_limit=4000, user_char_limit=4000)
+        store.load_from_disk()
+        return store
+
+    def _seed(self, store, *entries):
+        for e in entries:
+            store.add("memory", e)
+
+    def test_qualifying_record_appears_in_context_and_prompt(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        import hashlib
+
+        store = self._seeded_store()
+        self._seed(store, "seed entry one")
+        record = self._stage(tmp_path, matched_entry="seed entry one", summary="a" * 200)
+        ctx = bg.pending_memory_proposals_context()
+        assert record["id"] in ctx
+        assert "replace" in ctx and "memory" in ctx
+        # The brief is the OP text, which tells the reviewer WHICH entry is queued; the
+        # staging summary's boilerplate never appears (it used to eat the whole 80 chars).
+        assert "replace entry matching 'seed entry'" in ctx
+        assert ("a" * 80) not in ctx and "background review consolidation" not in ctx
+        digest = hashlib.sha256(b"seed entry one").hexdigest()[:8]
+        assert f"pinned: {digest}" in ctx and len(digest) == 8
+
+        agent = SimpleNamespace()
+        with patch.object(bg, "_run_review_in_thread", lambda *a, **k: None):
+            _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
+        marker = "Already-proposed memory maintenance awaiting review"
+        assert marker in prompt
+        assert prompt.endswith(ctx)
+
+    def test_op_brief_is_capped_at_the_character_budget(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        from tools import write_approval as wa
+
+        store = self._seeded_store()
+        long_entry = "E" * 150
+        self._seed(store, long_entry)
+        wa.stage_write("memory", {"action": "remove", "target": "memory",
+                                  "old_text": long_entry, "matched_entry": long_entry},
+                       summary="staging summary that must not be used", origin="background_review")
+        ctx = bg.pending_memory_proposals_context()
+        # "- remove: " (10 chars) + 70 E's fills the 80-char brief exactly.
+        assert ("E" * 70) in ctx and ("E" * 71) not in ctx
+        assert "staging summary that must not be used" not in ctx
+
+    def test_non_qualifying_records_skipped(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        # foreground origin
+        self._stage(tmp_path, origin="foreground", matched_entry="seed entry one")
+        assert bg.pending_memory_proposals_context() == ""
+        # archived status
+        self._stage(tmp_path, status="stale", matched_entry="seed entry one")
+        assert bg.pending_memory_proposals_context() == ""
+        # adds only — harmless duplicates the fork can already see
+        self._stage(tmp_path, action="add")
+        assert bg.pending_memory_proposals_context() == ""
+
+    def test_caps_limit_lines_and_characters(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, *(f"seed entry {i}" for i in range(12)))
+        for i in range(12):
+            self._stage(tmp_path, matched_entry=f"seed entry {i}", summary=f"consolidate dupes {i:02d}")
+        ctx = bg.pending_memory_proposals_context()
+        lines = [ln for ln in ctx.splitlines() if ln.startswith("- ")]
+        assert len(lines) == 8  # default record limit
+        assert "(+4 more — /memory pending)" in ctx
+        assert len(ctx) < 1500  # char budget + slack for the truncation note
+
+    def test_import_failure_returns_empty_and_spawn_survives(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+
+        def boom(subsystem):
+            raise RuntimeError("queue unavailable")
+
+        from tools import write_approval as wa
+
+        with patch.object(wa, "list_pending", boom):
+            assert bg.pending_memory_proposals_context() == ""
+            agent = SimpleNamespace()
+            with patch.object(bg, "_run_review_in_thread", lambda *a, **k: None):
+                _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
+            assert "Already-proposed" not in prompt
+            assert prompt == bg._MEMORY_REVIEW_PROMPT
+
+    def test_statusless_but_stale_record_not_suppressed_and_not_shown(self, tmp_path, monkeypatch):
+        """Correction round: a statusless proposal whose pinned entry has since been
+        REMOVED from the store must not appear in (and so must not suppress) new fork
+        work — classified against the CURRENT store here, with no prior /memory pending."""
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "entry the stale proposal targets")
+        record = self._stage(tmp_path, matched_entry="entry the stale proposal targets")
+        # The store moves on: the pinned entry is deleted AFTER staging, with NO
+        # /memory pending run (the status stays absent on disk).
+        store.remove("memory", "entry the stale proposal targets")
+        assert bg.pending_memory_proposals_context() == ""
+
+    def test_statusless_ready_record_still_appears(self, tmp_path, monkeypatch):
+        """Positive control for the classification filter: a statusless record whose pin
+        is STILL live keeps appearing in the digest (classification must not over-drop)."""
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "live entry one")
+        record = self._stage(tmp_path, matched_entry="live entry one")
+        ctx = bg.pending_memory_proposals_context()
+        assert record["id"] in ctx
+
+class TestPendingDigestFreshVerdicts:
+    """CORRECTION ROUND 3 — the background digest must consume FRESH verdicts, not
+    persisted statuses. A record persisted 'superseded' whose fresh verdict recovered to
+    'ready' is rendered WITHOUT a /memory pending run first; genuinely stale stays
+    absent; the digest rewrites no lifecycle files."""
+
+    def _home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    def _seeded_store(self):
+        from tools.memory_tool import MemoryStore
+        store = MemoryStore(memory_char_limit=4000, user_char_limit=4000)
+        store.load_from_disk()
+        return store
+
+    def _seed(self, store, *entries):
+        for e in entries:
+            store.add("memory", e)
+
+    def _status_of(self, record_id):
+        from tools import write_approval as wa
+        rec = wa.get_pending("memory", record_id)
+        return (rec or {}).get("status")
+
+    def test_superseded_then_superseder_rejected_renders_old_record(self, tmp_path, monkeypatch):
+        """THE required regression: stage older single-op proposal O; stage newer
+        same-pin proposal N (staging marks O persisted 'superseded'); explicitly reject
+        N; do NOT run /memory pending. Whole-queue classification says O=ready,
+        N=rejected. The digest MUST include O."""
+        from hermes_cli.write_approval_commands import handle_pending_subcommand
+        from tools import write_approval as wa
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "digest fresh verdict pin entry")
+        # O: older single-op destructive proposal (backdated).
+        older = wa.stage_write(
+            "memory",
+            {"action": "remove", "target": "memory", "old_text": "digest fresh verdict",
+             "matched_entry": "digest fresh verdict pin entry"},
+            summary="older proposal O", origin="background_review")
+        wa._pending_path("memory", older["id"]).write_text(
+            __import__("json").dumps({**older, "created_at": 1000.0}), encoding="utf-8")
+        # N: newer same-pin proposal — staging supersedes O on disk.
+        newer = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "memory", "old_text": "digest fresh verdict",
+             "content": "replaced by newer", "matched_entry": "digest fresh verdict pin entry"},
+            summary="newer proposal N", origin="background_review")
+        assert self._status_of(older["id"]) == "superseded"  # persisted by staging
+        # Explicitly reject N — NO /memory pending run anywhere in this test.
+        handle_pending_subcommand("memory", ["reject", newer["id"]], memory_store=store)
+        assert self._status_of(newer["id"]) == "rejected"
+        # Whole-queue fresh classification: O recovered to ready, N rejected.
+        verdicts = dict((r["id"], v) for r, v in
+                        wa.classify_pending_memory_queue(store))
+        assert verdicts[older["id"]] == "ready"
+        assert verdicts[newer["id"]] == "rejected"
+        # The digest consumes the FRESH verdict: O is rendered despite its persisted
+        # 'superseded' status.
+        ctx = bg.pending_memory_proposals_context()
+        assert older["id"] in ctx, ctx
+        assert newer["id"] not in ctx
+        # And the rendered line carries the FRESH status word, not the persisted one.
+        line = next(ln for ln in ctx.splitlines() if older["id"] in ln)
+        assert "superseded" not in line
+
+    def test_genuinely_stale_stays_absent(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "stale digest witness entry")
+        from tools import write_approval as wa
+        record = wa.stage_write(
+            "memory",
+            {"action": "remove", "target": "memory", "old_text": "stale digest witness",
+             "matched_entry": "stale digest witness entry"},
+            summary="will drift", origin="background_review")
+        store.remove("memory", "stale digest witness entry")  # disk moves on
+        assert bg.pending_memory_proposals_context() == ""
+
+    def test_persisted_stale_freshly_ready_is_rendered(self, tmp_path, monkeypatch):
+        """A record persisted 'stale' whose pin is back on disk (freshly recovered to
+        ready) is rendered when appropriate — persisted statuses do not gate the digest."""
+        from tools import write_approval as wa
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "recovery witness entry")
+        record = wa.stage_write(
+            "memory",
+            {"action": "remove", "target": "memory", "old_text": "recovery witness",
+             "matched_entry": "recovery witness entry"},
+            summary="persisted stale", origin="background_review")
+        wa.update_pending_status("memory", record["id"], "stale")
+        # The pin is still live on disk => fresh verdict is ready.
+        ctx = bg.pending_memory_proposals_context()
+        assert record["id"] in ctx, ctx
+
+    def test_digest_rewrites_no_lifecycle_files(self, tmp_path, monkeypatch):
+        """The digest is read-only: rendering it must not rewrite any pending record
+        file (statuses stay exactly as persisted)."""
+        from tools import write_approval as wa
+        import hashlib as _h
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "readonly digest witness")
+        records = []
+        for i, status in enumerate([None, "stale", "superseded", "ready"]):
+            r = wa.stage_write(
+                "memory",
+                {"action": "remove", "target": "memory", "old_text": "readonly digest",
+                 "matched_entry": "readonly digest witness"},
+                summary=f"ro {i}", origin="background_review")
+            if status:
+                wa.update_pending_status("memory", r["id"], status)
+            records.append(r)
+        before = {r["id"]: _h.sha256(
+            wa._pending_path("memory", r["id"]).read_bytes()).hexdigest() for r in records}
+        ctx = bg.pending_memory_proposals_context()  # rendered (ready + recovered) or not
+        assert ctx  # the ready-status and the statusless record both render
+        after = {r["id"]: _h.sha256(
+            wa._pending_path("memory", r["id"]).read_bytes()).hexdigest() for r in records}
+        assert before == after  # no lifecycle file rewritten

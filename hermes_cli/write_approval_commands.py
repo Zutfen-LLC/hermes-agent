@@ -4,9 +4,16 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from contextlib import suppress
+from typing import List, Optional, Tuple
 
 from tools import write_approval as wa
+
+# Memory reject flags -> the archived status they bulk-reject.
+_BULK_REJECT_FLAGS = {"--stale": wa.STATUS_STALE, "--superseded": wa.STATUS_SUPERSEDED,
+                      "--invalid": wa.STATUS_INVALID}
+
+_READY_STATUSES = ("", "ready")
 
 
 def _fmt_state(subsystem: str) -> str:
@@ -14,21 +21,62 @@ def _fmt_state(subsystem: str) -> str:
     return f"{subsystem}.write_approval = {'on' if on else 'off'}"
 
 
-def _fmt_pending_list(subsystem: str) -> str:
+def _fmt_unattended_line() -> str:
+    on = wa.unattended_memory_consolidation_enabled()
+    return f"unattended consolidation: {'on' if on else 'off'}"
+
+
+def _fmt_pending_list(subsystem: str, memory_store=None) -> str:
     records = wa.list_pending(subsystem)
     if not records:
         return f"No pending {subsystem} writes."
-    lines = [f"Pending {subsystem} writes ({len(records)}):"]
-    for r in records:
+
+    # Memory: classify first (statuses persisted) so the queue reflects the live store;
+    # a hygiene failure must never break the listing. Re-list afterwards — classification
+    # rewrites the record files, so the pre-classification snapshot is stale.
+    counts = None
+    if subsystem == wa.MEMORY and memory_store is not None:
+        with suppress(Exception):
+            counts = wa.reclassify_pending_memory(memory_store, subsystem)
+        records = wa.list_pending(subsystem)
+
+    ready = [r for r in records if (r.get("status") or "") in _READY_STATUSES]
+    # Rejected records are invisible everywhere (audit-only, on disk); the footer surfaces
+    # only the still-reviewable archived categories.
+    archived = [r for r in records if r.get("status") in
+                (wa.STATUS_STALE, wa.STATUS_SUPERSEDED, wa.STATUS_INVALID)]
+
+    header = f"Pending {subsystem} writes"
+    if counts is not None:
+        nonzero = [(label, counts[label]) for label in ("ready", "stale", "superseded", "invalid")
+                   if counts.get(label)]
+        if nonzero:
+            header += f" ({', '.join(f'{n} {label}' for label, n in nonzero)})"
+    if not ready and not archived:
+        return f"No pending {subsystem} writes."
+    lines = [f"{header}:"]
+    for r in ready:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
         if subsystem == wa.MEMORY:
-            lines.extend(f"      {line}" for line in _matched_entries(r["payload"]))
+            lines.extend(f"      {line}" for line in _matched_entries(r.get("payload") or {}))
     lines.append("")
     lines.append(f"Apply: /{subsystem} approve <id>   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
         lines.append("Review full diff: /skills diff <id>")
+    elif subsystem == wa.MEMORY:
+        lines.append("Review full diff: /memory diff <id>")
+    if archived:
+        by = {}
+        for r in archived:
+            status = r.get("status") or "ready"
+            by[status] = by.get(status, 0) + 1
+        parts = ", ".join(f"{n} {status}" for status, n in sorted(by.items()))
+        flags = " / ".join(flag for flag, status in sorted(_BULK_REJECT_FLAGS.items())
+                           if status in by)
+        lines.append(f"Archived: {parts} — not listed for approval; "
+                     f"/{subsystem} reject {flags} to clear")
     return "\n".join(lines)
 
 
@@ -37,28 +85,63 @@ def handle_pending_subcommand(
     """Dispatch a /memory or /skills write-approval subcommand.
 
     ``memory_store`` applies approved memory writes (CLI passes its live store; gateway a freshly
-    loaded one); ``set_mode_fn`` persists the write_approval boolean. Returns text for the user,
-    or None when the args are not a write-approval subcommand so the caller falls through to its
-    other handling (e.g. /skills search).
-    """
+    loaded one) AND drives pending-record lifecycle classification; ``set_mode_fn`` persists the
+    write_approval boolean. Returns text for the user, or None when the args are not a
+    write-approval subcommand so the caller falls through to its other handling (e.g. /skills
+    search)."""
     if not args:
-        return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
+        state = _fmt_state(subsystem)
+        if subsystem == wa.MEMORY:
+            state += f"\n{_fmt_unattended_line()}"
+        return f"{state}\n\n" + _fmt_pending_list(subsystem, memory_store)
     sub, rest = args[0].lower(), args[1:]
     if sub == "pending":
-        return _fmt_pending_list(subsystem)
+        return _fmt_pending_list(subsystem, memory_store)
     if sub in {"approve", "apply"}:
         return _approve(subsystem, rest, memory_store)
     if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
+        return _reject(subsystem, rest, memory_store)
+    if sub == "diff" and subsystem == wa.MEMORY:
+        return _memory_diff(rest, memory_store)
     if sub == "diff" and subsystem == wa.SKILLS:
         return _diff(rest)
+    if sub == "undo" and subsystem == wa.MEMORY:
+        return _memory_undo(rest, memory_store)
     if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
         return _set_approval(subsystem, rest, set_mode_fn)
     return None  # not ours — caller handles
 
 
 def _usage(subsystem: str) -> str:
-    return f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
+    usage = f"Usage: /{subsystem} approve|reject <id> [<id> ...]  (or 'all')"
+    if subsystem == wa.MEMORY:
+        usage += f"  — bulk-reject archived: /memory reject {' /'.join(sorted(_BULK_REJECT_FLAGS))}"
+    return usage
+
+
+def _ready_memory_records(subsystem: str, memory_store) -> Tuple[Optional[str], List[dict]]:
+    """Reclassify the memory queue and split it: ``(skip_summary, ready_records)``.
+    ``skip_summary`` (None when nothing was skipped, or when classification is unavailable —
+    then EVERY record is returned ready, preserving the pre-lifecycle behavior) reads like
+    'skipped 4 non-ready (2 stale, 1 superseded, 1 invalid) — they remain archived'."""
+    if memory_store is None:
+        # No store to classify against: fall back to the record statuses alone (rejected
+        # records stay invisible; unaudited ones remain approvable, as before lifecycles).
+        return None, [r for r in wa.list_pending(subsystem) if r.get("status") != wa.STATUS_REJECTED]
+    with suppress(Exception):
+        wa.reclassify_pending_memory(memory_store, subsystem)
+    records = wa.list_pending(subsystem)
+    ready = [r for r in records if (r.get("status") or "") in _READY_STATUSES]
+    skipped = [r for r in records if r.get("status") in
+               (wa.STATUS_STALE, wa.STATUS_SUPERSEDED, wa.STATUS_INVALID)]
+    if not skipped:
+        return None, ready
+    by = {}
+    for r in skipped:
+        status = r.get("status") or "ready"
+        by[status] = by.get(status, 0) + 1
+    parts = ", ".join(f"{n} {status}" for status, n in sorted(by.items()))
+    return f"skipped {len(skipped)} non-ready ({parts}) — they remain archived", ready
 
 
 def _approve(subsystem: str, rest: List[str], memory_store) -> str:
@@ -68,13 +151,37 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     records = wa.list_pending(subsystem)
     if not records:
         return f"No pending {subsystem} writes."
+    skip_summary = None
+    refusals: List[str] = []
     if target.lower() == "all":
-        targets = list(records)
+        if subsystem == wa.MEMORY:
+            skip_summary, targets = _ready_memory_records(subsystem, memory_store)
+            if not targets:
+                out = "No pending memory writes ready to approve."
+                if skip_summary:
+                    out += f"\n{skip_summary}."
+                return out
+        else:
+            targets = list(records)
     else:
-        rec = wa.get_pending(subsystem, target)
-        if not rec:
-            return f"No pending {subsystem} write with id '{target}'."
-        targets = [rec]
+        # One or more explicit ids (multi-id: /memory approve <id1> <id2> ...). Ids that
+        # cannot be applied are reported individually rather than silently skipping — and a
+        # missing or rejected id does not stop the rest of the list from being applied.
+        targets = []
+        for pending_id in rest:
+            rec = wa.get_pending(subsystem, pending_id)
+            if not rec:
+                refusals.append(f"No pending {subsystem} write with id '{pending_id}'.")
+                continue
+            if rec.get("status") == wa.STATUS_REJECTED:
+                # Rejected records are terminal evidence: applying (then unlinking) one
+                # here would destroy the audit trail the rejection decision rests on.
+                refusals.append(f"Record '{pending_id}' was rejected and is kept as evidence "
+                                f"only; recreate the change instead if you still want it.")
+                continue
+            targets.append(rec)
+        if not targets:
+            return "\n".join(refusals) if refusals else _usage(subsystem)
 
     applied, failed, overwritten, removed = 0, [], [], []
     for rec in targets:
@@ -86,6 +193,12 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             removed.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "removed"))
         else:
             failed.append(f"{rec['id']}: {msg}")
+            if subsystem == wa.MEMORY and target.lower() != "all" and memory_store is not None:
+                # Operator override attempted a record that failed: persist its classification
+                # so a permanently-failing record stops showing as ready.
+                with suppress(Exception):
+                    wa.update_pending_status(
+                        subsystem, rec["id"], wa.classify_pending_memory(rec, memory_store))
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if overwritten:
@@ -99,6 +212,10 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     if failed:
         out.append("Failed:")
         out.extend(f"  {f}" for f in failed)
+    if skip_summary:
+        out.append(skip_summary)
+    if refusals:
+        out.extend(refusals)
     return "\n".join(out)
 
 
@@ -136,16 +253,60 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e), {}
 
 
-def _reject(subsystem: str, rest: List[str]) -> str:
+def _reject(subsystem: str, rest: List[str], memory_store=None) -> str:
+    """Reject pending records. Memory bulk flags (``--stale``/``--superseded``/``--invalid``)
+    operate on CURRENT classification — ``memory_store`` (present on every /memory surface)
+    drives a reclassify first, so no prior ``/memory pending`` run is needed."""
     if not rest:
         return _usage(subsystem)
-    target = rest[0]
-    if target.lower() == "all":
-        n = sum(1 for rec in wa.list_pending(subsystem) if wa.discard_pending(subsystem, rec["id"]))
-        return f"Rejected {n} pending {subsystem} write(s)."
-    if wa.discard_pending(subsystem, target):
-        return f"Rejected pending {subsystem} write '{target}'."
-    return f"No pending {subsystem} write with id '{target}'."
+    if subsystem != wa.MEMORY:
+        # Skills keep the legacy delete semantics (no lifecycle statuses).
+        target = rest[0]
+        if target.lower() == "all":
+            n = sum(1 for rec in wa.list_pending(subsystem) if wa.discard_pending(subsystem, rec["id"]))
+            return f"Rejected {n} pending {subsystem} write(s)."
+        if wa.discard_pending(subsystem, target):
+            return f"Rejected pending {subsystem} write '{target}'."
+        return f"No pending {subsystem} write with id '{target}'."
+
+    flags = [a for a in rest if a.lower() in _BULK_REJECT_FLAGS]
+    wants_all = any(a.lower() == "all" for a in rest)
+    ids = [a for a in rest if a.lower() not in _BULK_REJECT_FLAGS and a.lower() != "all"]
+
+    if flags:
+        # Bulk flags operate on CURRENT classification, not on whatever statuses happen to
+        # be persisted: reclassify first (a store is loaded for the /memory surface) so
+        # `/memory reject --stale` works without a prior `/memory pending` run. A
+        # classification failure falls back to the persisted statuses alone.
+        if memory_store is not None:
+            with suppress(Exception):
+                wa.reclassify_pending_memory(memory_store, subsystem)
+
+    n, missing = 0, []
+    for flag in flags:
+        n += wa.reject_pending_bulk(subsystem, _BULK_REJECT_FLAGS[flag.lower()])
+    if wants_all:
+        for rec in wa.list_pending(subsystem):
+            if rec.get("status") != wa.STATUS_REJECTED and wa.update_pending_status(
+                    subsystem, rec["id"], wa.STATUS_REJECTED):
+                n += 1
+    for pid in ids:
+        if wa.get_pending(subsystem, pid) is None:
+            missing.append(pid)
+        elif wa.update_pending_status(subsystem, pid, wa.STATUS_REJECTED):
+            n += 1
+    if not flags and not wants_all and not ids:
+        return f"No pending {subsystem} write with id '{rest[0]}'."
+    if not flags and not wants_all and len(ids) == 1:
+        if missing:
+            return f"No pending {subsystem} write with id '{ids[0]}'."
+        # Same wording as the legacy single reject; the record is now status-marked
+        # 'rejected' (kept on disk for audit) instead of deleted.
+        return f"Rejected pending {subsystem} write '{ids[0]}'."
+    out = f"Rejected {n} pending {subsystem} write(s)."
+    if missing:
+        out += "\nNot found: " + ", ".join(missing)
+    return out
 
 
 def _diff(rest: List[str]) -> str:
@@ -155,6 +316,98 @@ def _diff(rest: List[str]) -> str:
     if not rec:
         return f"No pending skill write with id '{rest[0]}'."
     return f"# Pending skill write {rec['id']}: {rec.get('summary', '')}\n\n" + wa.skill_pending_diff(rec)
+
+
+# --- /memory diff: bounded BEFORE/AFTER rendering ---
+
+_DIFF_HEAD, _DIFF_TAIL = 300, 200
+
+
+def _bounded_field(text: str, head: int = _DIFF_HEAD, tail: int = _DIFF_TAIL) -> str:
+    """head + '…' + tail of a field once it exceeds head+tail chars (chat-safe but
+    recognizable at both ends)."""
+    text = text or ""
+    return text if len(text) <= head + tail else f"{text[:head]}…{text[-tail:]}"
+
+
+def _indented(text: str) -> str:
+    return "\n".join(f"    {line}" for line in (text or "").splitlines() or [""])
+
+
+def memory_pending_diff(record: dict) -> str:
+    """Bounded per-op BEFORE/AFTER text for a pending memory record: the FULL pinned
+    ``matched_entry`` is BEFORE (not the old_text search string), the proposed
+    ``content``/``new_text`` (whole new entry, #117952) is AFTER; batch ops are enumerated
+    'Operation N (action)'."""
+    payload = record.get("payload") or {}
+    payload = payload if isinstance(payload, dict) else {}
+    ops = (payload.get("operations") or []) if payload.get("action") == "batch" else [payload]
+    chunks = [f"target: {payload.get('target', 'memory')}"]
+    for i, op in enumerate(ops, start=1):
+        op = op if isinstance(op, dict) else {}
+        action = op.get("action", "?")
+        lines = [f"Operation {i} ({action})" if payload.get("action") == "batch" else action]
+        before = op.get("matched_entry") or op.get("old_text") or ""
+        if before:
+            lines.append("  BEFORE (whole pinned entry):")
+            lines.append(_indented(_bounded_field(before)))
+        after = op.get("content") or op.get("new_text") or ""
+        if action in {"replace", "add"} and after:
+            lines.append("  AFTER (whole new entry):")
+            lines.append(_indented(_bounded_field(after)))
+        elif action == "remove":
+            lines.append("  (entry removed)")
+        chunks.append("\n".join(lines))
+    return "\n\n".join(chunks)
+
+
+def _memory_diff(rest: List[str], memory_store=None) -> str:
+    if not rest:
+        return "Usage: /memory diff <id>"
+    rec = wa.get_pending(wa.MEMORY, rest[0])
+    if not rec:
+        return f"No pending memory write with id '{rest[0]}'."
+    return f"# Pending memory write {rec['id']}: {rec.get('summary', '')}\n\n" + memory_pending_diff(rec)
+
+
+def _memory_undo(rest: List[str], memory_store=None) -> str:
+    """``/memory undo <audit_id>``: restore the recorded before-state of one autonomous
+    consolidation as a single atomic batch — automatic undo requires durable commit
+    evidence (a ledger 'applied' event); without it the restore refuses and points at
+    manual recovery. ``undo list`` shows recent audit ids."""
+    if not rest:
+        return "Usage: /memory undo <audit_id>  (ids: /memory undo list)"
+    if rest[0].lower() == "list":
+        return _memory_undo_list()
+    audit_id = rest[0]
+    if memory_store is None:
+        return "memory store unavailable"
+    try:
+        from tools.memory_consolidation import restore
+        result = restore(audit_id, memory_store) or {}
+    except Exception as e:
+        return f"Undo failed: {e}"
+    detail = result.get("message") or result.get("error") or "no result"
+    return f"Undo {audit_id}: {detail}"
+
+
+def _memory_undo_list(limit: int = 10) -> str:
+    """Up to *limit* most-recent 'applied' ledger records, newest first."""
+    from tools.memory_consolidation import list_records
+    try:
+        applied = [r for r in list_records() if r.get("event") == "applied"]
+    except Exception:
+        applied = []
+    if not applied:
+        return "No autonomous consolidations recorded yet."
+    lines = ["Recent autonomous consolidations (most recent first):"]
+    for r in reversed(applied[-limit:]):
+        counts = r.get("counts") or {}
+        lines.append(f"  {r.get('id', '?')}  {r.get('ts', '?')}  {r.get('target', 'memory')}  "
+                     f"replaced {counts.get('replaced', 0)}, removed {counts.get('removed', 0)}, "
+                     f"added {counts.get('added', 0)}")
+    lines.append("Restore one: /memory undo <audit_id>")
+    return "\n".join(lines)
 
 
 _APPROVAL_VALUES = {

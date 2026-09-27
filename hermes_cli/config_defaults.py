@@ -1293,6 +1293,10 @@ DEFAULT_CONFIG = {
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
         "write_approval": False,
+        # Opt-in: let UNATTENDED background-review forks apply replace/remove memory consolidation
+        # autonomously (with exact-entry pinning, atomic batch, audit + undo). Requires
+        # write_approval=false; default false keeps the safe stage-for-approval behavior (#106919).
+        "allow_unattended_consolidation": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.

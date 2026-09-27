@@ -1902,7 +1902,8 @@ class CLICommandsMixin:
             wa.MEMORY, args, memory_store=store,
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else
-              "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>.")
+              "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, diff <id>, "
+              "undo <id>, approval <on|off>.")
 
     def _save_write_approval(self, subsystem: str, enabled: bool):
         """Persist <subsystem>.write_approval to config (for /memory|/skills approval)."""

@@ -700,7 +700,9 @@ reviewed with the same familiar approve/deny flow as dangerous commands:
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or
 in the pending JSON file). Memory writes have the same gate under
-`memory.write_approval` — see [Controlling memory writes](./memory.md#controlling-memory-writes-write_approval).
+`memory.write_approval` — see [Controlling memory writes](./memory.md#controlling-memory-writes-write_approval)
+(and, for the reverse opt-in that lets unattended reviews consolidate directly,
+[Letting unattended reviews consolidate](./memory.md#letting-unattended-reviews-consolidate-allow_unattended_consolidation)).
 
 > The separate `skills.guard_agent_created` setting is a content scanner
 > (dangerous-pattern heuristics), not an approval gate — the two are

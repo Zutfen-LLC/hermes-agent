@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager, suppress
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -235,14 +236,23 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message, current_entries=self._entries_for(target), usage=self._usage(target)))
 
-    def _batch_failure(self, target: str, message: str) -> Dict[str, Any]:
+    def _batch_failure(self, target: str, message: str, *, count_failure: bool = True) -> Dict[str, Any]:
         """Batch-abort failure WITHOUT ``current_entries``: the store did not change and the
         caller already holds the inventory, so echoing it made each consolidation retry
-        grow the context it was invoked to shrink (#97316)."""
+        grow the context it was invoked to shrink (#97316).
+
+        ``count_failure=False`` (read-only dry-runs via ``resolve_batch_entries``) skips the
+        per-turn failure budget: inspecting the queue — ``/memory pending``, bare ``/memory``,
+        bulk hygiene, lifecycle classification — must not consume the retry budget that
+        governs the LIVE agent's real memory writes. Commit-path failures keep counting."""
+        if not count_failure:
+            return _error(message + " No operations were applied (batch is all-or-nothing).",
+                          usage=self._usage(target))
         return self._consolidation_failure(
             _error(message + " No operations were applied (batch is all-or-nothing).", usage=self._usage(target)))
 
-    def _mutate(self, target: str, mutate, *, skip_drift: bool = False) -> Dict[str, Any]:
+    def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
+                expected_before_raw: Optional[str] = None) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -252,12 +262,24 @@ class MemoryStore:
         third value, a dict merged into the success payload (``_error``'s ``**extra``
         convention) — e.g. the full text a replace overwrote (#117952). ANY dict the closure
         returns is passed through verbatim and nothing is persisted: error dicts, or the
-        success payload of a read-only closure (``resolve_entry``, ``resolve_batch_entries``)."""
+        success payload of a read-only closure (``resolve_entry``, ``resolve_batch_entries``).
+
+        ``expected_before_raw`` is a full-store precondition checked INSIDE the lock,
+        immediately after the authoritative re-read and before the closure runs: when the
+        raw file no longer equals that exact snapshot the mutation is refused outright.
+        The autonomous consolidation path uses it so the audit begin-state is always the
+        exact state the commit was validated against — ANY drift, including on unrelated
+        entries, applies nothing (a stale-audit commit would let a later undo erase a
+        concurrent write the audit never recorded)."""
         path = self._path_for(target)
         with self._file_lock(path):
             raw, read_ok = self._read_raw_checked(path)
             if not read_ok:
                 return _read_failed_error(path)
+            if expected_before_raw is not None and raw != expected_before_raw:
+                return self._batch_failure(target, (
+                    "Memory changed on disk since this consolidation was planned and "
+                    "audited; nothing was applied. Retry the operation."))
             bak = None if skip_drift else self._detect_external_drift(target, raw)
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
             if bak:
@@ -394,21 +416,42 @@ class MemoryStore:
         working[idx:idx + 1] = [content] if act == "replace" else []
         return None, previous_content
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(self, target: str, operations: List[Dict[str, Any]], *,
+                    expected_before_raw: Optional[str] = None,
+                    allow_empty: bool = False) -> Dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure. Aborts do not
-        echo ``current_entries`` — the store is unchanged and the model already has it."""
-        return self._batch(target, operations, commit=True)
+        echo ``current_entries`` — the store is unchanged and the model already has it.
 
-    def resolve_batch_entries(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ``expected_before_raw``: a full-store precondition checked INSIDE the file lock,
+        after the authoritative disk re-read and before any mutation is written — the
+        commit applies only if the raw file still equals that exact snapshot. Used by the
+        autonomous consolidation path so the audit begin-state is always the exact state
+        the commit was validated against (any drift — including on unrelated entries —
+        applies nothing).
+
+        ``allow_empty`` lifts the #103419 batch empty-guard for a caller replaying a
+        DELIBERATE single remove() through the batch machinery (the autonomous path
+        normalizes lone ops to one-op batches): single remove stays the sanctioned
+        wipe-the-last-entry path; genuine batches keep the guard."""
+        return self._batch(target, operations, commit=True, expected_before_raw=expected_before_raw,
+                           allow_empty=allow_empty)
+
+    def resolve_batch_entries(self, target: str, operations: List[Dict[str, Any]], *,
+                              allow_empty: bool = False) -> Dict[str, Any]:
         """Dry-run ``apply_batch`` under the lock without persisting: the same content scan,
         op walk, empty-store and budget checks, so it fails exactly where the direct batch
         would; on success ``{"success": True, "matched_entries": [...]}`` — per op, the FULL
-        entry its replace/remove selects now (None for add), in batch order."""
-        return self._batch(target, operations, commit=False)
+        entry its replace/remove selects now (None for add), in batch order.
+        ``allow_empty`` mirrors the commit-side flag for single-remove replays."""
+        return self._batch(target, operations, commit=False, allow_empty=allow_empty)
 
-    def _batch(self, target: str, operations: List[Dict[str, Any]], *, commit: bool) -> Dict[str, Any]:
+    def _batch(self, target: str, operations: List[Dict[str, Any]], *, commit: bool,
+               expected_before_raw: Optional[str] = None, allow_empty: bool = False) -> Dict[str, Any]:
+        # Read-only dry-run (commit=False) failures never touch the per-turn failure
+        # budget: classification/preflight inspection is not a consolidation attempt.
+        _fail = self._batch_failure if commit else partial(self._batch_failure, count_failure=False)
         if not operations:
             return _error("operations list is empty.")
         ops = [op or {} for op in operations]
@@ -428,21 +471,21 @@ class MemoryStore:
                     (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})",
                     op.get("matched_entry"))
                 if msg:
-                    return self._batch_failure(target, msg)
+                    return _fail(target, msg)
                 matched.append(previous_content)
-            if entries and not working:
+            if entries and not working and not allow_empty:
                 # #103419: a consolidation batch that removes the last entry would
                 # commit an empty file as a normal successful write. Refuse; single
                 # remove() is the deliberate-wipe path.
                 label = self._path_for(target).name
-                return self._batch_failure(target, (
+                return _fail(target, (
                     f"Refusing to empty {label}: this batch would remove every entry from a "
                     f"previously non-empty store. Keep at least one entry — merge overlapping "
                     f"entries into a shorter one instead of removing the last one. To delete the "
                     f"final entry deliberately, use single remove() calls."))
             new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
             if new_total > limit:
-                return self._batch_failure(target, (
+                return _fail(target, (
                     f"After applying all {len(operations)} operations, memory would be at "
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
                     f"entries in the same batch, then retry."))
@@ -458,7 +501,8 @@ class MemoryStore:
             if removed:
                 replaced_fields["removed_entries"] = removed
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
-        return self._mutate(target, _apply, skip_drift=not commit)
+        return self._mutate(target, _apply, skip_drift=not commit,
+                            expected_before_raw=expected_before_raw if commit else None)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch

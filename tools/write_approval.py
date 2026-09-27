@@ -20,7 +20,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -32,10 +32,28 @@ MEMORY = "memory"
 SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
 
+# --- Pending-record lifecycle statuses (MEMORY) ---
+#
+# A staged memory proposal can outlive the state it was pinned to: the entry it pins may
+# have been edited or removed, a newer proposal may already cover the same entry, or the
+# record may predate pinning entirely. Such records are never deleted — each carries a
+# ``status`` field (absent = active/ready, so records written before this field existed
+# stay valid): 'stale' (a pinned entry is gone/changed), 'superseded' (a newer ACTIVE
+# proposal pins the same entry; ``superseded_by`` names it), 'invalid' (malformed payload
+# or legacy unpinned destructive op — fail closed forever) and 'rejected' (operator
+# -archived). Statused files stay on disk as audit evidence.
+
+STATUS_ACTIVE: Optional[str] = None
+STATUS_STALE = "stale"
+STATUS_SUPERSEDED = "superseded"
+STATUS_INVALID = "invalid"
+STATUS_REJECTED = "rejected"
+
 # Per-subsystem config key. Intentionally a single boolean with no "block all writes"
 # state — to disable a subsystem use its own enable flag (e.g. ``memory.memory_enabled``).
 CONFIG_KEY = "write_approval"
 _TRUTHY_STRINGS = frozenset({"on", "true", "yes", "1", "approve", "enabled"})
+_FALSY_STRINGS = frozenset({"off", "false", "no", "0", "disable", "disabled"})
 
 
 # --- Config resolution ---
@@ -51,12 +69,60 @@ def write_approval_enabled(subsystem: str) -> bool:
         return False
 
 
+def unattended_memory_consolidation_enabled() -> bool:
+    """True only when the operator explicitly opted in AND the ordinary approval gate is off
+    (write_approval=true stays authoritative: staging then remains the only path).
+
+    Both booleans are resolved from ONE ``load_config()`` snapshot: a second, independent
+    config read could fail (or race an edit) between the two and report the gate off while
+    the opt-in was read as on. Each value is parsed STRICTLY (``_parse_bool_setting``) so
+    validity stays separate from value: a malformed or unrecognized spelling on EITHER key,
+    a malformed ``memory`` section, a non-dict config, or any exception leaves the policy
+    disabled (fail closed) — ``allow_unattended_consolidation: true`` plus
+    ``write_approval: "garbage"`` must never arm autonomous destructive consolidation,
+    which the lossy ``_normalize_enabled`` coercion used to allow."""
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        config = load_config()
+        if not isinstance(config, dict):
+            return False
+        section = cfg_get(config, MEMORY)
+        if section is not None and not isinstance(section, dict):
+            return False  # malformed memory section
+        opted_in = _parse_bool_setting(cfg_get(config, MEMORY, "allow_unattended_consolidation", default=False))
+        gate_on = _parse_bool_setting(cfg_get(config, MEMORY, CONFIG_KEY, default=False))
+    except Exception:
+        return False
+    if opted_in is None or gate_on is None:
+        return False  # malformed/unrecognized value on either key: fail closed
+    return opted_in and not gate_on
+
+
 def _normalize_enabled(value: Any) -> bool:
     """Coerce a config value to bool; unknown → False (gate off). The string branch
     covers hand-edited configs (YAML already parses bare on/off/yes/no)."""
     if isinstance(value, bool):
         return value
     return isinstance(value, str) and value.strip().lower() in _TRUTHY_STRINGS
+
+
+def _parse_bool_setting(value: Any) -> Optional[bool]:
+    """STRICT boolean parse for fail-closed policy keys: True/False for recognized
+    values, ``None`` when the value is malformed/unrecognized — validity stays
+    distinguishable from a legitimate false. ``_normalize_enabled`` collapses both into
+    False, which for ``write_approval`` reads an unknown spelling as "gate off" and
+    silently arms autonomous destructive consolidation; callers that must fail closed
+    on ambiguity use this instead. Global ``write_approval_enabled`` semantics are
+    deliberately unchanged."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUTHY_STRINGS:
+            return True
+        if lowered in _FALSY_STRINGS:
+            return False
+    return None
 
 
 # --- Pending store (file-backed) ---
@@ -74,7 +140,14 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
     Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
-    the safe failure for an approval gate (nothing silently committed)."""
+    the safe failure for an approval gate (nothing silently committed).
+
+    Memory dedup: a background-review destructive proposal that pins an entry some still-active
+    pending record already pins (same target) supersedes that record first (see
+    ``supersedes`` for the exact conservative rule) — the old file is kept on disk, marked
+    ``superseded``/``superseded_by`` the new id — so one entry change never queues for review
+    twice. Supersession happens only AFTER the new record is durably persisted; foreground
+    staging and hygiene failures never block the proposal."""
     pid = uuid.uuid4().hex[:8]
     record = {
         "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
@@ -84,8 +157,122 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     try:
         atomic_json_write(_pending_path(subsystem, pid), record)
     except Exception as e:  # pragma: no cover - disk failure path
+        # Safe failure for an approval gate: the write is lost, nothing silently committed —
+        # and crucially nothing was superseded either (below), so no existing proposal can
+        # point at a record that never existed.
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        return record
+    if subsystem == MEMORY and origin == "background_review":
+        # Supersession runs ONLY after the new record is durably on disk: a persistence
+        # failure must never leave older proposals marked superseded-by an id that does
+        # not exist. Hygiene failures never block the staged proposal either way.
+        try:
+            _supersede_dups_before_staging(pid, payload)
+        except Exception as e:  # never block a proposal on queue hygiene
+            logger.warning("Pending-dedup scan failed; staged proposal stays active: %s", e, exc_info=True)
     return record
+
+
+def _pinned_entries_of(payload: Dict[str, Any]) -> set:
+    """Exact pinned-entry strings of a memory payload's destructive ops (empty when unpinned
+    or non-destructive)."""
+    pinned = set()
+    for op in _memory_destructive_ops(payload):
+        entry = op.get("matched_entry")
+        if isinstance(entry, str) and entry:
+            pinned.add(entry)
+    return pinned
+
+
+def _memory_destructive_ops(payload: Any) -> List[Dict[str, Any]]:
+    """``memory_tool.destructive_ops`` guarded: it can only fail on shapes the memory gate
+    itself refuses (non-dict payloads); a helper must not import its failures."""
+    if not isinstance(payload, dict):
+        return []
+    with suppress(Exception):
+        from tools.memory_tool import destructive_ops
+        return [op for op in (destructive_ops(payload) or []) if isinstance(op, dict)]
+    return []
+
+
+def supersedes(newer: Dict[str, Any], older: Dict[str, Any]) -> bool:
+    """THE one conservative supersession predicate, used by BOTH staging-time dedup and
+    lifecycle classification — they cannot disagree by construction.
+
+    A proposal may supersede another only when it provably covers the ENTIRE logical change
+    the older one represents. The smallest provably-safe v1 rule: a SINGLE destructive-op
+    proposal supersedes another SINGLE destructive-op proposal when both are
+    background-review proposals on the same target pinning the EXACT same matched entry.
+
+    Everything else — multi-op batches, mixed add/remove work, partial pin overlap — stays
+    independently reviewable: ``[replace A, remove B, add C]`` is NOT hidden by a new
+    ``[replace A]``, because the new proposal does not cover the distinct B/C work. Whole
+    batches are never auto-superseded on pin overlap alone; exact-equivalent whole batches
+    would require mechanically proving complete operation equivalence, so they are simply
+    left active (safe: a duplicate review, never hidden work)."""
+    def _single_destructive_op(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if record.get("origin") != "background_review":
+            return None
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        all_ops = (payload.get("operations") if payload.get("action") == "batch" else [payload]) or []
+        all_ops = [op for op in all_ops if isinstance(op, dict)]
+        if len(all_ops) != 1:
+            return None  # multi-op batch (or empty): coverage is not provable
+        return all_ops[0] if all_ops[0].get("action") in ("replace", "remove") else None
+
+    new_op, old_op = _single_destructive_op(newer), _single_destructive_op(older)
+    if new_op is None or old_op is None:
+        return False
+    new_payload = newer.get("payload") or {}
+    old_payload = older.get("payload") or {}
+    if not (isinstance(new_payload, dict) and isinstance(old_payload, dict)):
+        return False
+    if new_payload.get("target", "memory") != old_payload.get("target", "memory"):
+        return False  # different targets never supersede
+    return (new_op.get("matched_entry") == old_op.get("matched_entry")
+            and isinstance(new_op.get("matched_entry"), str) and bool(new_op.get("matched_entry")))
+
+
+def _supersede_dups_before_staging(new_id: str, payload: Dict[str, Any], origin: str = "background_review") -> None:
+    """Mark still-active pending memory records that this NEW payload provably covers (see
+    ``supersedes``) as superseded by ``new_id``. Old files stay on disk (audit evidence)."""
+    target = payload.get("target", "memory")
+    for old in list_pending(MEMORY):
+        if old.get("id") == new_id:
+            continue  # the just-written new record itself is in the scan set
+        if old.get("status") not in (None, "", "ready"):
+            continue  # already archived (stale/superseded/invalid/rejected)
+        old_payload = old.get("payload") or {}
+        if not isinstance(old_payload, dict) or old_payload.get("target", "memory") != target:
+            continue
+        if supersedes({"id": new_id, "origin": origin, "payload": payload}, old):
+            update_pending_status(MEMORY, old["id"], STATUS_SUPERSEDED, superseded_by=new_id)
+
+
+def update_pending_status(subsystem: str, pending_id: str, status: Optional[str], *,
+                          superseded_by: Optional[str] = None) -> bool:
+    """Rewrite one pending record's file atomically with ``status`` set (plus
+    ``status_updated_at`` and ``superseded_by`` when given); every other field is preserved.
+    The record is NEVER deleted — statused files stay as audit evidence. True when rewritten;
+    False when the record is missing or unreadable."""
+    record = get_pending(subsystem, pending_id)
+    if not isinstance(record, dict):
+        return False
+    if status is None:  # canonical active form: field absent
+        record.pop("status", None)
+    else:
+        record["status"] = status
+    record["status_updated_at"] = time.time()
+    if superseded_by is not None:
+        record["superseded_by"] = superseded_by
+    try:
+        atomic_json_write(_pending_path(subsystem, pending_id), record)
+    except Exception as e:
+        logger.error("Failed to status pending %s/%s -> %s: %s", subsystem, pending_id, status, e)
+        return False
+    return True
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
@@ -135,6 +322,202 @@ def pending_count(subsystem: str) -> int:
     with suppress(Exception):
         return sum(1 for _ in d.glob("*.json"))
     return 0
+
+
+# --- Memory pending-queue lifecycle (classification) ---
+
+_MEMORY_ACTIONS = frozenset({"add", "replace", "remove", "batch"})
+
+
+def classify_pending_memory(record: Dict[str, Any], store, records: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Lifecycle classification of one pending MEMORY record against a loaded ``store``:
+    ``'rejected'`` (terminal), ``'invalid'`` (fail closed forever), ``'stale'``,
+    ``'superseded'`` or ``'ready'``. ``records`` (all pending records, oldest first)
+    enables the superseded check — newer ACTIVE/ready records on the same target pinning
+    an identical ``matched_entry`` make this one redundant. Any unexpected store error
+    also classifies 'invalid' (fail closed).
+
+    Classification order (correction round 3): rejected terminal → malformed structural
+    shape → semantic preflight → supersession → ready. The semantic preflight is THE one
+    authoritative applicability verdict: the record's own ops, normalized to a batch, are
+    dry-runned through the store's public batch resolver — which re-reads disk under the
+    lock and walks ops SEQUENTIALLY, so a staged chain ``replace A→B`` then ``replace
+    B→C`` resolves B from the batch's own working state, exactly as apply_batch would
+    execute it. No independent flat "every pin must pre-exist in the initial entry list"
+    check runs first (correction round 2's flat check misclassified such legitimate
+    sequential batches as stale, and a long-lived CLI store snapshot older than disk
+    could make it disagree with the resolver's fresh view)."""
+    if not isinstance(record, dict) or record.get("status") == STATUS_REJECTED:
+        return STATUS_REJECTED
+    payload = record.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if payload.get("action") not in _MEMORY_ACTIONS:
+        return STATUS_INVALID
+    destructive = _memory_destructive_ops(payload)
+    if any(not (op.get("matched_entry") if isinstance(op, dict) else None) for op in destructive):
+        return STATUS_INVALID  # legacy pre-pinning record: fail closed forever
+    target = payload.get("target", "memory")
+    if target not in ("memory", "user"):
+        return STATUS_INVALID
+    try:
+        preflight = _preflight_memory_payload(payload, target, store)
+        if preflight is not None:
+            return preflight  # 'stale' (pin drifted at its point of consumption) or 'invalid'
+        if _is_superseded(record, records, target):
+            return STATUS_SUPERSEDED
+    except Exception:
+        logger.warning("Memory pending classification failed; failing closed", exc_info=True)
+        return STATUS_INVALID
+    return "ready"
+
+
+_STALE_PREFLIGHT_MARKERS = ("no entry matched", "matched multiple distinct", "is no longer", "changed since")
+
+
+def _preflight_memory_payload(payload: Dict[str, Any], target: str, store) -> Optional[str]:
+    """THE authoritative semantic preflight of one pending payload against CURRENT disk
+    state: the exact op set ``/memory approve`` would replay, normalized to a batch and
+    resolved through ``resolve_batch_entries`` — which takes the store's file lock,
+    re-reads disk, and walks the ops SEQUENTIALLY over the working state (a staged
+    ``replace A→B`` then ``replace B→C`` resolves B from the batch's own intermediate
+    state, never from a possibly stale long-lived store snapshot).
+
+    Returns ``None`` when the payload applies cleanly; ``STATUS_STALE`` when it fails
+    because an exact staged pin is genuinely gone/changed at the point in the sequential
+    walk where it is consumed (ordinary drift — recoverable, re-derivable); otherwise
+    ``STATUS_INVALID`` (malformed shape, invalid content, budget failure, …) — a record
+    that could never apply and must not be retried by approve-all. ``store`` is never
+    mutated: the resolver runs read-only (skip_drift, no commit, no failure-budget
+    counting — inspecting the queue must not consume the live agent's retry budget)."""
+    action = payload.get("action")
+    if action == "batch":
+        operations = payload.get("operations")
+        if not isinstance(operations, list) or not operations:
+            return STATUS_INVALID  # empty / malformed operations batch
+        ops = [op if isinstance(op, dict) else {} for op in operations]
+        allow_empty = False
+    else:
+        if action not in ("add", "replace", "remove"):
+            return STATUS_INVALID
+        ops = [{k: payload[k] for k in ("action", "old_text", "content", "new_text",
+                                        "matched_entry") if k in payload}]
+        # Single-op replay keeps the sanctioned single-op semantics (a lone remove may
+        # legitimately empty the store — the deliberate-wipe path).
+        allow_empty = True
+    if not ops:
+        return STATUS_INVALID
+    dry = store.resolve_batch_entries(target, ops, allow_empty=allow_empty)
+    if dry.get("success"):
+        return None
+    message = str(dry.get("error") or "")
+    if any(marker in message for marker in _STALE_PREFLIGHT_MARKERS):
+        return STATUS_STALE  # pin drift at its point of consumption: recoverable
+    return STATUS_INVALID
+
+
+def _is_superseded(record: Dict[str, Any], records: Optional[List[Dict[str, Any]]], target: str) -> bool:
+    """True when a strictly NEWER record provably covers this one — judged by the SAME
+    ``supersedes`` predicate staging-time dedup uses, so classification can never disagree
+    with what staging already superseded. A stale/superseded newer record does NOT
+    supersede: each record is judged by its own pins. ``records=None`` fetches the queue
+    (best-effort)."""
+    if records is None:
+        with suppress(Exception):
+            records = list_pending(MEMORY)
+    if not records:
+        return False
+    for other in records:
+        if other.get("id") == record.get("id"):
+            continue
+        if other.get("status") not in (None, "", "ready"):
+            continue
+        if other.get("created_at", 0) <= record.get("created_at", 0):
+            continue
+        if supersedes(other, record):
+            return True
+    return False
+
+
+def classify_pending_memory_queue(store, records: Optional[List[Dict[str, Any]]] = None
+                                  ) -> List[Tuple[Dict[str, Any], str]]:
+    """Whole-queue lifecycle verdicts — ONE consistent pass, newest-first, so the queue
+    is classified as a SET with exactly the semantics ``/memory pending`` persists.
+
+    Per-record independent classification can disagree with itself: judging an older
+    proposal first sees a newer same-pin proposal still ACTIVE (it supersedes the older
+    one), while judging that newer proposal finds it stale — net effect: NEITHER is
+    active, and real queued work vanishes from every consumer. Here each record's
+    supersession check sees the FRESH verdict of every newer record (a newer record
+    that is itself stale/superseded/invalid does not suppress), which is the same
+    newest-first order ``reclassify_pending_memory`` persists.
+
+    Returns ``[(record, verdict), ...]`` oldest-first (input order). PURE: nothing is
+    persisted — ``reclassify_pending_memory`` persists these verdicts, the background
+    digest only consumes them."""
+    if records is None:
+        with suppress(Exception):
+            records = list_pending(MEMORY)
+    records = [r for r in (records or []) if isinstance(r, dict)]
+    verdicts: List[Tuple[Dict[str, Any], str]] = []
+    by_id: Dict[Any, str] = {}
+    for record in reversed(records):  # NEWEST first: older records see fresh verdicts
+        persisted = record.get("status")
+        if persisted in (STATUS_REJECTED, STATUS_INVALID):
+            verdict = persisted  # terminal: never re-judged, no churn
+        else:
+            # records=[]: the queue-aware supersession check below replaces the
+            # per-record one, so classify judges everything EXCEPT supersession.
+            verdict = classify_pending_memory(record, store, [])
+            if verdict == "ready":
+                target = (record.get("payload") or {}).get("target", "memory")
+                for other in records:
+                    if other.get("id") == record.get("id"):
+                        continue
+                    if other.get("created_at", 0) <= record.get("created_at", 0):
+                        continue  # only strictly newer records can supersede
+                    if by_id.get(other.get("id")) not in (None, "", "ready"):
+                        continue  # newer record already judged non-active
+                    if supersedes(other, record):
+                        verdict = STATUS_SUPERSEDED
+                        break
+        by_id[record.get("id")] = verdict
+        verdicts.append((record, verdict))
+    verdicts.reverse()  # back to oldest-first for callers
+    return verdicts
+
+
+def reclassify_pending_memory(store, subsystem: str = MEMORY) -> Dict[str, int]:
+    """Re-classify every non-terminal pending ``subsystem`` record and persist changed
+    statuses. Returns counts: ``{'ready', 'stale', 'superseded', 'invalid', 'rejected',
+    'changed'}`` where ``changed`` counts records whose status field actually changed.
+    'invalid' persists too (audit evidence); records already 'invalid'/'rejected' stay as
+    they are (no churn). Classification runs through ``classify_pending_memory_queue`` —
+    one consistent newest-first pass over the whole set."""
+    counts = {STATUS_STALE: 0, STATUS_SUPERSEDED: 0, STATUS_INVALID: 0, STATUS_REJECTED: 0,
+              "ready": 0, "changed": 0}
+    if subsystem != MEMORY:
+        return counts
+    for record, verdict in classify_pending_memory_queue(store):
+        counts[verdict] += 1
+        # '' (absent) and 'ready' are the same lifecycle state: a ready record is not
+        # rewritten (no churn), while a stale→ready recovery persists the new status.
+        current = record.get("status") or ""
+        current_norm = "" if current in ("", "ready") else current
+        verdict_norm = "" if verdict == "ready" else verdict
+        if verdict_norm != current_norm:
+            update_pending_status(subsystem, record["id"], verdict)
+            counts["changed"] += 1
+    return counts
+
+
+def reject_pending_bulk(subsystem: str, status_value: str) -> int:
+    """Status-mark every pending record whose status == ``status_value`` as 'rejected'
+    (never delete — the files remain on disk as audit evidence). Returns how many were marked."""
+    if status_value == STATUS_REJECTED:
+        return 0
+    return sum(1 for record in list_pending(subsystem)
+               if record.get("status") == status_value
+               and update_pending_status(subsystem, record["id"], STATUS_REJECTED))
 
 
 # --- Write origin ---
