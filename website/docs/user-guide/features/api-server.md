@@ -592,6 +592,43 @@ When `session_id` identifies an existing Hermes session and no explicit
 that session's active transcript. Session turn leases serialize concurrent
 writers and refresh the transcript after a contended wait.
 
+### POST /v1/restricted-runs (input-only delegated analysis)
+
+For callers that must not receive the full gateway bearer, set a **distinct**
+`API_SERVER_RESTRICTED_KEY` in the served profile's `.env` (or
+`gateway.platforms.api_server.restricted_key` for the default listener). Give
+only that bearer to the caller, never `API_SERVER_KEY`. It can create
+`/v1/restricted-runs` requests and read/stop **its restricted runs** via
+`GET /v1/runs/{run_id}` and `POST /v1/runs/{run_id}/stop`; it cannot call
+general `/v1/runs`, chat, steer, approval, or other full-authority routes.
+The gateway master bearer retains its original access, including this endpoint.
+An unset, weak, or identical restricted key does not grant scoped access.
+
+The JSON body must contain exactly `delegation_profile_id`, `work_class`
+(`context_gather`, `log_triage`, `process_observe`, or `ci_triage`), `input`
+(a bounded string), and `capability_envelope: "input_only_v1"`. A visible-ASCII
+`Idempotency-Key` header is required; retries replay the original run, even
+after a key rotation. The delegation profile, not the request, selects model
+and provider credentials. Currently only approved native OpenAI chat models
+(GPT-4o, GPT-4.1, GPT-5 and their approved mini/nano variants) and approved
+native Anthropic Claude chat models may run. Unknown variants and models that
+can browse autonomously (including OpenAI search models) are rejected before
+admission. No Hermes tools, repository, filesystem, host, or network access
+are exposed to these runs; submitted text is the entire evidence snapshot.
+
+If the gateway accepted a run but the client lost its `run_id`, recover it
+without posting another run: `GET /v1/restricted-runs/by-key` with the same
+`Idempotency-Key` header returns the stored run status (including `run_id`).
+`POST /v1/restricted-runs/by-key/stop` with that header requests interruption
+of that same run. Both require the served profile's restricted bearer (or its
+master bearer); neither accepts an arbitrary run ID or a key in the URL. They
+look up **only** previously admitted `input_only_v1` runs in the authenticated
+profile's durable store: missing/other-profile keys return 404, malformed keys
+400, absent/invalid bearer 401, and unavailable durable storage 503. A live
+worker remains `stopping` until it actually exits; repeating stop is safe and
+terminal runs return their existing status. A newly rotated bearer for the
+same served profile can recover and stop an older run.
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.
@@ -846,6 +883,7 @@ The API server gives full access to hermes-agent's toolset, **including terminal
 | `API_SERVER_PORT` | `8642` | HTTP server port |
 | `API_SERVER_HOST` | `127.0.0.1` | Bind address (localhost only by default) |
 | `API_SERVER_KEY` | _(required)_ | Bearer token for auth |
+| `API_SERVER_RESTRICTED_KEY` | _(none)_ | Optional separate, profile-scoped bearer for input-only restricted runs and their status/stop routes; must differ from `API_SERVER_KEY` |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
 | `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
 

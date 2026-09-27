@@ -373,6 +373,15 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
 
 def _check_run_auth(self, request: "web.Request", *, permission: str, _api_server) -> "web.Response | None":
     if not self._room_grant_token(request):
+        if self._is_restricted_credential(request):
+            run_id = request.match_info.get("run_id", "")
+            path = request.path
+            if run_id and ((permission == "status" and request.method == "GET"
+                            and path.endswith(f"/v1/runs/{run_id}"))
+                           or (permission == "stop" and request.method == "POST"
+                               and path.endswith(f"/v1/runs/{run_id}/stop"))):
+                return None  # _request_owns_run still enforces restricted-only ownership.
+            return self._auth_failed_response()
         return self._check_auth(request)
     try:
         self._room_grant_claims(request, permission=permission)
@@ -395,12 +404,19 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
 def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, Any] | None:
     """Hydrate a scoped run status and fail stale owners closed."""
     status = self._run_statuses.get(run_id)
-    if status is not None:
-        if run_id in self._run_idempotency_ids:
-            scope = self._run_idempotency_scope(request)
-            self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
+    if status is not None and run_id not in self._run_idempotency_ids:
         return status
-    scope = self._run_idempotency_scope(request)
+    from gateway.platforms.api_server_restricted_runs import _restricted_scope
+    from gateway.platforms import api_server as _api_server
+    restricted_scope = _restricted_scope(self, request, _api_server=_api_server)
+    owner = self._run_owners.get(run_id)
+    scope = (restricted_scope if not self._room_grant_token(request)
+             and (owner == restricted_scope or (owner is None and
+                 self._run_idempotency_store.owns_run(restricted_scope, run_id)))
+             else self._run_idempotency_scope(request))
+    if status is not None:
+        self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
+        return status
     record = self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
     if record is None:
@@ -1079,8 +1095,19 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
 
 
 def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
-    scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
+    # Restricted runs intentionally bind to a stable *profile* principal, not a
+    # bearer-key hash: rotating the listener key must not orphan control or replay.
+    from gateway.platforms.api_server_restricted_runs import _restricted_scope
+    from gateway.platforms import api_server as _api_server
+    restricted_scope = _restricted_scope(self, request, _api_server=_api_server)
+    if self._is_restricted_credential(request):
+        return owner == restricted_scope or (owner is None and
+            self._run_idempotency_store.owns_run(restricted_scope, run_id))
+    scope = self._run_idempotency_scope(request)
+    if not self._room_grant_token(request) and (owner == restricted_scope or (
+            owner is None and self._run_idempotency_store.owns_run(restricted_scope, run_id))):
+        return True
     if owner is not None:
         return owner == scope
     # No in-memory owner: only a durable record under the caller's scope admits it.
@@ -1282,6 +1309,10 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
+    if status and status.get("capability_envelope") == "input_only_v1":
+        return _json_error(
+            _openai_error, "Restricted runs cannot accept steer input.",
+            code="restricted_run_steer_forbidden", status=409)
     # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
     # agent ref) is what rejects stop-then-steer.
     if status.get("status") != "running" or not hasattr(agent, "steer"):
@@ -1312,16 +1343,21 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
 
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
-    _openai_error = _api_server._openai_error
     run_id, status, agent, task, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
+    assert run_id is not None and status is not None
+    return _stop_owned_run(self, run_id, status, agent, task, _api_server=_api_server)
+
+
+def _stop_owned_run(self, run_id: str, status: dict, agent: Any, task: Any, *, _api_server) -> "web.Response":
+    """Stop an already authenticated and owned run (also used by restricted key recovery)."""
     if status.get("status") in TERMINAL_STATUSES:
         return web.json_response(status)
     if agent is None and task is None:
         return _json_error(
-            _openai_error, f"Run is not active in this gateway process: {run_id}",
+            _api_server._openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)

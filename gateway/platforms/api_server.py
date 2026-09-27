@@ -15,7 +15,7 @@ import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar, copy_context
-from functools import wraps
+from functools import partial, wraps
 import logging
 import os
 import re
@@ -93,6 +93,9 @@ _CAPABILITY_ENDPOINTS = (
     ("chat_completions", ("POST", "/v1/chat/completions")),
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
+    ("restricted_runs", ("POST", "/v1/restricted-runs")),
+    ("restricted_run_by_key", ("GET", "/v1/restricted-runs/by-key")),
+    ("restricted_run_stop_by_key", ("POST", "/v1/restricted-runs/by-key/stop")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
@@ -149,6 +152,7 @@ from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_restricted_runs as _restricted_runs
 from gateway.platforms import api_server_provider_credentials as _provider_credentials
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
@@ -963,16 +967,18 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
     "api_agent_request_reservation", default=None)
 
 
-def _admit_api_agent_request(handler):
+def _admit_api_agent_request(handler, *, restricted=False):
     """Reserve an authenticated API turn before its handler first awaits: drain check +
     reservation in one non-awaiting block so a request admitted just before shutdown can't go
     invisible while parsing its body. The mutable reservation releases the slot exactly once."""
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
-        auth_err = (
-            self._check_run_auth(request, permission="dispatch")
-            if _api_runs._uses_room_run_auth(self, request)
-            else self._check_auth(request))
+        if restricted:
+            auth_err = self._check_restricted_auth(request)
+        elif _api_runs._uses_room_run_auth(self, request):
+            auth_err = self._check_run_auth(request, permission="dispatch")
+        else:
+            auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         draining = self._draining_response()
@@ -1204,6 +1210,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self._host, self._port = listen_address(extra)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        # Optional low-authority bearer, never accepted by general-route _check_auth.
+        self._restricted_api_key: str = extra.get(
+            "restricted_key", _get_scoped_secret("API_SERVER_RESTRICTED_KEY", ""))
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")))
         self._model_name: str = self._resolve_model_name(
@@ -1590,6 +1599,36 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
         return self._auth_failed_response()
 
+    def _expected_restricted_api_key(self) -> str:
+        profile = _api_request_profile.get()
+        if not profile or profile == "default":
+            return self._restricted_api_key
+        try:
+            from agent.secret_scope import get_secret
+            return get_secret("API_SERVER_RESTRICTED_KEY", "") or ""
+        except Exception:
+            return ""
+
+    def _is_restricted_credential(self, request: "web.Request") -> bool:
+        """Only a distinct, configured restricted bearer identifies this principal."""
+        from hermes_cli.auth import has_usable_secret
+        restricted = self._expected_restricted_api_key()
+        master = self._expected_api_key()
+        if (not master or not has_usable_secret(restricted, min_length=16)
+                or hmac.compare_digest(restricted.encode(), master.encode())):
+            return False
+        header = request.headers.get("Authorization", "")
+        return header.startswith("Bearer ") and hmac.compare_digest(
+            header[7:].strip().encode(), restricted.encode())
+
+    def _check_restricted_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Preserve master access; authorize the scoped bearer only on this route."""
+        if self._is_restricted_credential(request):
+            return None
+        if self._expected_api_key() and self._check_auth(request) is None:
+            return None
+        return self._auth_failed_response()
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -1770,6 +1809,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        routes.append(("POST", "/v1/restricted-runs", self._handle_restricted_runs))
+        routes.append(("GET", "/v1/restricted-runs/by-key", self._handle_restricted_run_by_key))
+        routes.append(("POST", "/v1/restricted-runs/by-key/stop", self._handle_stop_restricted_run_by_key))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -4443,6 +4485,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
+
+    @partial(_admit_api_agent_request, restricted=True)
+    async def _handle_restricted_runs(self, request: "web.Request") -> "web.Response":
+        return await _restricted_runs._handle_restricted_runs(self, request, _api_server=sys.modules[__name__])
+
+    async def _handle_restricted_run_by_key(self, request: "web.Request") -> "web.Response":
+        return await _restricted_runs._handle_restricted_run_by_key(self, request, _api_server=sys.modules[__name__])
+
+    async def _handle_stop_restricted_run_by_key(self, request: "web.Request") -> "web.Response":
+        return await _restricted_runs._handle_stop_restricted_run_by_key(
+            self, request, _api_server=sys.modules[__name__])
 
     def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
         return _api_runs._request_owns_run(self, request, run_id)

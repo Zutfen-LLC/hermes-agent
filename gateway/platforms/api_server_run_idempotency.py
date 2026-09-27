@@ -166,6 +166,16 @@ class RunIdempotencyStore:
             self._conn.commit()
         return ("missing", None) if row is None else _outcome(row, fingerprint)
 
+    def lookup_key(self, scope: str, key: str) -> dict[str, Any] | None:
+        """Read an existing reservation by scoped key without creating or renewing it.
+
+        Recovery callers do not have the original request body/fingerprint. The
+        caller must still authorize the scope and inspect the stored run type.
+        """
+        with self._lock:
+            row = self._conn.execute(_SELECT_BY_KEY, (scope, key)).fetchone()
+        return None if row is None else _record(*row[1:])
+
     def _prune_stale_terminal_locked(self, now: float) -> None:
         """Prune aged replay records only once their stored run is terminal (caller holds the
         lock + transaction): a long or disconnected room turn may outlive the retention window."""
@@ -179,7 +189,11 @@ class RunIdempotencyStore:
         ).fetchall()
         for stale_scope, stale_key, stale_status in stale:
             try:
-                terminal = json.loads(stale_status).get("status") in TERMINAL_STATUSES
+                saved = json.loads(stale_status)
+                # Input-only delegated tasks must never reuse a terminal key: the
+                # caller may retry after an arbitrarily long offline interval.
+                terminal = (saved.get("status") in TERMINAL_STATUSES
+                            and saved.get("capability_envelope") != "input_only_v1")
             except Exception:
                 terminal = False
             if terminal:
