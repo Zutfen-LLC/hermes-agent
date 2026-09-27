@@ -131,11 +131,20 @@ Mechanics proven by the prototype script (committed under
 
 1. Parse the skill library (`references/*.md` lesson blocks) into discrete
    lessons; preserve group + numbering.
-2. Import via `POST /v1/remember` as `source_type=migration` (trust default
-   0.8, active immediately — bulk import is an operator-authorized act),
-   with `external_source=hermes-skill-migration` + deterministic
-   `external_id` so re-runs are idempotent (probed before POST; dedup also
-   enforced server-side).
+2. Import via `POST /v1/remember` as `source_type=migration`, executed by the
+   dedicated **agent principal** of §3 (`hermes-skills-lessons`). Trust and
+   confidence come from Engram's import/migration policy defaults (0.8/0.8
+   absent tenant override), but an agent principal never auto-activates: the
+   write lands `review_status='proposed'` and becomes retrievable only when a
+   human review authority — a `user` or `admin` principal holding the required
+   `review` scope — promotes it through the review queue. The agent cannot
+   self-activate (server-enforced 403). `external_source=hermes-skill-migration`
+   + deterministic `external_id` keep re-runs idempotent (probed before POST;
+   dedup also enforced server-side). A differently authorized migration — one
+   executed by a `user`, `admin`, or `system` principal — may carry different
+   initial-state semantics under Engram's canonical trust policy
+   (`resolve_trust_defaults()` in `engram/trust_policy.py` is authoritative);
+   this contract does not hard-code a client-side policy for the source type.
 3. Reduce the skill file to procedure + retrieval directive; freeze the local
    library file as a migration snapshot (never a retrieval source).
 4. For `MEMORY.md`/`USER.md`: operator-approved export of durable facts into
