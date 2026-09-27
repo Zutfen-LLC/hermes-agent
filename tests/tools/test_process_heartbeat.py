@@ -38,11 +38,30 @@ def test_heartbeat_carries_only_new_output_and_stops_at_exit(tmp_path, monkeypat
     monkeypatch.setattr(pr, "HEARTBEAT_MIN_SECONDS", 1)
     monkeypatch.setattr(pr, "HEARTBEAT_TICK_SECONDS", 0.1)
     registry = ProcessRegistry()
-    session = registry.spawn_local("echo first; sleep 2.5; echo second; sleep 2.5", cwd=str(tmp_path))
+    session = registry.spawn_local(
+        "while [ ! -f first-ready ]; do sleep 0.02; done; echo first; "
+        "while [ ! -f second-ready ]; do sleep 0.02; done; echo second; "
+        "while [ ! -f exit-ready ]; do sleep 0.02; done",
+        cwd=str(tmp_path),
+    )
     session.notify_on_complete = True
-    assert registry.arm_heartbeat(session, 1) == 1
-
-    assert _wait_until(lambda: registry.poll(session.id)["status"] != "running", timeout=20)
+    try:
+        assert registry.arm_heartbeat(session, 1) == 1
+        # Release each line only after the previous heartbeat includes its output.
+        for line in ("first", "second"):
+            (tmp_path / f"{line}-ready").touch()
+            assert _wait_until(
+                lambda: any(
+                    event.get("type") == "heartbeat" and line in event["output"]
+                    for event in list(registry.completion_queue.queue)
+                ),
+                timeout=20,
+            )
+        (tmp_path / "exit-ready").touch()
+        assert _wait_until(lambda: registry.poll(session.id)["status"] != "running", timeout=20)
+    finally:
+        if not session.exited:
+            registry.kill_process(session.id)
     # Give the completion event a moment to be enqueued after the reader observes EOF.
     assert _wait_until(lambda: any(e.get("type") == "completion" for e in list(registry.completion_queue.queue)),
                        timeout=5)
