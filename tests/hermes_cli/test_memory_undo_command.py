@@ -28,8 +28,8 @@ def _disk_entries(store, target="memory"):
 
 
 def _record_consolidation(store, target="memory"):
-    """Mirror the landed _autonomous_consolidation apply path: begin snapshot ->
-    real public batch mutation -> applied record. Returns the audit id."""
+    """Mirror the landed _autonomous_consolidation apply path: begin snapshot (with the
+    planned after digest) -> real public batch mutation -> applied record. Returns the audit id."""
     from tools.memory_consolidation import record_applied, record_begin
     before_entries = list(store._entries_for(target))
     before_raw = store._read_raw_checked(store._path_for(target))[0]

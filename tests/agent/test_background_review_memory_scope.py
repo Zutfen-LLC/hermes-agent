@@ -237,10 +237,26 @@ class TestPendingProposalsContext:
             _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
         assert prompt == bg._MEMORY_REVIEW_PROMPT
 
+    def _seeded_store(self):
+        """A store actually holding the entries these tests pin to — the digest now
+        classifies statusless records against the CURRENT store, so a proposal pinning
+        a nonexistent entry is (correctly) stale and drops out."""
+        from tools.memory_tool import MemoryStore
+
+        store = MemoryStore(memory_char_limit=4000, user_char_limit=4000)
+        store.load_from_disk()
+        return store
+
+    def _seed(self, store, *entries):
+        for e in entries:
+            store.add("memory", e)
+
     def test_qualifying_record_appears_in_context_and_prompt(self, tmp_path, monkeypatch):
         self._home(tmp_path, monkeypatch)
         import hashlib
 
+        store = self._seeded_store()
+        self._seed(store, "seed entry one")
         record = self._stage(tmp_path, matched_entry="seed entry one", summary="a" * 200)
         ctx = bg.pending_memory_proposals_context()
         assert record["id"] in ctx
@@ -263,7 +279,9 @@ class TestPendingProposalsContext:
         self._home(tmp_path, monkeypatch)
         from tools import write_approval as wa
 
+        store = self._seeded_store()
         long_entry = "E" * 150
+        self._seed(store, long_entry)
         wa.stage_write("memory", {"action": "remove", "target": "memory",
                                   "old_text": long_entry, "matched_entry": long_entry},
                        summary="staging summary that must not be used", origin="background_review")
@@ -286,6 +304,8 @@ class TestPendingProposalsContext:
 
     def test_caps_limit_lines_and_characters(self, tmp_path, monkeypatch):
         self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, *(f"seed entry {i}" for i in range(12)))
         for i in range(12):
             self._stage(tmp_path, matched_entry=f"seed entry {i}", summary=f"consolidate dupes {i:02d}")
         ctx = bg.pending_memory_proposals_context()
@@ -309,3 +329,26 @@ class TestPendingProposalsContext:
                 _, prompt = bg.spawn_background_review_thread(agent, [], review_memory=True)
             assert "Already-proposed" not in prompt
             assert prompt == bg._MEMORY_REVIEW_PROMPT
+
+    def test_statusless_but_stale_record_not_suppressed_and_not_shown(self, tmp_path, monkeypatch):
+        """Correction round: a statusless proposal whose pinned entry has since been
+        REMOVED from the store must not appear in (and so must not suppress) new fork
+        work — classified against the CURRENT store here, with no prior /memory pending."""
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "entry the stale proposal targets")
+        record = self._stage(tmp_path, matched_entry="entry the stale proposal targets")
+        # The store moves on: the pinned entry is deleted AFTER staging, with NO
+        # /memory pending run (the status stays absent on disk).
+        store.remove("memory", "entry the stale proposal targets")
+        assert bg.pending_memory_proposals_context() == ""
+
+    def test_statusless_ready_record_still_appears(self, tmp_path, monkeypatch):
+        """Positive control for the classification filter: a statusless record whose pin
+        is STILL live keeps appearing in the digest (classification must not over-drop)."""
+        self._home(tmp_path, monkeypatch)
+        store = self._seeded_store()
+        self._seed(store, "live entry one")
+        record = self._stage(tmp_path, matched_entry="live entry one")
+        ctx = bg.pending_memory_proposals_context()
+        assert record["id"] in ctx

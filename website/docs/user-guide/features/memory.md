@@ -353,9 +353,17 @@ staged write:
   fallback is always "stage it for a human instead."
 - **Audit + undo** — the full before-state is written to an append-only ledger
   at `~/.hermes/memory_backups/consolidations.jsonl` *before* anything is
-  applied (no ledger write, no mutation). Every applied consolidation reports
-  its audit id, and `/memory undo <audit_id>` restores the recorded before-state
-  as one atomic batch. `/memory undo list` shows recent audit records.
+  applied (no ledger write, no mutation), together with the deterministic
+  digest of the planned final state. The commit itself is a transactional
+  batch carrying a full-store precondition — if ANY entry changed between the
+  audit snapshot and the commit (even one the consolidation never touches),
+  nothing is applied. Every applied consolidation reports its audit id, and
+  `/memory undo <audit_id>` restores the recorded before-state — but only
+  after proving from the journal that the consolidation committed and that
+  memory has not drifted since: an uncommitted (begin-only) transaction is a
+  no-op, and a consolidation followed by later writes is refused (with the
+  audit id for manual recovery) rather than erasing them.
+  `/memory undo list` shows recent audit records.
 
 Scope guardrails: only the unattended background **memory** review is affected —
 skill-only reviews never receive the memory tool at all, foreground turns are
@@ -372,7 +380,7 @@ and only list **ready** items as approval candidates (#109215):
 |--------|---------|
 | `ready` | Active — pinned entries still match the store exactly; listed for approval. |
 | `stale` | A pinned entry is gone or has changed since staging; can recover to `ready` if the entry returns. |
-| `superseded` | A newer active proposal pins the same exact entry. Staging a new background proposal that re-targets an entry supersedes the older one automatically. |
+| `superseded` | A newer active single-op background-review proposal pins the same exact entry on the same target. Multi-op batches are never auto-superseded on partial pin overlap — their distinct work stays independently reviewable. |
 | `invalid` | Malformed payload, or a legacy pre-pinning `replace`/`remove` with no verifiable target — permanently fail-closed; reject it and recreate the change. |
 | `rejected` | You rejected it. The record is kept on disk as audit evidence but never listed again. |
 

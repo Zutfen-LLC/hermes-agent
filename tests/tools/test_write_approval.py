@@ -368,3 +368,60 @@ def test_unattended_consolidation_malformed_config_fails_closed(hermes_home, mon
     # the module attribute is what the call-time import resolves to.
     monkeypatch.setattr("hermes_cli.config.load_config", _boom)
     assert wa.unattended_memory_consolidation_enabled() is False
+
+# ---------------------------------------------------------------------------
+# Single-config-snapshot resolution (correction round: fail-closed invariant)
+# ---------------------------------------------------------------------------
+
+def test_unattended_policy_resolves_from_one_config_snapshot(hermes_home, monkeypatch):
+    """Both booleans (allow_unattended_consolidation, write_approval) must come from ONE
+    load_config() result. The reviewed implementation called write_approval_enabled()
+    afterwards — a second, independent config read whose failure would silently report
+    the gate OFF and turn autonomous destructive consolidation ON."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    calls = {"n": 0}
+    real_load = cfg.load_config
+
+    def counting_load():
+        calls["n"] += 1
+        return real_load()
+
+    monkeypatch.setattr("hermes_cli.config.load_config", counting_load)
+    assert wa.unattended_memory_consolidation_enabled() is True
+    assert calls["n"] == 1  # exactly ONE configuration read
+
+def test_unattended_policy_second_read_failure_cannot_enable_it(hermes_home, monkeypatch):
+    """Regression for the reviewed defect: the config has opt-in=true AND
+    write_approval=true (gate authoritative), but the SECOND config read (the old
+    write_approval_enabled() call) fails transiently. The reviewed implementation
+    swallowed that failure, reported the gate OFF, and ENABLED autonomous destructive
+    consolidation against a config that explicitly says the gate is on. The corrected
+    single-snapshot policy reads both from one load_config() and stays disabled."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    _set_approval("memory", True)  # the authoritative gate is ON in the config
+
+    real_load = cfg.load_config
+    state = {"n": 0}
+
+    def fail_on_second_call():
+        state["n"] += 1
+        if state["n"] >= 2:
+            raise RuntimeError("second config read failed")
+        return real_load()
+
+    monkeypatch.setattr("hermes_cli.config.load_config", fail_on_second_call)
+    assert wa.unattended_memory_consolidation_enabled() is False
+
+def test_unattended_policy_write_approval_truthy_string_blocks(hermes_home):
+    """opt-in=true + write_approval=true => False, including hand-edited string forms."""
+    import hermes_cli.config as cfg
+    from tools import write_approval as wa
+    _set_consolidation(True)
+    c = cfg.load_config()
+    c.setdefault("memory", {})["write_approval"] = "on"  # hand-edited truthy spelling
+    cfg.save_config(c)
+    assert wa.unattended_memory_consolidation_enabled() is False

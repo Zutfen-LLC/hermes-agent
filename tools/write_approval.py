@@ -70,13 +70,23 @@ def write_approval_enabled(subsystem: str) -> bool:
 
 def unattended_memory_consolidation_enabled() -> bool:
     """True only when the operator explicitly opted in AND the ordinary approval gate is off
-    (write_approval=true stays authoritative: staging then remains the only path)."""
+    (write_approval=true stays authoritative: staging then remains the only path).
+
+    Both booleans are resolved from ONE ``load_config()`` snapshot: a second, independent
+    config read could fail (or race an edit) between the two and report the gate off while
+    the opt-in was read as on — enabling autonomous destructive consolidation against a
+    config the operator never made. Any exception, malformed section or unreadable config
+    leaves the policy disabled (fail closed)."""
     try:
         from hermes_cli.config import load_config, cfg_get
-        opted_in = _normalize_enabled(cfg_get(load_config(), MEMORY, "allow_unattended_consolidation", default=False))
+        config = load_config()
+        if not isinstance(config, dict):
+            return False
+        opted_in = _normalize_enabled(cfg_get(config, MEMORY, "allow_unattended_consolidation", default=False))
+        gate_on = _normalize_enabled(cfg_get(config, MEMORY, CONFIG_KEY, default=False))
     except Exception:
         return False
-    return opted_in and not write_approval_enabled(MEMORY)
+    return opted_in and not gate_on
 
 
 def _normalize_enabled(value: Any) -> bool:
@@ -105,15 +115,12 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     the safe failure for an approval gate (nothing silently committed).
 
     Memory dedup: a background-review destructive proposal that pins an entry some still-active
-    pending record already pins (same target) supersedes that record first — the old file is kept
-    on disk, marked ``superseded``/``superseded_by`` the new id — so one entry change never queues
-    for review twice. Foreground staging and hygiene failures never block the proposal."""
+    pending record already pins (same target) supersedes that record first (see
+    ``supersedes`` for the exact conservative rule) — the old file is kept on disk, marked
+    ``superseded``/``superseded_by`` the new id — so one entry change never queues for review
+    twice. Supersession happens only AFTER the new record is durably persisted; foreground
+    staging and hygiene failures never block the proposal."""
     pid = uuid.uuid4().hex[:8]
-    try:
-        if subsystem == MEMORY and origin == "background_review":
-            _supersede_dups_before_staging(pid, payload)
-    except Exception as e:  # never block a proposal on queue hygiene
-        logger.warning("Pending-dedup scan failed; staging anyway: %s", e, exc_info=True)
     record = {
         "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
         "summary": (summary or "").strip(), "origin": origin or "foreground",
@@ -122,7 +129,19 @@ def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin
     try:
         atomic_json_write(_pending_path(subsystem, pid), record)
     except Exception as e:  # pragma: no cover - disk failure path
+        # Safe failure for an approval gate: the write is lost, nothing silently committed —
+        # and crucially nothing was superseded either (below), so no existing proposal can
+        # point at a record that never existed.
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        return record
+    if subsystem == MEMORY and origin == "background_review":
+        # Supersession runs ONLY after the new record is durably on disk: a persistence
+        # failure must never leave older proposals marked superseded-by an id that does
+        # not exist. Hygiene failures never block the staged proposal either way.
+        try:
+            _supersede_dups_before_staging(pid, payload)
+        except Exception as e:  # never block a proposal on queue hygiene
+            logger.warning("Pending-dedup scan failed; staged proposal stays active: %s", e, exc_info=True)
     return record
 
 
@@ -148,20 +167,59 @@ def _memory_destructive_ops(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _supersede_dups_before_staging(new_id: str, payload: Dict[str, Any]) -> None:
-    """Mark still-active pending memory records that pin an entry the NEW payload also pins
-    (same target) as superseded by ``new_id``. Old files stay on disk (audit evidence)."""
+def supersedes(newer: Dict[str, Any], older: Dict[str, Any]) -> bool:
+    """THE one conservative supersession predicate, used by BOTH staging-time dedup and
+    lifecycle classification — they cannot disagree by construction.
+
+    A proposal may supersede another only when it provably covers the ENTIRE logical change
+    the older one represents. The smallest provably-safe v1 rule: a SINGLE destructive-op
+    proposal supersedes another SINGLE destructive-op proposal when both are
+    background-review proposals on the same target pinning the EXACT same matched entry.
+
+    Everything else — multi-op batches, mixed add/remove work, partial pin overlap — stays
+    independently reviewable: ``[replace A, remove B, add C]`` is NOT hidden by a new
+    ``[replace A]``, because the new proposal does not cover the distinct B/C work. Whole
+    batches are never auto-superseded on pin overlap alone; exact-equivalent whole batches
+    would require mechanically proving complete operation equivalence, so they are simply
+    left active (safe: a duplicate review, never hidden work)."""
+    def _single_destructive_op(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if record.get("origin") != "background_review":
+            return None
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        all_ops = (payload.get("operations") if payload.get("action") == "batch" else [payload]) or []
+        all_ops = [op for op in all_ops if isinstance(op, dict)]
+        if len(all_ops) != 1:
+            return None  # multi-op batch (or empty): coverage is not provable
+        return all_ops[0] if all_ops[0].get("action") in ("replace", "remove") else None
+
+    new_op, old_op = _single_destructive_op(newer), _single_destructive_op(older)
+    if new_op is None or old_op is None:
+        return False
+    new_payload = newer.get("payload") or {}
+    old_payload = older.get("payload") or {}
+    if not (isinstance(new_payload, dict) and isinstance(old_payload, dict)):
+        return False
+    if new_payload.get("target", "memory") != old_payload.get("target", "memory"):
+        return False  # different targets never supersede
+    return (new_op.get("matched_entry") == old_op.get("matched_entry")
+            and isinstance(new_op.get("matched_entry"), str) and bool(new_op.get("matched_entry")))
+
+
+def _supersede_dups_before_staging(new_id: str, payload: Dict[str, Any], origin: str = "background_review") -> None:
+    """Mark still-active pending memory records that this NEW payload provably covers (see
+    ``supersedes``) as superseded by ``new_id``. Old files stay on disk (audit evidence)."""
     target = payload.get("target", "memory")
-    new_pins = _pinned_entries_of(payload)
-    if not new_pins:
-        return
     for old in list_pending(MEMORY):
+        if old.get("id") == new_id:
+            continue  # the just-written new record itself is in the scan set
         if old.get("status") not in (None, "", "ready"):
             continue  # already archived (stale/superseded/invalid/rejected)
         old_payload = old.get("payload") or {}
         if not isinstance(old_payload, dict) or old_payload.get("target", "memory") != target:
             continue
-        if _pinned_entries_of(old_payload) & new_pins:
+        if supersedes({"id": new_id, "origin": origin, "payload": payload}, old):
             update_pending_status(MEMORY, old["id"], STATUS_SUPERSEDED, superseded_by=new_id)
 
 
@@ -275,16 +333,15 @@ def classify_pending_memory(record: Dict[str, Any], store, records: Optional[Lis
 
 
 def _is_superseded(record: Dict[str, Any], records: Optional[List[Dict[str, Any]]], target: str) -> bool:
-    """True when a strictly NEWER record — still active or ready, same target — pins at least
-    one identical ``matched_entry``. A stale/superseded newer record does NOT supersede: each
-    record is judged by its own pins. ``records=None`` fetches the queue (best-effort)."""
+    """True when a strictly NEWER record provably covers this one — judged by the SAME
+    ``supersedes`` predicate staging-time dedup uses, so classification can never disagree
+    with what staging already superseded. A stale/superseded newer record does NOT
+    supersede: each record is judged by its own pins. ``records=None`` fetches the queue
+    (best-effort)."""
     if records is None:
         with suppress(Exception):
             records = list_pending(MEMORY)
     if not records:
-        return False
-    pinned = {op.get("matched_entry") for op in _memory_destructive_ops(record.get("payload"))}
-    if not pinned:
         return False
     for other in records:
         if other.get("id") == record.get("id"):
@@ -293,10 +350,7 @@ def _is_superseded(record: Dict[str, Any], records: Optional[List[Dict[str, Any]
             continue
         if other.get("created_at", 0) <= record.get("created_at", 0):
             continue
-        payload = other.get("payload") or {}
-        if not isinstance(payload, dict) or payload.get("target", "memory") != target:
-            continue
-        if pinned & {op.get("matched_entry") for op in _memory_destructive_ops(payload)}:
+        if supersedes(other, record):
             return True
     return False
 

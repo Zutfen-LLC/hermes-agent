@@ -54,7 +54,7 @@ def _stage_remove(matched_entry, old_text, *, origin="background_review", create
 def _status(record_id):
     from tools import write_approval as wa
     rec = wa.get_pending(wa.MEMORY, record_id)
-    return rec.get("status"), rec
+    return rec.get("status") if rec else None, rec
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ def test_stage_dedup_supersedes_older_same_pin(hermes_home):
                     created_at=2000.0)
     status, rec = _status(first["id"])
     assert status == "superseded"
-    assert rec["superseded_by"] == second["id"]
+    assert rec is not None and rec["superseded_by"] == second["id"]
     # Old file still on disk (audit evidence); new record stays active.
     assert wa._pending_path(wa.MEMORY, first["id"]).exists()
     assert _status(second["id"])[0] is None
@@ -249,6 +249,171 @@ def test_stage_dedup_only_supersedes_active_records(hermes_home):
 
 
 # ---------------------------------------------------------------------------
+# Durable-first supersession + partial-overlap batch safety (correction round)
+# ---------------------------------------------------------------------------
+
+def test_stage_persistence_failure_leaves_old_proposal_active(hermes_home, monkeypatch):
+    """The new record is persisted FIRST; supersession runs only after. A persistence
+    failure must not mark any existing proposal superseded-by an id that does not exist."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "durable first entry")
+    first = _stage_remove("durable first entry", "durable first", created_at=1000.0)
+
+    def boom(path, record):
+        raise OSError("disk full")
+    monkeypatch.setattr("tools.write_approval.atomic_json_write", boom)
+    doomed = wa.stage_write(wa.MEMORY, {"action": "replace", "target": "memory",
+                                        "old_text": "durable first", "content": "never lands",
+                                        "matched_entry": "durable first entry"},
+                            summary="doomed", origin="background_review")
+    # Safe failure posture preserved: the record object is still returned, nothing staged.
+    assert doomed["id"]
+    assert not wa._pending_path(wa.MEMORY, doomed["id"]).exists()
+    # The OLD proposal is untouched: still active, no dangling superseded_by.
+    status, rec = _status(first["id"])
+    assert status is None
+    assert rec is not None and "superseded_by" not in rec
+    # And the never-persisted id superseded nothing anywhere.
+    for other in wa.list_pending(wa.MEMORY):
+        assert other.get("superseded_by") != doomed["id"]
+
+
+def test_supersession_runs_only_after_durable_persist(hermes_home):
+    """Successful new single-op same-pin proposal supersedes the older one — and does so
+    AFTER its own record is durably on disk (the old proposal can only ever point at a
+    record that exists)."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "ordering witness entry")
+    first = _stage_remove("ordering witness entry", "ordering witness", created_at=1000.0)
+    second = _stage({"action": "replace", "target": "memory", "old_text": "ordering witness",
+                     "content": "ordering witness v2", "matched_entry": "ordering witness entry"},
+                    created_at=2000.0)
+    assert wa._pending_path(wa.MEMORY, second["id"]).exists()  # durable BEFORE supersede
+    status, rec = _status(first["id"])
+    assert status == "superseded" and rec["superseded_by"] == second["id"]
+
+
+def test_partial_pin_overlap_batch_not_superseded(hermes_home):
+    """The atomic-batch safety case: an old batch [remove A, remove B, add C] must remain
+    independently reviewable when a new single-op proposal only re-targets A — the new
+    proposal does NOT cover the distinct B/C work."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "entry a text")
+    store.add("memory", "entry b text")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "remove", "old_text": "entry a", "matched_entry": "entry a text"},
+        {"action": "remove", "old_text": "entry b", "matched_entry": "entry b text"},
+        {"action": "add", "content": "entry c content"},
+    ]}, created_at=1000.0)
+    _stage({"action": "replace", "target": "memory", "old_text": "entry a",
+            "content": "entry a rewritten", "matched_entry": "entry a text"}, created_at=2000.0)
+    assert _status(batch["id"])[0] is None  # batch stays ACTIVE (staging-time dedup)
+    assert wa.classify_pending_memory(batch, store) == "ready"  # and at classification time
+
+
+def test_batch_of_remove_plus_add_not_superseded_by_replace(hermes_home):
+    """Old batch [remove A, add C], new proposal replace A => the old batch must remain
+    active: replace A does not cover the add of C."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "solo target entry")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "remove", "old_text": "solo target", "matched_entry": "solo target entry"},
+        {"action": "add", "content": "replacement fact c"},
+    ]}, created_at=1000.0)
+    _stage({"action": "replace", "target": "memory", "old_text": "solo target",
+            "content": "solo target rewritten", "matched_entry": "solo target entry"},
+           created_at=2000.0)
+    assert _status(batch["id"])[0] is None
+    assert wa.classify_pending_memory(batch, store) == "ready"
+
+
+def test_new_batch_does_not_supersede_older_single_op(hermes_home):
+    """Conservative symmetry: a newer MULTI-op proposal never supersedes even an older
+    single-op proposal on pin overlap alone (coverage is not mechanically proven)."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "one pin entry")
+    store.add("memory", "two pin entry")
+    old = _stage_remove("one pin entry", "one pin", created_at=1000.0)
+    _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "one pin", "content": "one pin v2",
+         "matched_entry": "one pin entry"},
+        {"action": "remove", "old_text": "two pin", "matched_entry": "two pin entry"},
+    ]}, created_at=2000.0)
+    assert _status(old["id"])[0] is None
+    assert wa.classify_pending_memory(old, store) == "ready"
+
+
+def test_equivalent_whole_batches_both_stay_active(hermes_home):
+    """Exact-equivalent whole BATCHES are never auto-deduplicated: proving complete
+    operation equivalence is not mechanical, so both stay active (a duplicate review is
+    safe; hidden work is not). Two identical single-op replaces, by contrast, are the
+    explicitly-safe supersession case — one pinned entry, one logical change."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "dup target entry")
+    first = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "remove", "old_text": "dup target", "matched_entry": "dup target entry"},
+        {"action": "add", "content": "same new text"},
+    ]}, created_at=1000.0)
+    _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "remove", "old_text": "dup target", "matched_entry": "dup target entry"},
+        {"action": "add", "content": "same new text"},
+    ]}, created_at=2000.0)
+    assert _status(first["id"])[0] is None
+    assert wa.classify_pending_memory(first, store) == "ready"
+
+
+def test_different_targets_never_supersede(hermes_home):
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "shared wording entry")
+    store.add("user", "shared wording entry")
+    mem_rec = _stage_remove("shared wording entry", "shared wording",
+                            target="memory", created_at=1000.0)
+    _stage_remove("shared wording entry", "shared wording", target="user", created_at=2000.0)
+    assert _status(mem_rec["id"])[0] is None
+    assert wa.classify_pending_memory(mem_rec, store) == "ready"
+
+
+def test_foreground_newer_never_supersedes_background_old(hermes_home):
+    """The predicate requires BOTH records to be background-review proposals: a newer
+    foreground proposal never hides an older background one."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "origin guard entry")
+    old = _stage_remove("origin guard entry", "origin guard", created_at=1000.0)
+    _stage({"action": "replace", "target": "memory", "old_text": "origin guard",
+            "content": "fg rewrite", "matched_entry": "origin guard entry"},
+           origin="foreground", created_at=2000.0)
+    assert _status(old["id"])[0] is None
+    assert wa.classify_pending_memory(old, store) == "ready"
+
+
+def test_staging_and_classification_predicates_cannot_disagree(hermes_home):
+    """One predicate drives both: for every (old, new) pair of staged records, staging
+    marked old superseded IFF classification judges it superseded."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "witness one entry")
+    store.add("memory", "witness two entry")
+    old = _stage_remove("witness one entry", "witness one", created_at=1000.0)
+    _stage({"action": "replace", "target": "memory", "old_text": "witness one",
+            "content": "witness one v2", "matched_entry": "witness one entry"}, created_at=2000.0)
+    staged_status, _ = _status(old["id"])
+    classified = "superseded" if wa._is_superseded(old, wa.list_pending(wa.MEMORY), "memory") else None
+    assert staged_status == classified == "superseded"
+    # And the negative direction on a non-covered pair.
+    other = _stage_remove("witness two entry", "witness two", created_at=1500.0)
+    assert _status(other["id"])[0] is None
+    assert not wa._is_superseded(other, wa.list_pending(wa.MEMORY), "memory")
+
+
+# ---------------------------------------------------------------------------
 # reject semantics
 # ---------------------------------------------------------------------------
 
@@ -274,6 +439,24 @@ def test_reject_bulk_by_flag_marks_rejected_files_stay(hermes_home):
     out = handle_pending_subcommand(wa.MEMORY, ["reject", "--invalid"], memory_store=store)
     assert "Rejected 1" in out
     assert _status(bad["id"])[0] == "rejected"
+
+
+def test_reject_bulk_stale_without_prior_listing(hermes_home):
+    """Correction round regression: `/memory reject --stale` must operate on CURRENT
+    classification — a record whose pin drifted but was never re-classified (no prior
+    /memory pending run) is still bulk-rejected."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "never listed entry")
+    rec = _stage_remove("never listed entry", "never listed")
+    store.remove("memory", "never listed entry")  # drift AFTER staging; status still absent
+    assert _status(rec["id"])[0] is None  # nothing reclassified it yet
+
+    out = handle_pending_subcommand(wa.MEMORY, ["reject", "--stale"], memory_store=store)
+    assert "Rejected 1" in (out or "")
+    assert _status(rec["id"])[0] == "rejected"
+    assert wa._pending_path(wa.MEMORY, rec["id"]).exists()  # evidence kept
 
 
 def test_reject_rejected_records_invisible_in_pending(hermes_home):

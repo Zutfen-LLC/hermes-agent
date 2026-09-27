@@ -100,7 +100,7 @@ def handle_pending_subcommand(
     if sub in {"approve", "apply"}:
         return _approve(subsystem, rest, memory_store)
     if sub in {"reject", "deny", "drop"}:
-        return _reject(subsystem, rest)
+        return _reject(subsystem, rest, memory_store)
     if sub == "diff" and subsystem == wa.MEMORY:
         return _memory_diff(rest, memory_store)
     if sub == "diff" and subsystem == wa.SKILLS:
@@ -253,7 +253,10 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e), {}
 
 
-def _reject(subsystem: str, rest: List[str]) -> str:
+def _reject(subsystem: str, rest: List[str], memory_store=None) -> str:
+    """Reject pending records. Memory bulk flags (``--stale``/``--superseded``/``--invalid``)
+    operate on CURRENT classification — ``memory_store`` (present on every /memory surface)
+    drives a reclassify first, so no prior ``/memory pending`` run is needed."""
     if not rest:
         return _usage(subsystem)
     if subsystem != wa.MEMORY:
@@ -269,6 +272,15 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     flags = [a for a in rest if a.lower() in _BULK_REJECT_FLAGS]
     wants_all = any(a.lower() == "all" for a in rest)
     ids = [a for a in rest if a.lower() not in _BULK_REJECT_FLAGS and a.lower() != "all"]
+
+    if flags:
+        # Bulk flags operate on CURRENT classification, not on whatever statuses happen to
+        # be persisted: reclassify first (a store is loaded for the /memory surface) so
+        # `/memory reject --stale` works without a prior `/memory pending` run. A
+        # classification failure falls back to the persisted statuses alone.
+        if memory_store is not None:
+            with suppress(Exception):
+                wa.reclassify_pending_memory(memory_store, subsystem)
 
     n, missing = 0, []
     for flag in flags:

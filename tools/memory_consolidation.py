@@ -89,10 +89,16 @@ def _utc_now_iso() -> str:
 
 
 def record_begin(target: str, ops: List[Dict[str, Any]], before_raw: str,
-                 before_entries: List[str], origin: str = "background_review") -> str:
+                 before_entries: List[str], origin: str = "background_review",
+                 planned_after_raw: Optional[str] = None) -> str:
     """Snapshot the pre-mutation state BEFORE anything is applied. Fail-closed:
     raises MemoryConsolidationAuditError when the ledger cannot be written —
-    the caller must then refuse the consolidation entirely. Returns the audit id."""
+    the caller must then refuse the consolidation entirely. Returns the audit id.
+
+    ``planned_after_raw`` is the deterministic planned final state derived from the
+    validated plan against this exact before-state; its sha256 lands in the record as
+    ``planned_after_sha256`` — recovery evidence that lets a later undo prove the
+    consolidation committed even when the best-effort 'applied' append failed."""
     audit_id = uuid.uuid4().hex[:12]
     destructive = [
         {"action": op.get("action"),
@@ -109,8 +115,26 @@ def record_begin(target: str, ops: List[Dict[str, Any]], before_raw: str,
         "before_entries": list(before_entries or []),
         "before_sha256": _sha256(before_raw or ""),
     }
+    if planned_after_raw is not None:
+        record["planned_after_sha256"] = _sha256(planned_after_raw)
     _append_record(record)
     return audit_id
+
+
+def record_undone(audit_id: str, target: str, restored_sha256: str) -> None:
+    """Best-effort 'undone' audit event appended after a successful restore — durable
+    evidence that the transaction was reversed (an already-undone id restores as a
+    no-op, but the journal keeps its own record). Never fatal: the restore is already
+    durable in the store."""
+    record = {
+        "event": "undone", "id": audit_id, "ts": _utc_now_iso(), "target": target,
+        "restored_sha256": restored_sha256,
+    }
+    try:
+        _append_record(record)
+    except Exception:
+        logger.warning("Consolidation %s restored but its 'undone' audit event failed to "
+                       "persist.", audit_id, exc_info=True)
 
 
 def record_applied(audit_id: str, target: str, after_raw: str, counts: Dict[str, int]) -> None:
@@ -163,10 +187,27 @@ def list_records() -> List[Dict[str, Any]]:
 
 
 def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
-    """Undo one recorded consolidation as ONE atomic public batch (``apply_batch``)
-    against the CURRENT state: remove every entry that is present now but was not
-    in the recorded before-state, re-add every before entry that is missing now.
-    Idempotent; refuses cross-profile records and a batch that would empty the store."""
+    """Undo one recorded consolidation, fail-closed on the CURRENT state.
+
+    The transaction journal contract: the begin record carries ``before_sha256`` (and the
+    full before-state), an ``applied`` event (when its append succeeded) carries
+    ``after_sha256``, and the begin's ``planned_after_sha256`` (when planned deterministically)
+    is recovery evidence for the applied-append-failure case.
+
+    Decision table on the CURRENT raw store digest:
+
+    - current == before  -> idempotent no-op (never committed, or already restored);
+      memory is NOT rewritten.
+    - current == expected-after (applied.after_sha256, else planned_after_sha256)
+      -> the consolidation provably committed and nothing else changed since: restore the
+      exact before-state as ONE atomic public batch, then append a best-effort 'undone'
+      event. Repeated undo is the no-op above.
+    - anything else      -> REFUSE: memory changed since the consolidation (a later
+      legitimate write would be erased by an exact restore). Current memory stays
+      untouched; the audit id is returned for manual inspection.
+
+    Also refuses cross-profile records and an empty recorded before-state (the store
+    refuses emptying a non-empty file; that stays explicit rather than generic)."""
     record = get_record(audit_id)
     if record is None:
         return {"success": False,
@@ -177,13 +218,16 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
                 "error": (f"Audit record '{audit_id}' belongs to a different Hermes home "
                           f"({home}); refusing to restore into {get_hermes_home()}.")}
     target = record.get("target", "memory")
+    before_sha = record.get("before_sha256") or _sha256(record.get("before_raw") or "")
     before_entries = [e for e in (record.get("before_entries") or []) if e]
 
     store.load_from_disk()
-    current = list(store._entries_for(target))
+    current_raw = store._read_raw_checked(store._path_for(target))[0]
+    current_sha = _sha256(current_raw)
 
-    if current == before_entries:
-        return {"success": True, "message": "Already at the recorded state; nothing to restore."}
+    if current_sha == before_sha:
+        return {"success": True,
+                "message": "Already at the recorded before-state; nothing to restore."}
     if not before_entries:
         # Reaching an empty recorded state means removing every current entry; the
         # store already refuses emptying a non-empty file, so say so up front instead
@@ -193,6 +237,21 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
                           f"empty recorded state. Refusing — edit {store._path_for(target).name} "
                           f"manually if that is really intended.")}
 
+    # The expected committed after-state: the applied event when it landed, else the
+    # deterministic planned_after recorded in the begin (post-commit ledger-write-failure
+    # recovery — see the contract above).
+    events = [r for r in _read_ledger() if r.get("id") == audit_id]
+    applied = next((r for r in reversed(events) if r.get("event") == "applied"), None)
+    expected_after = (applied or {}).get("after_sha256") or record.get("planned_after_sha256")
+    if not expected_after or current_sha != expected_after:
+        return {"success": False,
+                "error": (f"Refusing to undo '{audit_id}': memory has changed since that "
+                          f"consolidation (current state matches neither the recorded "
+                          f"before-state nor its committed/planned after-state), so an exact "
+                          f"restore would erase those later changes. Memory is untouched; "
+                          f"inspect audit id '{audit_id}' and recover manually if intended.")}
+
+    current = list(store._entries_for(target))
     before_set, current_set = set(before_entries), set(current)
     survivors = [e for e in current if e in before_set]
     missing = [e for e in before_entries if e not in current_set]
@@ -210,6 +269,8 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
 
     result = store.apply_batch(target, ops)
     if isinstance(result, dict) and result.get("success"):
+        with suppress(Exception):  # best-effort journal evidence; the restore is durable
+            record_undone(audit_id, target, before_sha)
         result = {**result, "restored": audit_id,
                   "message": f"Restored memory to the state recorded before consolidation "
                              f"'{audit_id}'."}

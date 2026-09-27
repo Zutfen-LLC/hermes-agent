@@ -214,12 +214,30 @@ def _background_delete_gate(store, action, operations, target="memory", content=
 
 def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], detail: str) -> str:
     """Opt-in path (``memory.allow_unattended_consolidation``, #106919): an unattended
-    background-review fork applies destructive consolidation DIRECTLY, wrapped in the
-    same guarantees as an approved staged write — exact-entry pinning, the public atomic
-    store path, plus an audit snapshot taken BEFORE anything is applied (fail-closed: no
-    snapshot, no mutation) and an undo hint. ``/memory undo <audit_id>`` restores the
-    recorded before-state as one atomic batch."""
+    background-review fork applies destructive consolidation DIRECTLY, wrapped in the same
+    guarantees as an approved staged write — exact-entry pinning, the public atomic store
+    path, plus a fail-closed audit journal (no begin record, no mutation) and an undo hint.
+
+    One safety model for single-op and batch: a lone replace/remove is normalized into a
+    ONE-OP BATCH, so every autonomous commit flows through ``apply_batch`` with a
+    full-store expected-before precondition checked inside the store's mutation lock:
+
+    1. fresh authoritative load; snapshot the full raw before-state;
+    2. resolve the plan (pin every destructive op to its exact matched_entry; refusal on
+       a missing/ambiguous anchor is the store's own error, nothing applied);
+    3. dry-run the batch (``resolve_batch_entries``) — same content scan, op walk,
+       empty-store and final-budget checks the commit will run — and derive the
+       deterministic planned final raw state;
+    4. durably record the audit begin (fail-closed), carrying ``planned_after_sha256``;
+    5. commit via ``apply_batch(..., expected_before_raw=before_raw)``: if ANY part of
+       the store changed between snapshot and commit — including an unrelated entry —
+       the store refuses under the lock and NOTHING is applied.
+
+    ``/memory undo <audit_id>`` restores the recorded before-state; it proves from the
+    journal (before/applied/planned-after digests) that the consolidation committed and
+    that memory has not drifted since before touching anything."""
     from tools.memory_consolidation import MemoryConsolidationAuditError, record_applied, record_begin
+    from tools.memory_tool_store import ENTRY_DELIMITER
 
     target = payload.get("target", "memory")
     try:
@@ -229,24 +247,42 @@ def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], det
         before_raw = store._read_raw_checked(store._path_for(target))[0]
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched  # missing/ambiguous anchor: the store's own error, nothing applied
+        # Single-op normalization: one replace/remove becomes a one-op batch, so the
+        # commit, its validation and its precondition are ALWAYS the batch machinery.
+        ops = (list(payload.get("operations") or []) if payload.get("action") == "batch"
+               else [{k: payload[k] for k in ("action", "old_text", "content",
+                                              "matched_entry") if k in payload}])
+        single_op = payload.get("action") != "batch"
+        dry = store.resolve_batch_entries(target, ops, allow_empty=single_op)
+        if not dry.get("success"):
+            return json.dumps(dry, ensure_ascii=False)  # validation failure: nothing applied
+        planned_entries = _planned_final_entries(before_entries, ops)
+        if planned_entries is None:
+            return tool_error("Unattended consolidation refused: the planned final state could "
+                              "not be derived; nothing was applied.", success=False)
+        planned_after_raw = ENTRY_DELIMITER.join(planned_entries)
         try:
-            audit_id = record_begin(target, destructive_ops(payload), before_raw, before_entries)
+            audit_id = record_begin(target, destructive_ops(payload), before_raw, before_entries,
+                                    planned_after_raw=planned_after_raw)
         except MemoryConsolidationAuditError as e:
             return tool_error(f"Unattended consolidation refused: audit snapshot could not be "
                               f"created ({e}); nothing was applied.", success=False)
-        result = apply_memory_pending(payload, store)
+        result = store.apply_batch(target, ops, expected_before_raw=before_raw,
+                                   allow_empty=single_op)
         if not result.get("success"):
             # Fail closed; the begin record stays in the ledger as auditable evidence.
             return json.dumps(result, ensure_ascii=False)
-        if payload.get("action") == "batch":
-            replaced = result.get("replaced_entries") or {}
-            removed = result.get("removed_entries") or {}
-            counts = {"replaced": len(replaced), "removed": len(removed),
-                      "added": sum(1 for op in payload.get("operations") or []
-                                   if (op or {}).get("action") == "add")}
-        else:
-            counts = {"replaced": int(bool(result.get("replaced_entry"))),
-                      "removed": int(bool(result.get("removed_entry"))), "added": 0}
+        # The commit is always the batch machinery; translate its per-op extras back to
+        # the single-op field names the tool result has always carried (#117952).
+        replaced = dict(result.get("replaced_entries") or {})
+        removed = dict(result.get("removed_entries") or {})
+        if single_op:
+            if replaced:
+                result["replaced_entry"] = replaced.get(1)
+            if removed:
+                result["removed_entry"] = removed.get(1)
+        counts = {"replaced": len(replaced), "removed": len(removed),
+                  "added": sum(1 for op in ops if (op or {}).get("action") == "add")}
         with suppress(Exception):  # best-effort: the commit is already durable
             after_raw = store._read_raw_checked(store._path_for(target))[0]
             record_applied(audit_id, target, after_raw, counts)
@@ -268,6 +304,34 @@ def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], det
         return tool_error("Unattended consolidation failed safely; nothing was applied. "
                           "The operator can retry it in the foreground or via /memory.",
                           success=False)
+
+
+def _planned_final_entries(before_entries: List[str], ops: List[Dict[str, Any]]) -> Optional[List[str]]:
+    """Deterministically derive the planned final entry list of a PINNED batch against
+    ``before_entries`` — mirroring ``MemoryStore._apply_batch_op`` semantics (add appends
+    unless duplicate; replace/remove address the exact ``matched_entry``). None when an op
+    does not resolve: the caller must refuse rather than guess. The dry-run has already
+    validated the same walk; this derivation only computes what it validated."""
+    from tools.memory_tool_store import _find_unique_match
+
+    working = list(before_entries)
+    for op in ops or []:
+        op = op or {}
+        act, content = op.get("action"), (op.get("content") or op.get("new_text") or "").strip()
+        if act == "add":
+            if content and content not in working:
+                working.append(content)
+            continue
+        if act not in ("replace", "remove"):
+            return None
+        matched = op.get("matched_entry")
+        idx = (working.index(matched) if matched in working else None) if isinstance(matched, str) else None
+        if idx is None:
+            idx, ambiguous = _find_unique_match(working, (op.get("old_text") or "").strip())
+            if ambiguous or idx is None:
+                return None
+        working[idx:idx + 1] = [content] if act == "replace" else []
+    return working
 
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,

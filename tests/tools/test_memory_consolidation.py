@@ -229,8 +229,9 @@ class TestValidationFailClosed:
 
     def test_concurrent_target_drift_applies_nothing(self, store, monkeypatch):
         """A writer that changes the pinned entry AFTER the fresh load/pin and BEFORE the
-        commit makes the whole consolidation a no-op: the pinned replay re-reads disk under
-        the store lock and must fail closed rather than remove a different entry."""
+        commit makes the whole consolidation a no-op: the commit carries a full-store
+        precondition checked under the store lock, and the pinned replay re-reads disk —
+        either refuses rather than remove a different entry."""
         from tools import memory_consolidation as mc
         real_begin = mc.record_begin
 
@@ -247,6 +248,51 @@ class TestValidationFailClosed:
             r = json.loads(memory_tool(action="remove", old_text="entry pinned", store=store))
         assert r["success"] is False
         assert _disk_entries(store) == ["the entry was rewritten by someone else"]
+
+    def test_unrelated_entry_drift_between_audit_and_commit_applies_nothing(self, store, monkeypatch):
+        """THE audit-before-state invariant (correction round): an unrelated writer adds
+        an entry AFTER the audit snapshot and BEFORE the commit. The commit legitimately
+        would preserve it — but the audit 'before' does not contain it, so a later undo
+        would erase it. The full-store precondition refuses the WHOLE commit under the
+        lock: nothing is applied, the concurrent write stays."""
+        from tools import memory_consolidation as mc
+        real_begin = mc.record_begin
+
+        def unrelated_write_then_begin(target, ops, before_raw, before_entries, **kwargs):
+            # A concurrent session adds an entry the consolidation never touches.
+            path = store._path_for(target)
+            path.write_text(before_raw + "\n§\nwritten by an unrelated session", encoding="utf-8")
+            return real_begin(target, ops, before_raw, before_entries, **kwargs)
+
+        monkeypatch.setattr(mc, "record_begin", unrelated_write_then_begin)
+        _set_flag(True)
+        store.add("memory", "consolidation target entry")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="consolidation target", store=store))
+        assert r["success"] is False
+        entries = _disk_entries(store)
+        assert "consolidation target entry" in entries  # the remove did NOT apply
+        assert "written by an unrelated session" in entries  # the concurrent write survives
+
+    def test_targeted_entry_drift_applies_nothing(self, store, monkeypatch):
+        """Targeted drift (the pinned entry itself changes) is equally refused by the
+        same full-store precondition — covered separately from the unrelated-entry case."""
+        from tools import memory_consolidation as mc
+        real_begin = mc.record_begin
+
+        def rewrite_target_then_begin(target, ops, before_raw, before_entries, **kwargs):
+            store._path_for(target).write_text(
+                before_raw.replace("drifting entry", "drifting entry (edited concurrently)"),
+                encoding="utf-8")
+            return real_begin(target, ops, before_raw, before_entries, **kwargs)
+
+        monkeypatch.setattr(mc, "record_begin", rewrite_target_then_begin)
+        _set_flag(True)
+        store.add("memory", "drifting entry")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="drifting", store=store))
+        assert r["success"] is False
+        assert _disk_entries(store) == ["drifting entry (edited concurrently)"]
 
     def test_concurrent_batch_drift_applies_nothing(self, store, monkeypatch):
         """Batch variant: one drifted pinned entry voids the entire batch (all-or-nothing)."""
@@ -380,7 +426,7 @@ class TestRecovery:
         assert restore(r["audit_id"], store)["success"] is True
         again = restore(r["audit_id"], store)
         assert again["success"] is True
-        assert "Already at the recorded state" in again["message"]
+        assert "Already at the recorded before-state" in again["message"]
         assert _disk_entries(store) == ["sole entry removed then restored"]
 
     def test_restore_refuses_foreign_profile(self, store):
@@ -415,6 +461,180 @@ class TestRecovery:
         assert _disk_entries(store) == ["second original entry", "fresh fork conclusion"]
         assert restore(r["audit_id"], store)["success"] is True
         assert _disk_entries(store) == before  # exact, order included
+
+
+# =========================================================================
+# Correction round: the undo current-state precondition (transaction journal)
+# =========================================================================
+
+class TestUndoCurrentStatePrecondition:
+    """restore() must PROVE the consolidation committed and that memory has not drifted
+    since: begin-only (never committed / mutation failed) is a no-op; committed+drifted is
+    REFUSED with current memory untouched; only current==expected-after restores."""
+
+    def _applied_removal(self, store, victim="victim entry for undo"):
+        _set_flag(True)
+        store.add("memory", victim)
+        store.add("memory", "keeper entry for undo")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text=victim[:14], store=store))
+        assert r["success"] is True, r
+        return r["audit_id"]
+
+    def test_begin_only_record_undo_changes_nothing(self, store, monkeypatch):
+        """Begin record + mutation failed => /memory undo <id> changes nothing. The
+        reviewed implementation restored the before-state from the begin record alone,
+        mutating memory for a transaction that never committed."""
+        from tools import memory_consolidation as mc
+        real_begin = mc.record_begin
+        real_apply_batch = MemoryStore.apply_batch
+
+        def refuse(*a, **kw):
+            return {"success": False, "error": "commit failed (simulated)"}
+
+        def begin_then_fail_apply(target, ops, before_raw, before_entries, **kwargs):
+            audit_id = real_begin(target, ops, before_raw, before_entries, **kwargs)
+            # Simulate the commit failing after the audit begin was durably recorded.
+            # Patched on the CLASS (memory_tool imports the symbol into the module
+            # under test) so both the consolidation path and restore() see it.
+            monkeypatch.setattr(MemoryStore, "apply_batch", refuse)
+            return audit_id
+
+        monkeypatch.setattr(mc, "record_begin", begin_then_fail_apply)
+        _set_flag(True)
+        store.add("memory", "entry a begin only")
+        store.add("memory", "entry b begin only")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="entry a", store=store))
+        assert r["success"] is False
+        # Find the begin-only id from the ledger (read while the patches are still
+        # active; monkeypatch.undo() would ALSO undo the home fixture's HERMES_HOME).
+        ledger_ids = [rec["id"] for rec in mc.list_records() if rec.get("event") == "begin"]
+        assert ledger_ids
+        monkeypatch.setattr(MemoryStore, "apply_batch", real_apply_batch)
+        result = mc.restore(ledger_ids[0], store)
+        assert result["success"] is True
+        assert "nothing to restore" in result["message"]
+        # Nothing was committed, nothing was rewritten.
+        assert _disk_entries(store) == ["entry a begin only", "entry b begin only"]
+
+    def test_begin_only_current_equals_before_is_noop_not_restore(self, store):
+        """A failed consolidation intentionally leaves its begin record behind; current
+        memory equals before, so undo must be an idempotent no-op — no rewrite at all."""
+        from tools import memory_consolidation as mc
+        _set_flag(True)
+        store.add("memory", "survivor of failed consolidation")
+        store.add("memory", "doomed by nothing")
+        before_raw = store._read_raw_checked(store._path_for("memory"))[0]
+        audit_id = mc.record_begin("memory", [{"action": "remove", "old_text": "doomed",
+                                               "matched_entry": "doomed by nothing"}],
+                                   before_raw, list(store._entries_for("memory")))
+        # No apply ever happened; current raw is still the before raw.
+        result = mc.restore(audit_id, store)
+        assert result["success"] is True
+        assert "nothing to restore" in result["message"]
+        assert store._read_raw_checked(store._path_for("memory"))[0] == before_raw
+
+    def test_committed_current_equals_after_restores_exact_before(self, store):
+        from tools.memory_consolidation import restore
+        audit_id = self._applied_removal(store, victim="alpha undo target")
+        assert _disk_entries(store) == ["keeper entry for undo"]
+        result = restore(audit_id, store)
+        assert result["success"] is True, result
+        assert _disk_entries(store) == ["alpha undo target", "keeper entry for undo"]  # exact, order included
+
+    def test_committed_then_later_unrelated_add_undo_refused(self, store):
+        from tools.memory_consolidation import restore
+        audit_id = self._applied_removal(store)
+        assert _disk_entries(store) == ["keeper entry for undo"]
+        # A later legitimate write lands after the consolidation.
+        assert store.add("memory", "later unrelated add")["success"]
+        drifted = _disk_entries(store)
+        result = restore(audit_id, store)
+        assert result["success"] is False
+        assert "changed since" in result["error"]
+        assert audit_id in result["error"]  # audit id surfaced for manual recovery
+        assert _disk_entries(store) == drifted  # the later add is preserved, untouched
+
+    def test_committed_then_later_unrelated_replace_undo_refused(self, store):
+        from tools.memory_consolidation import restore
+        audit_id = self._applied_removal(store)
+        assert store.replace("memory", "keeper entry", "keeper entry (later edit)")["success"]
+        drifted = _disk_entries(store)
+        result = restore(audit_id, store)
+        assert result["success"] is False
+        assert "changed since" in result["error"]
+        assert _disk_entries(store) == drifted  # the later replace is preserved
+
+    def test_applied_append_failure_planned_after_recovery(self, store, monkeypatch):
+        """Post-commit ledger-write failure: the 'applied' event never lands, but the
+        begin carries planned_after_sha256; when current memory EXACTLY equals that
+        planned after-state, safe undo remains possible (recovery evidence adopted)."""
+        from tools import memory_consolidation as mc
+        real_applied = mc.record_applied
+
+        def failing_applied(*a, **kw):
+            raise mc.MemoryConsolidationAuditError("ledger append failed (simulated)")
+
+        monkeypatch.setattr(mc, "record_applied", failing_applied)
+        _set_flag(True)
+        store.add("memory", "planned after keeper")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="planned after", store=store))
+        assert r["success"] is True, r  # the commit is durable; only the ledger append failed
+        # Restore the real record_applied WITHOUT monkeypatch.undo() (it would also undo
+        # the home fixture's HERMES_HOME and point the ledger read at the real ~/.hermes).
+        mc.record_applied = real_applied
+        assert _disk_entries(store) == []
+        result = mc.restore(r["audit_id"], store)
+        assert result["success"] is True, result
+        assert _disk_entries(store) == ["planned after keeper"]  # exactly the before-state
+
+    def test_wrong_profile_refused(self, store):
+        from tools import memory_consolidation as _mc
+        audit_id = self._applied_removal(store)
+        from tools.memory_consolidation import _ledger_path
+        lines = _ledger_path().read_text(encoding="utf-8").splitlines()
+        rewrote = False
+        for i, line in enumerate(lines):
+            rec = json.loads(line)
+            if rec.get("id") == audit_id:
+                rec["hermes_home"] = "/somewhere/else/.hermes"
+                lines[i] = json.dumps(rec, ensure_ascii=False)
+                rewrote = True
+        assert rewrote
+        _ledger_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
+        after = _disk_entries(store)
+        result = _mc.restore(audit_id, store)
+        assert result["success"] is False
+        assert "different Hermes home" in result["error"]
+        assert _disk_entries(store) == after
+
+    def test_empty_before_state_refusal_stays_explicit(self, store):
+        """An empty recorded before-state keeps its explicit refusal (restoring would
+        empty the store) rather than a generic undo error."""
+        from tools import memory_consolidation as mc
+        store.add("memory", "only entry now")
+        audit_id = mc.record_begin("memory", [], "", [])  # empty before-state record
+        result = mc.restore(audit_id, store)
+        assert result["success"] is False
+        assert "empty recorded state" in result["error"]
+        assert _disk_entries(store) == ["only entry now"]
+
+    def test_repeated_undo_noop_no_corruption(self, store):
+        from tools.memory_consolidation import list_records, restore
+        audit_id = self._applied_removal(store)
+        first = restore(audit_id, store)
+        assert first["success"] is True
+        expected = _disk_entries(store)
+        for _ in range(3):
+            again = restore(audit_id, store)
+            assert again["success"] is True
+            assert "nothing to restore" in again["message"]
+        assert _disk_entries(store) == expected
+        # The journal recorded the undo.
+        assert any(rec.get("event") == "undone" and rec.get("id") == audit_id
+                   for rec in list_records())
 
 
 # =========================================================================
