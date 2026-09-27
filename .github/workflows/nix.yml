@@ -12,6 +12,11 @@ name: Nix flake check
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Require the flake-check lane for a sync candidate.'
+        type: boolean
+        default: false
   pull_request:
   push:
     branches: [main]

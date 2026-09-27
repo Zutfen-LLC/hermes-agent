@@ -17,6 +17,7 @@ on:
       - ".github/workflows/ci.yaml"
       - ".github/workflows/nix.yml"
       - "scripts/ci/fork_ci_policy.py"
+      - "scripts/ci/upstream_sync_report.py"
 
 permissions:
   contents: write
@@ -35,6 +36,8 @@ env:
 jobs:
   prepare:
     name: Build merge candidate
+    # A promotion can change these paths. Its committer identifies the sync's own push.
+    if: github.event_name != 'push' || github.event.head_commit.committer.email != 'upstream-sync@users.noreply.github.com'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -76,22 +79,8 @@ jobs:
           fi
 
           report_blocker() {
-            # $1 is the headline; the remaining args are markdown detail lines.
             echo "::error::$1"
             { echo "### Upstream sync blocked: $1"; printf '%s\n' "${@:2}"; } >> "$GITHUB_STEP_SUMMARY"
-            if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != true ]; then
-              echo "::warning::Issues are disabled on $GITHUB_REPOSITORY; this failed run is the only report."
-              return 0
-            fi
-            local body existing
-            body="$(printf '%s\n' "$1" "" "${@:2}")"
-            existing="$(gh issue list --state open --limit 100 --json number,title \
-              --jq '.[] | select(.title == env.BLOCKER_TITLE) | .number' | head -n 1)"
-            if [ -n "$existing" ]; then
-              gh issue comment "$existing" --body "$body" >/dev/null
-            else
-              gh issue create --title "$BLOCKER_TITLE" --body "$body" >/dev/null
-            fi
           }
 
           git checkout -B "$SYNC_BRANCH" "$BASE_SHA"
@@ -136,6 +125,7 @@ jobs:
           fi
 
           CANDIDATE_SHA="$(git rev-parse HEAD)"
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
 
           # Fork invariants: upstream changes may evolve delegation and CI, but
           # automatic promotion must never silently remove our compute-selection
@@ -153,7 +143,6 @@ jobs:
           # force-pushed, and concurrency guarantees one sync writer at a time.
           git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
 
-          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
           echo "needed=true" >> "$GITHUB_OUTPUT"
           {
             echo "### Upstream merge candidate"
@@ -167,6 +156,9 @@ jobs:
     runs-on: ubuntu-latest
     # Sliced unit suite, Windows, e2e and desktop lanes on standard runners.
     timeout-minutes: 180
+    outputs:
+      ci_run_id: ${{ steps.dispatch.outputs.ci_run_id }}
+      nix_run_id: ${{ steps.dispatch.outputs.nix_run_id }}
     env:
       GH_TOKEN: ${{ github.token }}
       CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
@@ -177,8 +169,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh workflow run ci.yaml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"
-          gh workflow run nix.yml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"
+          DISPATCH_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           find_run() {
             local workflow="$1"
@@ -190,8 +181,8 @@ jobs:
                 --branch "$SYNC_BRANCH" \
                 --event workflow_dispatch \
                 --limit 30 \
-                --json databaseId,headSha \
-                --jq ".[] | select(.headSha == \"$CANDIDATE_SHA\") | .databaseId" \
+                --json databaseId,headSha,createdAt \
+                --jq ".[] | select(.headSha == \"$CANDIDATE_SHA\" and .createdAt >= \"$DISPATCH_STARTED\") | .databaseId" \
                 | head -n 1)"
               if [ -n "$run_id" ]; then
                 printf '%s' "$run_id"
@@ -202,16 +193,19 @@ jobs:
             return 1
           }
 
+          # Strict mode forces the required lanes and rejects unexpected skipped jobs.
+          gh workflow run ci.yaml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH" -f release=true
           CI_RUN_ID="$(find_run ci.yaml)" || {
             echo "::error::Could not find dispatched CI run for $CANDIDATE_SHA"
             exit 1
           }
+          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
+          gh workflow run nix.yml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH" -f release=true
           NIX_RUN_ID="$(find_run nix.yml)" || {
             echo "::error::Could not find dispatched Nix run for $CANDIDATE_SHA"
             exit 1
           }
 
-          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "nix_run_id=$NIX_RUN_ID" >> "$GITHUB_OUTPUT"
 
           {
@@ -221,11 +215,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Require CI green
+        if: always() && steps.dispatch.outputs.ci_run_id != ''
         env:
           RUN_ID: ${{ steps.dispatch.outputs.ci_run_id }}
         run: gh run watch "$RUN_ID" -R "$GITHUB_REPOSITORY" --exit-status --interval 10
 
       - name: Require Nix green
+        if: always() && steps.dispatch.outputs.nix_run_id != ''
         env:
           RUN_ID: ${{ steps.dispatch.outputs.nix_run_id }}
         run: gh run watch "$RUN_ID" -R "$GITHUB_REPOSITORY" --exit-status --interval 10
@@ -236,6 +232,8 @@ jobs:
     if: needs.prepare.outputs.needed == 'true' && needs.validate.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      promoted: ${{ steps.promote.outputs.promoted }}
     steps:
       - name: Checkout fork main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -244,6 +242,7 @@ jobs:
           fetch-depth: 0
 
       - name: Fast-forward main to the validated SHA
+        id: promote
         env:
           BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
           UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
@@ -270,6 +269,7 @@ jobs:
 
           # This is a fast-forward from the exact base that was validated.
           git push origin "$CANDIDATE_SHA:refs/heads/main"
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
           git push origin --delete "$SYNC_BRANCH" >/dev/null 2>&1 || true
 
           {
@@ -278,18 +278,21 @@ jobs:
             echo "- validation: CI + Nix green"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Close resolved blocker issue
+  report:
+    name: Report sync outcome
+    needs: [prepare, validate, promote]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout reporting code from the original run commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Report failures and close resolved blockers
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != true ]; then
-            exit 0
-          fi
-          issue="$(gh issue list --state open --limit 100 --json number,title \
-            --jq '.[] | select(.title == env.BLOCKER_TITLE) | .number' | head -n 1 || true)"
-          if [ -n "$issue" ]; then
-            gh issue close "$issue" \
-              --comment "Validated upstream sync succeeded and was promoted to main." || true
-          fi
+          SYNC_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/upstream_sync_report.py

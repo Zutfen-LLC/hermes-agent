@@ -272,13 +272,7 @@ try { Install-HermesArm64OpenSSL -Vcpkg 'fixture-vcpkg' -Root $Root } catch {
 if (-not $rejected -or $calls -ne 2) { throw 'damaged install was accepted' }
 Write-Output 'PASS'
 ''', encoding="utf-8")
-    env = dict(os.environ)
-    env.setdefault("SystemRoot", r"C:\Windows")
-    shell = shutil.which("powershell") or str(Path(env["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
-    result = subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), str(HELPER), str(tmp_path)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=30,
-    )
+    result = _powershell(script, HELPER, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS" in result.stdout
 
@@ -315,14 +309,6 @@ $executable = $resolved
 if ($executable -isnot [string] -or $executable.Contains(' ')) { throw "joined path leaked: $executable" }
 Write-Output 'PASS'
 ''', encoding="utf-8")
-    env = dict(os.environ)
-    env.setdefault("SystemRoot", r"C:\Windows")
-    env.setdefault("ComSpec", str(Path(env["SystemRoot"]) / "System32/cmd.exe"))
-    env.setdefault("PATHEXT", ".COM;.EXE;.BAT;.CMD")
-    shell = shutil.which("powershell") or str(Path(env["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")
-    result = subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), str(HELPER), str(tmp_path)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=30,
-    )
+    result = _powershell(script, HELPER, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS" in result.stdout

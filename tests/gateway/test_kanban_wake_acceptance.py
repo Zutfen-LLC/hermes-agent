@@ -33,8 +33,21 @@ def setup_route(raft=False):
 
 
 async def drain(adapter):
-    while adapter._background_tasks:
-        await asyncio.gather(*list(adapter._background_tasks))
+    async with asyncio.timeout(10):
+        while adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+            # Python 3.14 can gather completed tasks without running their cleanup callbacks.
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_drain_runs_cleanup_callbacks_for_completed_tasks():
+    _, adapter, _, key = setup_route()
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    assert adapter._track_session_task(key, task)
+    await drain(adapter)
+    assert not adapter._background_tasks
 
 
 @pytest.mark.asyncio

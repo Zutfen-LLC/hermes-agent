@@ -83,7 +83,9 @@ _RULES: dict[str, tuple] = {
         # The sync dispatches Nix on the exact candidate commit.
         Replace("nix: workflow_dispatch trigger",
                 "on:\n  pull_request:\n",
-                "on:\n  workflow_dispatch:\n  pull_request:\n"),
+                "on:\n  workflow_dispatch:\n    inputs:\n      release:\n"
+                "        description: 'Require the flake-check lane for a sync candidate.'\n"
+                "        type: boolean\n        default: false\n  pull_request:\n"),
     ),
     "tests.yml": (
         # One quarter of the suite per 4-vCPU runner instead of one 96-core runner.
@@ -97,14 +99,9 @@ _RULES: dict[str, tuple] = {
         Replace("tests: unit job bound",
                 "    runs-on: ubuntu-latest-96-core\n    timeout-minutes: 30\n",
                 "    runs-on: ubuntu-latest\n    timeout-minutes: 45\n"),
-        # The deselected case hangs on 4 vCPUs: a finished message task stays in
-        # the adapter's _background_tasks after its discard callback ran, so the
-        # test's drain() spins forever (~1 in 10 locally when pinned to 2 cores).
         Replace("tests: sliced run",
                 "          scripts/run_tests.sh\n        env:\n",
-                "          scripts/run_tests.sh --slice ${{ matrix.slice }}/4 -j 4 -- --deselect \\\n"
-                "            'tests/gateway/test_kanban_wake_acceptance.py::"
-                "test_suppressed_ping_has_no_sent_receipt_but_wake_executes'\n        env:\n"),
+                "          scripts/run_tests.sh --slice ${{ matrix.slice }}/4 -j 4\n        env:\n"),
         Replace("tests: unit workers", "HERMES_TEST_WORKERS: 96\n", "HERMES_TEST_WORKERS: 4\n"),
         # Four slices restoring whichever slice saved last would slice the suite
         # differently per job; without the cache every slice splits by file count.
@@ -123,21 +120,6 @@ _RULES: dict[str, tuple] = {
                 'HERMES_TEST_WORKERS: "2"\n          HERMES_TEST_FILE_TIMEOUT: "3000"\n'),
     ),
     "tests-os.yml": (
-        # Cases that fail reliably on the standard windows-latest x64 image and pass
-        # on upstream's private image and the hosted arm64 runner (which still runs
-        # them): psutil reports a CREATE_SUSPENDED child as running there, and the
-        # openssl fixture script outlives its 30s budget in PowerShell start-up alone.
-        Replace("tests-os: skip suspended-status cases on hosted x64",
-                "          EXTRA_ARGS=()\n",
-                "          EXTRA_ARGS=()\n"
-                "          if [ \"$RUNNER_OS\" = Windows ] && [ \"$RUNNER_ARCH\" = X64 ]; then\n"
-                "            for case in assign resume; do\n"
-                "              EXTRA_ARGS+=(--deselect \"tests/hermes_cli/test_local_runtime_processes.py::"
-                "test_failed_setup_never_runs_child_and_releases_handles[$case]\")\n"
-                "            done\n"
-                "            EXTRA_ARGS+=(--deselect \"tests/pm/test_windows_build_deps.py::"
-                "test_openssl_installs_once_and_rejects_damaged_shared_install\")\n"
-                "          fi\n"),
         # Upstream sizes Windows x64 concurrency for 32 cores; on 4 vCPUs 8 and 6
         # concurrent files starve PowerShell and taskkill deadlines. The hosted
         # arm64 lane already runs at 2 and passes.
