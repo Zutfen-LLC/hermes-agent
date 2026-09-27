@@ -120,7 +120,7 @@ def slugify(s: str, maxlen: int = 48) -> str:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     base, key = _creds()
-    text = open(args.library, encoding="utf-8").read()
+    text = open(args.library, encoding="utf-8-sig").read()
     lessons = parse_lessons(text)
     if not lessons:
         print(f"no lesson blocks parsed from {args.library}", file=sys.stderr)
