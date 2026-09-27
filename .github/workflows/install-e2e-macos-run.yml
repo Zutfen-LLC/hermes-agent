@@ -78,12 +78,8 @@ permissions:
 jobs:
   # ---- arm 1: script installs (the shared OS-agnostic driver) --------------
   e2e:
+    if: false # Fork supports Linux only.
     name: install & update
-    if: >-
-      (inputs.install-method == 'installer-script'
-        || (inputs.install-method == 'installer-script+desktop' && inputs.tag-has-desktop))
-      && (contains(fromJSON('["hermes-update", "installer-script"]'), inputs.update-method)
-        || (contains(fromJSON('["installer-script+desktop", "hermes-desktop-app-update"]'), inputs.update-method) && inputs.tag-has-desktop))
     uses: ./.github/workflows/install-e2e-run.yml
     with:
       install-method: ${{ inputs.install-method }}
@@ -97,12 +93,10 @@ jobs:
 
   # ---- arm 2: the published dmg, then Playwright drives the app ------------
   gui-e2e:
+    if: false # Fork supports Linux only.
     # Short static name on purpose: name expressions render UNEXPANDED on
     # skipped jobs.
     name: Hermes-Setup.dmg
-    if: >-
-      inputs.install-method == 'desktop-installer@latest' && inputs.tag-has-desktop
-      && contains(fromJSON('["open-app-update", "hermes-desktop-app-update", "hermes-update", "installer-script", "installer-script+desktop"]'), inputs.update-method)
     runs-on: macos-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
@@ -202,8 +196,8 @@ jobs:
   # The driver itself re-guards on Darwin + GITHUB_ACTIONS and refuses to
   # run anywhere native coverage would be fake.
   bundled-e2e:
+    if: false # Fork supports Linux only.
     name: packaged bundle (open-app-update)
-    if: inputs.install-method == 'packaged-app' && inputs.update-method == 'open-app-update'
     runs-on: ${{ inputs.bundle-arch == 'x64' && 'macos-15-intel' || 'macos-15' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 

@@ -249,8 +249,8 @@ jobs:
           node tests/install/e2e-assets/bundle-plan.mjs
 
   windows-bundled:
+    if: false # Fork supports Linux only.
     name: ${{ matrix.name }}
-    if: inputs.windows-bundle-manifest != '' && contains(fromJSON('["all", "bundled", "windows-bundled"]'), inputs.route)
     needs: bundle-inputs
     strategy:
       fail-fast: false
@@ -265,8 +265,8 @@ jobs:
       bundle-arch: ${{ needs.bundle-inputs.outputs.windows-arch }}
 
   macos-bundled:
+    if: false # Fork supports Linux only.
     name: ${{ matrix.name }}
-    if: inputs.macos-bundle-manifest != '' && contains(fromJSON('["all", "bundled", "macos-bundled"]'), inputs.route)
     needs: bundle-inputs
     strategy:
       fail-fast: false
@@ -301,8 +301,8 @@ jobs:
       leg-id: ${{ matrix.leg_id }}
 
   windows:
+    if: false # Fork supports Linux only.
     name: ${{ matrix.name }}
-    if: needs.generate-matrix.outputs.windows-legs != '0'
     needs: generate-matrix
     strategy:
       fail-fast: false
@@ -317,8 +317,8 @@ jobs:
       leg-id: ${{ matrix.leg_id }}
 
   macos:
+    if: false # Fork supports Linux only.
     name: ${{ matrix.name }}
-    if: needs.generate-matrix.outputs.macos-legs != '0'
     needs: generate-matrix
     strategy:
       fail-fast: false

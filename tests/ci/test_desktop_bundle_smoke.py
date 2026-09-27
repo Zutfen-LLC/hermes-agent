@@ -72,7 +72,10 @@ def test_native_consumers_and_publication_fail_closed_across_trust_skips(tmp_pat
             needs.update({leg: {'result': 'skipped'} for leg in legs.values() if leg not in needs})
             if gate(job['if'], inputs, needs):
                 admitting.append((dispatch, inputs, needs))
-        assert admitting, f'{name} never runs for a downloadable build'
+        if str(job['if']).lower() == 'false':
+            assert not admitting, f'{name} is disabled but admits a downloadable build'
+        else:
+            assert admitting, f'{name} never runs for a downloadable build'
         for dispatch, inputs, needs in admitting:
             assert not gate(job['if'], inputs, needs, cancelled=True), (name, dispatch)
             for dependency in needs_of(job):
@@ -96,7 +99,8 @@ def test_native_consumers_and_publication_fail_closed_across_trust_skips(tmp_pat
         ]:
             inputs = {**base_inputs, 'release-phase': phase, 'build_commit': commit,
                       'upload_release': upload}
-            assert gate(jobs[name]['if'], inputs, needs) is allowed, (name, inputs)
+            expected = allowed and str(jobs[name]['if']).lower() != 'false'
+            assert gate(jobs[name]['if'], inputs, needs) is expected, (name, inputs)
     # A group the caller did not select stays skipped; its consumers refuse.
     for name in scope_jobs:
         assert not gate(jobs[name]['if'], base_inputs,

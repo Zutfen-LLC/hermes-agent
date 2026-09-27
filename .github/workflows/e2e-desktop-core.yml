@@ -24,7 +24,6 @@ concurrency:
 jobs:
   core:
     name: Desktop core E2E (Linux)
-    # Fork: standard hosted runner instead of upstream's private 32-core image.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

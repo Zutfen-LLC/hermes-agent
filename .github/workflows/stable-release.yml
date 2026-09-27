@@ -92,11 +92,9 @@ jobs:
       version: ${{ needs.admit.outputs.version }}
 
   pm-bundle:
+    if: false # Fork supports Linux only.
     needs: admit
     # Bundle acceptance is a test of bundles, so either claim flag removes it.
-    if: >-
-      needs.admit.outputs.skip-bundles != 'true'
-      && needs.admit.outputs.skip-tests != 'true'
     uses: ./.github/workflows/pm-bundle.yml
     with:
       release: true
@@ -113,8 +111,8 @@ jobs:
       release: true
 
   windows-live:
+    if: false # Fork supports Linux only.
     needs: admit
-    if: needs.admit.outputs.skip-tests != 'true'
     uses: ./.github/workflows/windows-venv-e2e.yml
     with:
       release: true
@@ -134,11 +132,10 @@ jobs:
       exclude-ref: ${{ inputs.tag }}
 
   candidates-darwin-arm64:
+    if: false # Fork supports Linux only.
     name: Build signed release candidates (darwin-arm64)
     needs: admit
     # Starts with the gates; the acceptance join is what requires CI.
-    if: >-
-      !cancelled() && needs.admit.result == 'success' && needs.admit.outputs.skip-bundles != 'true'
     permissions:
       contents: write
       actions: read
@@ -154,11 +151,10 @@ jobs:
       skip-tests: ${{ needs.admit.outputs.skip-tests == 'true' }}
 
   candidates-darwin-x64:
+    if: false # Fork supports Linux only.
     name: Build signed release candidates (darwin-x64)
     needs: admit
     # Starts with the gates; the acceptance join is what requires CI.
-    if: >-
-      !cancelled() && needs.admit.result == 'success' && needs.admit.outputs.skip-bundles != 'true'
     permissions:
       contents: write
       actions: read
@@ -174,11 +170,10 @@ jobs:
       skip-tests: ${{ needs.admit.outputs.skip-tests == 'true' }}
 
   candidates-win32-arm64:
+    if: false # Fork supports Linux only.
     name: Build signed release candidates (win32-arm64)
     needs: admit
     # Starts with the gates; the acceptance join is what requires CI.
-    if: >-
-      !cancelled() && needs.admit.result == 'success' && needs.admit.outputs.skip-bundles != 'true'
     permissions:
       contents: write
       actions: read
@@ -194,11 +189,10 @@ jobs:
       skip-tests: ${{ needs.admit.outputs.skip-tests == 'true' }}
 
   candidates-win32-x64:
+    if: false # Fork supports Linux only.
     name: Build signed release candidates (win32-x64)
     needs: admit
     # Starts with the gates; the acceptance join is what requires CI.
-    if: >-
-      !cancelled() && needs.admit.result == 'success' && needs.admit.outputs.skip-bundles != 'true'
     permissions:
       contents: write
       actions: read
@@ -214,13 +208,10 @@ jobs:
       skip-tests: ${{ needs.admit.outputs.skip-tests == 'true' }}
 
   candidates-win32-bundle:
+    if: false # Fork supports Linux only.
     name: Build signed release candidates (win32-bundle)
     needs: [admit, candidates-win32-arm64, candidates-win32-x64]
     # Starts with the gates; the acceptance join is what requires CI.
-    if: >-
-      !cancelled() && needs.admit.result == 'success' && needs.admit.outputs.skip-bundles != 'true'
-      && needs.candidates-win32-arm64.result == 'success'
-      && needs.candidates-win32-x64.result == 'success'
     permissions:
       contents: write
       actions: read
@@ -256,9 +247,9 @@ jobs:
       skip-tests: ${{ needs.admit.outputs.skip-tests == 'true' }}
 
   transitions-darwin-arm64:
+    if: false # Fork supports Linux only.
     name: Pin actual OLD and NEW signed packages (darwin-arm64)
     needs: [admit, candidates-darwin-arm64]
-    if: needs.admit.outputs.skip-tests != 'true'
     runs-on: ubuntu-24.04
     environment: release-signing
     outputs:
@@ -290,9 +281,9 @@ jobs:
           CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
 
   transitions-darwin-x64:
+    if: false # Fork supports Linux only.
     name: Pin actual OLD and NEW signed packages (darwin-x64)
     needs: [admit, candidates-darwin-x64]
-    if: needs.admit.outputs.skip-tests != 'true'
     runs-on: ubuntu-24.04
     environment: release-signing
     outputs:
@@ -324,9 +315,9 @@ jobs:
           CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
 
   transitions-win32:
+    if: false # Fork supports Linux only.
     name: Pin actual OLD and NEW signed packages (win32)
     needs: [admit, candidates-win32-bundle]
-    if: needs.admit.outputs.skip-tests != 'true'
     runs-on: ubuntu-24.04
     environment: release-signing
     outputs:
@@ -395,6 +386,7 @@ jobs:
         run: python -m scripts.releases.stable candidate-manifest
 
   windows-packaged:
+    if: false # Fork supports Linux only.
     name: Windows signed-package acceptance
     needs: transitions-win32
     strategy:
@@ -411,6 +403,7 @@ jobs:
       bundle-arch: ${{ matrix.arch }}
 
   macos-packaged-arm64:
+    if: false # Fork supports Linux only.
     name: macOS arm64 signed-package acceptance
     needs: transitions-darwin-arm64
     strategy:
@@ -427,6 +420,7 @@ jobs:
       bundle-arch: ${{ matrix.arch }}
 
   macos-packaged-x64:
+    if: false # Fork supports Linux only.
     name: macOS x64 signed-package acceptance
     needs: transitions-darwin-x64
     strategy:
