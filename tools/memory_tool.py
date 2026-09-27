@@ -242,9 +242,21 @@ def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], det
     target = payload.get("target", "memory")
     try:
         # Fresh authoritative view: pin, snapshot and budget all judge the same disk state.
+        # ONE raw snapshot is the authority for EVERYTHING derived about the before-state:
+        # read success, before_entries (the store's canonical parse/dedup of exactly that
+        # raw), the pin/dry-run working view, the audit before_raw/before_sha256 and the
+        # planned-after calculation. Independent reads could straddle a concurrent writer
+        # and record a begin mixing two states (entries from S0, digest of S1) — the
+        # eventual commit would then legitimately land against S1 while the rollback
+        # payload still describes S0, and undo could erase the concurrent change.
         store.load_from_disk()
-        before_entries = list(store._entries_for(target))
-        before_raw = store._read_raw_checked(store._path_for(target))[0]
+        path = store._path_for(target)
+        before_raw, read_ok = store._read_raw_checked(path)
+        if not read_ok:
+            from tools.memory_tool_store import _read_failed_error
+            return json.dumps(_read_failed_error(path), ensure_ascii=False)
+        before_entries = list(dict.fromkeys(store._parse_entries(before_raw)))
+        store._set_entries(target, before_entries)
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched  # missing/ambiguous anchor: the store's own error, nothing applied
         # Single-op normalization: one replace/remove becomes a one-op batch, so the
@@ -283,9 +295,15 @@ def _autonomous_consolidation(store: "MemoryStore", payload: Dict[str, Any], det
                 result["removed_entry"] = removed.get(1)
         counts = {"replaced": len(replaced), "removed": len(removed),
                   "added": sum(1 for op in ops if (op or {}).get("action") == "add")}
+        # Transaction identity is the CANONICAL PLANNED-AFTER state, never an unlocked
+        # reread: a writer landing between apply_batch's lock release and a post-lock
+        # read must not become part of applied.after_sha256 (undo would then claim
+        # ownership of it and refuse/erase inconsistently). The commit carries the
+        # full-store expected-before precondition, so the committed state IS the
+        # planned state; applied.after_sha256 therefore always equals the begin
+        # record's planned_after_sha256 (asserted by the ledger regression tests).
         with suppress(Exception):  # best-effort: the commit is already durable
-            after_raw = store._read_raw_checked(store._path_for(target))[0]
-            record_applied(audit_id, target, after_raw, counts)
+            record_applied(audit_id, target, planned_after_raw, counts)
         tool_result = {
             "success": True, "done": True, "target": target,
             "autonomously_consolidated": True, "audit_id": audit_id,

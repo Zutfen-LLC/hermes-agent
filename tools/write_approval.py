@@ -20,7 +20,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -53,6 +53,7 @@ STATUS_REJECTED = "rejected"
 # state — to disable a subsystem use its own enable flag (e.g. ``memory.memory_enabled``).
 CONFIG_KEY = "write_approval"
 _TRUTHY_STRINGS = frozenset({"on", "true", "yes", "1", "approve", "enabled"})
+_FALSY_STRINGS = frozenset({"off", "false", "no", "0", "disable", "disabled"})
 
 
 # --- Config resolution ---
@@ -74,18 +75,26 @@ def unattended_memory_consolidation_enabled() -> bool:
 
     Both booleans are resolved from ONE ``load_config()`` snapshot: a second, independent
     config read could fail (or race an edit) between the two and report the gate off while
-    the opt-in was read as on — enabling autonomous destructive consolidation against a
-    config the operator never made. Any exception, malformed section or unreadable config
-    leaves the policy disabled (fail closed)."""
+    the opt-in was read as on. Each value is parsed STRICTLY (``_parse_bool_setting``) so
+    validity stays separate from value: a malformed or unrecognized spelling on EITHER key,
+    a malformed ``memory`` section, a non-dict config, or any exception leaves the policy
+    disabled (fail closed) — ``allow_unattended_consolidation: true`` plus
+    ``write_approval: "garbage"`` must never arm autonomous destructive consolidation,
+    which the lossy ``_normalize_enabled`` coercion used to allow."""
     try:
         from hermes_cli.config import load_config, cfg_get
         config = load_config()
         if not isinstance(config, dict):
             return False
-        opted_in = _normalize_enabled(cfg_get(config, MEMORY, "allow_unattended_consolidation", default=False))
-        gate_on = _normalize_enabled(cfg_get(config, MEMORY, CONFIG_KEY, default=False))
+        section = cfg_get(config, MEMORY)
+        if section is not None and not isinstance(section, dict):
+            return False  # malformed memory section
+        opted_in = _parse_bool_setting(cfg_get(config, MEMORY, "allow_unattended_consolidation", default=False))
+        gate_on = _parse_bool_setting(cfg_get(config, MEMORY, CONFIG_KEY, default=False))
     except Exception:
         return False
+    if opted_in is None or gate_on is None:
+        return False  # malformed/unrecognized value on either key: fail closed
     return opted_in and not gate_on
 
 
@@ -95,6 +104,25 @@ def _normalize_enabled(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return isinstance(value, str) and value.strip().lower() in _TRUTHY_STRINGS
+
+
+def _parse_bool_setting(value: Any) -> Optional[bool]:
+    """STRICT boolean parse for fail-closed policy keys: True/False for recognized
+    values, ``None`` when the value is malformed/unrecognized — validity stays
+    distinguishable from a legitimate false. ``_normalize_enabled`` collapses both into
+    False, which for ``write_approval`` reads an unknown spelling as "gate off" and
+    silently arms autonomous destructive consolidation; callers that must fail closed
+    on ambiguity use this instead. Global ``write_approval_enabled`` semantics are
+    deliberately unchanged."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUTHY_STRINGS:
+            return True
+        if lowered in _FALSY_STRINGS:
+            return False
+    return None
 
 
 # --- Pending store (file-backed) ---
@@ -307,7 +335,15 @@ def classify_pending_memory(record: Dict[str, Any], store, records: Optional[Lis
     ``'superseded'`` or ``'ready'``. ``records`` (all pending records, oldest first)
     enables the superseded check — newer ACTIVE/ready records on the same target pinning
     an identical ``matched_entry`` make this one redundant. Any unexpected store error
-    also classifies 'invalid' (fail closed)."""
+    also classifies 'invalid' (fail closed).
+
+    Classification order (correction round 2): rejected terminal → malformed structural
+    shape → legacy unpinned destructive → stale exact pins → semantic preflight failure
+    that is not merely stale → supersession → ready. The semantic preflight is a
+    NON-MUTATING dry-run of the record's own ops through the store's public batch
+    resolver, so 'ready' also proves the record can actually APPLY: an over-budget
+    pinned replacement, an over-budget batch, an empty batch or a malformed op classify
+    'invalid' instead of eternally failing ``/memory approve all``."""
     if not isinstance(record, dict) or record.get("status") == STATUS_REJECTED:
         return STATUS_REJECTED
     payload = record.get("payload")
@@ -324,12 +360,54 @@ def classify_pending_memory(record: Dict[str, Any], store, records: Optional[Lis
         entries = store._entries_for(target)
         if any(op.get("matched_entry") not in entries for op in destructive):
             return STATUS_STALE
+        preflight = _preflight_memory_payload(payload, target, store)
+        if preflight == STATUS_INVALID:
+            return STATUS_INVALID
         if _is_superseded(record, records, target):
             return STATUS_SUPERSEDED
     except Exception:
         logger.warning("Memory pending classification failed; failing closed", exc_info=True)
         return STATUS_INVALID
     return "ready"
+
+
+_STALE_PREFLIGHT_MARKERS = ("no entry matched", "matched multiple distinct", "is no longer", "changed since")
+
+
+def _preflight_memory_payload(payload: Dict[str, Any], target: str, store) -> Optional[str]:
+    """NON-MUTATING semantic dry-run of one pending payload against the CURRENT loaded
+    store: the exact op set ``/memory approve`` would replay, normalized to a batch and
+    resolved through ``resolve_batch_entries`` (same content scan, op walk, empty-store
+    and final-budget checks as the real apply). Returns ``STATUS_INVALID`` when the
+    payload could not apply for a reason OTHER than the pinned target having drifted
+    (that is ordinary staleness, reported by the caller's exact-pin check instead — a
+    stale record can recover, an invalid one must never be retried by approve-all), and
+    ``None`` when the payload applies cleanly. ``store`` is never mutated: the resolver
+    runs under ``skip_drift``/no-commit and only reads."""
+    action = payload.get("action")
+    if action == "batch":
+        operations = payload.get("operations")
+        if not isinstance(operations, list) or not operations:
+            return STATUS_INVALID  # empty / malformed operations batch
+        ops = [op if isinstance(op, dict) else {} for op in operations]
+        allow_empty = False
+    else:
+        if action not in ("add", "replace", "remove"):
+            return STATUS_INVALID
+        ops = [{k: payload[k] for k in ("action", "old_text", "content", "new_text",
+                                        "matched_entry") if k in payload}]
+        # Single-op replay keeps the sanctioned single-op semantics (a lone remove may
+        # legitimately empty the store — the deliberate-wipe path).
+        allow_empty = True
+    if not ops:
+        return STATUS_INVALID
+    dry = store.resolve_batch_entries(target, ops, allow_empty=allow_empty)
+    if dry.get("success"):
+        return None
+    message = str(dry.get("error") or "")
+    if any(marker in message for marker in _STALE_PREFLIGHT_MARKERS):
+        return None  # target drift, not a structural defect: classify by exact pins
+    return STATUS_INVALID
 
 
 def _is_superseded(record: Dict[str, Any], records: Optional[List[Dict[str, Any]]], target: str) -> bool:
@@ -355,32 +433,74 @@ def _is_superseded(record: Dict[str, Any], records: Optional[List[Dict[str, Any]
     return False
 
 
+def classify_pending_memory_queue(store, records: Optional[List[Dict[str, Any]]] = None
+                                  ) -> List[Tuple[Dict[str, Any], str]]:
+    """Whole-queue lifecycle verdicts — ONE consistent pass, newest-first, so the queue
+    is classified as a SET with exactly the semantics ``/memory pending`` persists.
+
+    Per-record independent classification can disagree with itself: judging an older
+    proposal first sees a newer same-pin proposal still ACTIVE (it supersedes the older
+    one), while judging that newer proposal finds it stale — net effect: NEITHER is
+    active, and real queued work vanishes from every consumer. Here each record's
+    supersession check sees the FRESH verdict of every newer record (a newer record
+    that is itself stale/superseded/invalid does not suppress), which is the same
+    newest-first order ``reclassify_pending_memory`` persists.
+
+    Returns ``[(record, verdict), ...]`` oldest-first (input order). PURE: nothing is
+    persisted — ``reclassify_pending_memory`` persists these verdicts, the background
+    digest only consumes them."""
+    if records is None:
+        with suppress(Exception):
+            records = list_pending(MEMORY)
+    records = [r for r in (records or []) if isinstance(r, dict)]
+    verdicts: List[Tuple[Dict[str, Any], str]] = []
+    by_id: Dict[Any, str] = {}
+    for record in reversed(records):  # NEWEST first: older records see fresh verdicts
+        persisted = record.get("status")
+        if persisted in (STATUS_REJECTED, STATUS_INVALID):
+            verdict = persisted  # terminal: never re-judged, no churn
+        else:
+            # records=[]: the queue-aware supersession check below replaces the
+            # per-record one, so classify judges everything EXCEPT supersession.
+            verdict = classify_pending_memory(record, store, [])
+            if verdict == "ready":
+                target = (record.get("payload") or {}).get("target", "memory")
+                for other in records:
+                    if other.get("id") == record.get("id"):
+                        continue
+                    if other.get("created_at", 0) <= record.get("created_at", 0):
+                        continue  # only strictly newer records can supersede
+                    if by_id.get(other.get("id")) not in (None, "", "ready"):
+                        continue  # newer record already judged non-active
+                    if supersedes(other, record):
+                        verdict = STATUS_SUPERSEDED
+                        break
+        by_id[record.get("id")] = verdict
+        verdicts.append((record, verdict))
+    verdicts.reverse()  # back to oldest-first for callers
+    return verdicts
+
+
 def reclassify_pending_memory(store, subsystem: str = MEMORY) -> Dict[str, int]:
     """Re-classify every non-terminal pending ``subsystem`` record and persist changed
     statuses. Returns counts: ``{'ready', 'stale', 'superseded', 'invalid', 'rejected',
     'changed'}`` where ``changed`` counts records whose status field actually changed.
     'invalid' persists too (audit evidence); records already 'invalid'/'rejected' stay as
-    they are (no churn)."""
+    they are (no churn). Classification runs through ``classify_pending_memory_queue`` —
+    one consistent newest-first pass over the whole set."""
     counts = {STATUS_STALE: 0, STATUS_SUPERSEDED: 0, STATUS_INVALID: 0, STATUS_REJECTED: 0,
               "ready": 0, "changed": 0}
-    records = [r for r in list_pending(subsystem) if isinstance(r, dict)]
-    # NEWEST first: when an older record runs its superseded check, every newer record
-    # already carries its freshly-persisted status on this shared snapshot — a newer
-    # record that just classified 'stale' must not supersede it.
-    for record in reversed(records):
-        current = record.get("status") or ""
-        if current in (STATUS_REJECTED, STATUS_INVALID):
-            counts[current] += 1
-            continue
-        verdict = classify_pending_memory(record, store, records)
+    if subsystem != MEMORY:
+        return counts
+    for record, verdict in classify_pending_memory_queue(store):
         counts[verdict] += 1
         # '' (absent) and 'ready' are the same lifecycle state: a ready record is not
         # rewritten (no churn), while a stale→ready recovery persists the new status.
+        current = record.get("status") or ""
         current_norm = "" if current in ("", "ready") else current
         verdict_norm = "" if verdict == "ready" else verdict
         if verdict_norm != current_norm:
             update_pending_status(subsystem, record["id"], verdict)
-            record["status"] = verdict  # shared snapshot: later (older) records see it
             counts["changed"] += 1
     return counts
 

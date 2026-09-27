@@ -221,9 +221,23 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
     before_sha = record.get("before_sha256") or _sha256(record.get("before_raw") or "")
     before_entries = [e for e in (record.get("before_entries") or []) if e]
 
+    # ONE current raw snapshot is the authority for the digest AND the current entry
+    # list: an independent entries read could straddle a concurrent writer and let the
+    # restore decide on state S0 while mutating S1. The restore batch then carries this
+    # exact raw as its expected-before precondition, checked INSIDE the store's lock —
+    # any write that lands between this decision and the restore commit makes the whole
+    # restore fail with zero mutation instead of silently preserving or overwriting the
+    # concurrent change and calling the result an exact restore.
     store.load_from_disk()
-    current_raw = store._read_raw_checked(store._path_for(target))[0]
+    path = store._path_for(target)
+    current_raw, read_ok = store._read_raw_checked(path)
+    if not read_ok:
+        return {"success": False,
+                "error": (f"Refusing to undo '{audit_id}': {path.name} exists but could not "
+                          f"be read right now; nothing was changed — retry in a moment.")}
     current_sha = _sha256(current_raw)
+    current_entries = list(dict.fromkeys(store._parse_entries(current_raw)))
+    store._set_entries(target, current_entries)
 
     if current_sha == before_sha:
         return {"success": True,
@@ -251,7 +265,7 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
                           f"restore would erase those later changes. Memory is untouched; "
                           f"inspect audit id '{audit_id}' and recover manually if intended.")}
 
-    current = list(store._entries_for(target))
+    current = current_entries  # derived from the SAME raw snapshot as current_sha above
     before_set, current_set = set(before_entries), set(current)
     survivors = [e for e in current if e in before_set]
     missing = [e for e in before_entries if e not in current_set]
@@ -267,7 +281,9 @@ def restore(audit_id: str, store: "Any") -> Dict[str, Any]:
         ops = ([{"action": "remove", "old_text": e} for e in current] +
                [{"action": "add", "content": e} for e in before_entries])
 
-    result = store.apply_batch(target, ops)
+    # The precondition binds the restore to the exact state that was proven safe: any
+    # intervening write makes apply_batch refuse under the lock with zero mutation.
+    result = store.apply_batch(target, ops, expected_before_raw=current_raw)
     if isinstance(result, dict) and result.get("success"):
         with suppress(Exception):  # best-effort journal evidence; the restore is durable
             record_undone(audit_id, target, before_sha)

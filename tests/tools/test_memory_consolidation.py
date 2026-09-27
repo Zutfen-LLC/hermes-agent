@@ -683,3 +683,289 @@ class TestLedgerPermissions:
             r = json.loads(memory_tool(action="remove", old_text=text, store=store))
         assert r["success"] is True, r
         return r
+
+
+# =========================================================================
+# Correction round 2: one self-consistent BEFORE snapshot; canonical committed-after
+# digest; atomic undo precondition
+# =========================================================================
+
+class TestSingleSourceBeforeSnapshot:
+    """The begin record must describe exactly ONE store state: before_entries parsed from
+    the same raw as before_sha256. A writer changing the file between the old independent
+    reads used to produce a begin mixing entries from S0 with the digest of S1."""
+
+    def test_begin_record_entries_parse_from_the_same_raw_as_its_digest(self, store):
+        """Mechanical invariant on EVERY begin record: parse(before_raw) == before_entries
+        under the store's canonical normalization (strip, drop empties, dedupe
+        order-preserving) — the same rules production applies."""
+        from tools.memory_consolidation import list_records
+        _set_flag(True)
+        store.add("memory", "snapshot witness entry")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="snapshot witness", store=store))
+        assert r["success"] is True, r
+        begins = [rec for rec in list_records() if rec.get("event") == "begin"]
+        assert begins
+        for rec in begins:
+            normalized = list(dict.fromkeys(
+                e for e in (x.strip() for x in rec["before_raw"].split("\n§\n")) if e))
+            assert normalized == rec["before_entries"], rec["id"]
+
+    def test_writer_between_old_read_points_cannot_split_the_begin_record(self, store, monkeypatch):
+        """Deterministic race (correction round 2): the old code took before_entries from
+        the store's in-memory view (loaded S0) and before_raw from a SECOND, independent
+        disk read — a writer landing between them recorded begin entries from S0 with a
+        digest of S1, and a later undo could erase the concurrent change. Replaying that
+        exact interleaving (the concurrent write lands right after the load's read, before
+        the snapshot read), the corrected single-snapshot path derives BOTH from one raw
+        read, so the begin record is always self-consistent — proven mechanically by the
+        parse(before_raw) == before_entries invariant, which FAILS on the split record the
+        reviewed implementation produced for this same interleaving."""
+        from tools import memory_consolidation as mc
+        from tools.memory_tool_store import ENTRY_DELIMITER
+
+        _set_flag(True)
+        store.add("memory", "first race witness")
+        store.add("memory", "second race witness")
+
+        raw_entries = MemoryStore._read_raw_checked
+        state = {"fired": False}
+
+        def racing_read(path):
+            result = raw_entries(path)
+            # Fire on the load-time MEMORY.md read only: the concurrent writer lands
+            # AFTER the store's in-memory view (S0) is populated and BEFORE the
+            # consolidation's own snapshot read — the old two-read interleaving.
+            if path.name == "MEMORY.md" and not state["fired"]:
+                state["fired"] = True
+                store._path_for("memory").write_text(
+                    result[0] + ENTRY_DELIMITER + "concurrent late write",
+                    encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(MemoryStore, "_read_raw_checked", staticmethod(racing_read))
+
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="first race witness", store=store))
+        monkeypatch.setattr(MemoryStore, "_read_raw_checked", staticmethod(raw_entries))
+
+        # The one-snapshot path read the post-write state S1, so the consolidation
+        # validates, commits and audits against exactly S1 — and succeeds.
+        assert r["success"] is True, r
+        begins = [rec for rec in mc.list_records() if rec.get("event") == "begin"]
+        assert begins
+        for rec in begins:
+            normalized = list(dict.fromkeys(
+                e for e in (x.strip() for x in rec["before_raw"].split("\n§\n")) if e))
+            assert normalized == rec["before_entries"], rec["id"]
+            assert "concurrent late write" in rec["before_raw"]  # one snapshot: S1 whole
+        # And undo restores exactly that recorded pre-commit state (S1), erasing nothing.
+        entries_before_undo = _disk_entries(store)
+        assert entries_before_undo == ["second race witness", "concurrent late write"]
+        result = mc.restore(r["audit_id"], store)
+        assert result["success"] is True, result
+        assert _disk_entries(store) == ["first race witness", "second race witness",
+                                        "concurrent late write"]
+
+    def test_unreadable_memory_file_refused_before_anything(self, store, monkeypatch):
+        """Read success is verified before the snapshot is used: an unreadable MEMORY.md
+        refuses the consolidation outright instead of proceeding from a silently-empty
+        (lossy) view."""
+        from tools.memory_tool_store import MemoryStore as MS
+        _set_flag(True)
+        store.add("memory", "entry guarded against unreadable reads")  # file exists first
+        real = MS._read_raw_checked
+
+        def failing(path):
+            if path.name == "MEMORY.md":
+                return "", False
+            return real(path)
+
+        monkeypatch.setattr(MS, "_read_raw_checked", staticmethod(failing))
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="unreadable reads", store=store))
+        monkeypatch.setattr(MS, "_read_raw_checked", staticmethod(real))
+
+        assert r["success"] is False
+        assert "could not be read" in r["error"]
+        from tools.memory_consolidation import list_records
+        assert list_records() == []  # no begin record, nothing applied
+
+
+class TestCanonicalAppliedDigest:
+    """applied.after_sha256 must be the planned-after digest of the state the validated
+    commit wrote — never an unlocked reread that can absorb a post-commit writer."""
+
+    def test_applied_after_sha_equals_planned_after_sha(self, store):
+        from tools.memory_consolidation import list_records
+        _set_flag(True)
+        store.add("memory", "digest witness alpha")
+        store.add("memory", "digest witness beta")
+        with unattended_review():
+            r = json.loads(memory_tool(action="replace", old_text="digest witness alpha",
+                                       content="digest witness alpha (rewritten)", store=store))
+        assert r["success"] is True, r
+        begins = [rec for rec in list_records() if rec.get("event") == "begin"]
+        applied = [rec for rec in list_records() if rec.get("event") == "applied"]
+        assert begins and applied
+        assert begins[-1]["id"] == applied[-1]["id"] == r["audit_id"]
+        assert applied[-1]["after_sha256"] == begins[-1]["planned_after_sha256"]
+
+    def test_post_commit_writer_not_in_applied_digest_and_undo_refuses(self, store, monkeypatch):
+        """Race: a second writer lands immediately after apply_batch returns but BEFORE
+        record_applied executes. The writer must NOT become part of applied.after_sha256
+        (the digest stays the planned-after state), and undo must REFUSE while that later
+        write exists (current memory matches neither before nor expected-after)."""
+        from tools import memory_consolidation as mc
+
+        real_apply_batch = MemoryStore.apply_batch
+        state = {"committed": False}
+
+        def apply_then_write(subject, target, operations, **kwargs):
+            result = real_apply_batch(subject, target, operations, **kwargs)
+            if result.get("success") and not state["committed"]:
+                state["committed"] = True
+                # The unrelated writer lands AFTER the lock is released, BEFORE
+                # record_applied runs (which happens later in the caller).
+                assert subject.add("memory", "unrelated post-commit write")["success"]
+            return result
+
+        monkeypatch.setattr(MemoryStore, "apply_batch", apply_then_write)
+        _set_flag(True)
+        store.add("memory", "post-commit race target")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="post-commit race", store=store))
+        monkeypatch.setattr(MemoryStore, "apply_batch", real_apply_batch)
+
+        assert r["success"] is True, r  # the consolidation itself committed
+        begins = [rec for rec in mc.list_records() if rec.get("event") == "begin"]
+        applied = [rec for rec in mc.list_records() if rec.get("event") == "applied"]
+        audit_id = r["audit_id"]
+        begin = next(rec for rec in begins if rec["id"] == audit_id)
+        ap = next(rec for rec in applied if rec["id"] == audit_id)
+        # 1. The unrelated write is NOT part of the transaction's committed-after identity.
+        assert ap["after_sha256"] == begin["planned_after_sha256"]
+        # 2. Undo refuses while the later write exists; it survives untouched.
+        entries_after = _disk_entries(store)
+        assert "unrelated post-commit write" in entries_after
+        result = mc.restore(audit_id, store)
+        assert result["success"] is False
+        assert "changed since" in result["error"]
+        assert _disk_entries(store) == entries_after
+
+
+class TestAtomicUndoPrecondition:
+    """restore() derives digest, current entries and the restore ops from ONE raw
+    snapshot and commits with expected_before_raw: a writer landing between the
+    decision and the restore commit fails the whole restore with zero mutation."""
+
+    def _applied_removal(self, store, victim="atomic undo victim"):
+        _set_flag(True)
+        store.add("memory", victim)
+        store.add("memory", "atomic undo keeper")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text=victim, store=store))
+        assert r["success"] is True, r
+        return r["audit_id"]
+
+    def test_plain_restore_is_exact(self, store):
+        from tools.memory_consolidation import restore
+        store.add("memory", "plain restore alpha")
+        store.add("memory", "plain restore beta")
+        before = _disk_entries(store)
+        _set_flag(True)
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="plain restore alpha",
+                                       store=store))
+        assert r["success"] is True, r
+        assert _disk_entries(store) == ["plain restore beta"]
+        result = restore(r["audit_id"], store)
+        assert result["success"] is True, result
+        assert _disk_entries(store) == before
+
+    def test_unrelated_write_already_present_refuses(self, store):
+        from tools.memory_consolidation import restore
+        audit_id = self._applied_removal(store)
+        assert store.add("memory", "later unrelated entry")["success"]
+        drifted = _disk_entries(store)
+        result = restore(audit_id, store)
+        assert result["success"] is False
+        assert "changed since" in result["error"]
+        assert _disk_entries(store) == drifted
+
+    def test_writer_adds_after_validation_before_commit_refused_and_survives(self, store, monkeypatch):
+        """TOCTOU: a writer ADDS an entry after restore validated the digest but before
+        the restore commits. The precondition makes the restore fail with zero mutation
+        and the writer's entry survives."""
+        from tools import memory_consolidation as mc
+        real_apply_batch = MemoryStore.apply_batch
+        audit_id = self._applied_removal(store)
+        assert _disk_entries(store) == ["atomic undo keeper"]
+
+        def write_then_apply(subject, target, operations, **kwargs):
+            # Lands between restore's digest validation and its apply_batch commit.
+            assert subject.add("memory", "concurrent add during undo")["success"]
+            return real_apply_batch(subject, target, operations, **kwargs)
+
+        monkeypatch.setattr(MemoryStore, "apply_batch", write_then_apply)
+        result = mc.restore(audit_id, store)
+        monkeypatch.setattr(MemoryStore, "apply_batch", real_apply_batch)
+
+        assert result["success"] is False
+        assert "changed on disk since" in result["error"]
+        entries = _disk_entries(store)
+        assert "atomic undo victim" not in entries  # the restore did NOT run
+        assert "concurrent add during undo" in entries  # the writer survived
+
+    def test_writer_edits_target_after_validation_before_commit_refused(self, store, monkeypatch):
+        """TOCTOU: a writer EDITS the entry the restore would re-add, after validation.
+        Same refusal, zero mutation, edit survives."""
+        from tools import memory_consolidation as mc
+        real_apply_batch = MemoryStore.apply_batch
+        audit_id = self._applied_removal(store)
+
+        def edit_then_apply(subject, target, operations, **kwargs):
+            assert subject.replace("memory", "atomic undo keeper",
+                                   "atomic undo keeper (edited mid-undo)")["success"]
+            return real_apply_batch(subject, target, operations, **kwargs)
+
+        monkeypatch.setattr(MemoryStore, "apply_batch", edit_then_apply)
+        result = mc.restore(audit_id, store)
+        monkeypatch.setattr(MemoryStore, "apply_batch", real_apply_batch)
+
+        assert result["success"] is False
+        assert "changed on disk since" in result["error"]
+        assert _disk_entries(store) == ["atomic undo keeper (edited mid-undo)"]
+
+    def test_repeated_undo_idempotent_after_precondition_restore(self, store):
+        from tools.memory_consolidation import restore
+        store.add("memory", "repeatable restore entry")
+        audit_id = self._applied_removal(store, victim="repeatable restore entry")
+        assert restore(audit_id, store)["success"] is True
+        expected = _disk_entries(store)
+        for _ in range(2):
+            again = restore(audit_id, store)
+            assert again["success"] is True
+            assert "nothing to restore" in again["message"]
+        assert _disk_entries(store) == expected
+
+    def test_applied_ledger_failure_recovers_from_planned_after(self, store, monkeypatch):
+        from tools import memory_consolidation as mc
+        real_applied = mc.record_applied
+
+        def failing_applied(*a, **kw):
+            raise mc.MemoryConsolidationAuditError("ledger append failed (simulated)")
+
+        monkeypatch.setattr(mc, "record_applied", failing_applied)
+        _set_flag(True)
+        store.add("memory", "planned after recovery witness")
+        with unattended_review():
+            r = json.loads(memory_tool(action="remove", old_text="recovery witness", store=store))
+        mc.record_applied = real_applied
+
+        assert r["success"] is True, r
+        assert _disk_entries(store) == []
+        result = mc.restore(r["audit_id"], store)
+        assert result["success"] is True, result
+        assert _disk_entries(store) == ["planned after recovery witness"]

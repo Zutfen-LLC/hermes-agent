@@ -1310,12 +1310,17 @@ def pending_memory_proposals_context(
     A statusless record that has actually drifted (its pinned entry is gone/changed) is
     classified against the CURRENT store here — a read-only classification on a freshly
     loaded store — so a stale proposal cannot silently suppress new work just because
-    nobody ran ``/memory pending`` first."""
+    nobody ran ``/memory pending`` first. The whole queue is classified as ONE set
+    (``classify_pending_memory_queue``: newest-first, each record's supersession judged
+    against the fresh verdicts of newer records) against ONE store load — the same
+    semantics ``/memory pending`` persists, so the digest, the lifecycle UI and bulk
+    reject can never disagree about which records are active. Nothing is persisted from
+    here; the verdicts are consumed and dropped."""
     try:
         import hashlib
 
         from tools.memory_tool import _batch_op_line, destructive_ops, load_on_disk_store
-        from tools.write_approval import classify_pending_memory, list_pending
+        from tools.write_approval import classify_pending_memory_queue, list_pending
 
         def _emit(record: Dict[str, Any]) -> Optional[str]:
             payload = record.get("payload")
@@ -1342,14 +1347,14 @@ def pending_memory_proposals_context(
             return f"- [{rid}] {status} {action} on {target}: {brief}{pin}"
 
         records = list_pending("memory")  # resolves HERMES_HOME at call time
-        # Read-only lifecycle classification against the current store: records left
-        # statusless that have drifted become 'stale' (etc.) and drop out of the digest
-        # WITHOUT a prior /memory pending run. Best-effort — hygiene must never break
-        # the digest (same failure contract as everything in this function).
+        # Read-only whole-queue lifecycle classification against ONE freshly loaded
+        # store: records left statusless that have drifted become 'stale' (etc.) and
+        # drop out of the digest WITHOUT a prior /memory pending run, judged with the
+        # exact set semantics the persisted lifecycle uses. Best-effort — hygiene must
+        # never break the digest (same failure contract as everything in this function).
         try:
-            records = [r for r in records
-                       if r.get("status") not in (None, "", "ready")
-                       or classify_pending_memory(r, load_on_disk_store(), records) == "ready"]
+            verdicts = classify_pending_memory_queue(load_on_disk_store(), records)
+            records = [r for r, verdict in verdicts if verdict in ("ready", "")]
         except Exception:
             logger.debug("pending memory classification unavailable; using raw statuses", exc_info=True)
         lines: List[str] = []

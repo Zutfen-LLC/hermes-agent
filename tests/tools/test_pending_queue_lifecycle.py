@@ -757,3 +757,315 @@ def test_diff_batch_enumerates_operations(hermes_home):
     assert "Operation 3 (add)" in out
     assert "old a entry" in out and "old b entry" in out
     assert "(entry removed)" in out
+
+
+# ---------------------------------------------------------------------------
+# Semantic applicability preflight (correction round 2): a record classified
+# 'ready' must provably APPLY; /memory approve all must never retry a record
+# classified invalid.
+# ---------------------------------------------------------------------------
+
+def test_over_budget_pinned_replacement_classifies_invalid(hermes_home):
+    """A pinned replace whose proposed content exceeds the final memory limit can never
+    apply — it must classify 'invalid', not stay 'ready' failing /memory approve all
+    forever."""
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+    store = MemoryStore(memory_char_limit=120, user_char_limit=4000)
+    store.load_from_disk()
+    store.add("memory", "small entry to replace")
+    rec = _stage({"action": "replace", "target": "memory", "old_text": "small entry",
+                  "content": "X" * 300, "matched_entry": "small entry to replace"})
+    assert wa.classify_pending_memory(rec, store) == "invalid"
+    assert _status(rec["id"])[0] is None  # classification itself stays read-only
+
+
+def test_over_budget_pinned_batch_classifies_invalid(hermes_home):
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+    store = MemoryStore(memory_char_limit=150, user_char_limit=4000)
+    store.load_from_disk()
+    store.add("memory", "alpha batch entry")
+    store.add("memory", "beta batch entry")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "alpha batch", "content": "Y" * 200,
+         "matched_entry": "alpha batch entry"},
+        {"action": "add", "content": "added batch note"},
+    ]})
+    assert wa.classify_pending_memory(batch, store) == "invalid"
+
+
+def test_malformed_batch_op_classifies_invalid(hermes_home):
+    """A structurally valid payload carrying an op apply_batch would reject (unknown
+    action) classifies invalid."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "malformed op witness entry")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "malformed op witness",
+         "content": "fine", "matched_entry": "malformed op witness entry"},
+        {"action": "purge", "old_text": "anything"},
+    ]})
+    assert wa.classify_pending_memory(batch, store) == "invalid"
+
+
+def test_empty_batch_classifies_invalid(hermes_home):
+    from tools import write_approval as wa
+    store = _store()
+    batch = _stage({"action": "batch", "target": "memory", "operations": []})
+    assert wa.classify_pending_memory(batch, store) == "invalid"
+
+
+def test_unpinned_op_inside_batch_classifies_invalid(hermes_home):
+    """A batch mixing a pinned replace with an UNPINNED remove: the structural pin check
+    catches the legacy unpinned destructive op."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "mixed pin witness entry")
+    store.add("memory", "second mixed witness entry")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "mixed pin witness", "content": "fine",
+         "matched_entry": "mixed pin witness entry"},
+        {"action": "remove", "old_text": "second mixed witness"},  # unpinned => invalid
+    ]})
+    assert wa.classify_pending_memory(batch, store) == "invalid"
+
+
+def test_valid_final_budget_batch_classifies_ready(hermes_home):
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "valid batch target entry")
+    batch = _stage({"action": "batch", "target": "memory", "operations": [
+        {"action": "replace", "old_text": "valid batch target", "content": "consolidated v2",
+         "matched_entry": "valid batch target entry"},
+        {"action": "add", "content": "fresh valid note"},
+    ]})
+    assert wa.classify_pending_memory(batch, store) == "ready"
+
+
+def test_stale_pinned_target_classifies_stale_not_invalid(hermes_home):
+    """Target drift (pin gone) stays 'stale' — recoverable — even though the preflight
+    dry-run cannot resolve the op: drift is not a structural defect."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "drift classification entry")
+    rec = _stage_remove("drift classification entry", "drift classification")
+    store.remove("memory", "drift classification entry")
+    assert wa.classify_pending_memory(rec, store) == "stale"
+
+
+def test_classification_preflight_never_mutates_the_store(hermes_home):
+    """Classifying (even into invalid) is read-only: the store entries and the record's
+    on-disk status are untouched."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "preflight mutation witness")
+    entries_before = list(store._entries_for("memory"))
+    rec = _stage({"action": "replace", "target": "memory", "old_text": "preflight mutation",
+                  "content": "Z" * 9000, "matched_entry": "preflight mutation witness"})
+    assert wa.classify_pending_memory(rec, store) == "invalid"
+    assert store._entries_for("memory") == entries_before
+    assert _status(rec["id"])[0] is None
+
+
+def test_approve_all_twice_after_invalid_classification(hermes_home):
+    """THE failure loop: an over-budget pinned replacement sits 'ready' forever, and every
+    /memory approve all retries (and fails) it. With the preflight it classifies invalid,
+    is skipped by the first approve all, and the SECOND approve all does not retry it."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+    store = MemoryStore(memory_char_limit=120, user_char_limit=4000)
+    store.load_from_disk()
+    store.add("memory", "approve retry witness entry")
+    rec = _stage({"action": "replace", "target": "memory", "old_text": "approve retry witness",
+                  "content": "W" * 300, "matched_entry": "approve retry witness entry"})
+    assert _status(rec["id"])[0] is None  # statusless on disk — no prior /memory pending
+
+    first = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
+    assert "Approved" not in (first or "")  # nothing was applied
+    assert "1 invalid" in (first or "")  # skipped as non-ready, archived
+    assert _status(rec["id"])[0] == "invalid"  # skipped AND persisted invalid
+    calls = {"n": 0}
+    real_apply = MemoryStore.apply_batch
+
+    def counting_apply(target, operations, **kwargs):
+        calls["n"] += 1
+        return real_apply(target, operations, **kwargs)
+
+    MemoryStore.apply_batch = counting_apply
+    try:
+        second = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
+    finally:
+        MemoryStore.apply_batch = real_apply
+    assert "No pending memory writes ready to approve" in second
+    assert calls["n"] == 0  # the invalid record was NOT retried
+
+
+# ---------------------------------------------------------------------------
+# Whole-queue set classification (correction round 2): the digest, /memory
+# lifecycle and staging dedup must agree on which records are active.
+# ---------------------------------------------------------------------------
+
+def test_queue_classification_older_valid_survives_newer_stale_same_pin(hermes_home):
+    """Required regression: an older VALID proposal whose newer same-pin proposal is now
+    STALE must keep the older one active. Same-pin + same-target staleness is judged by
+    the pin's exact text, so the constructible form is an EDITED entry: the older
+    proposal pins the entry's CURRENT text (valid), the newer pins its PRE-drift text
+    (stale). The queue classification judges the set: the newer stale record does not
+    suppress the older valid one."""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "set classification entry")  # later edited in place
+    older = _stage_remove("set classification entry v2 (current)", "set classification",
+                          created_at=1000.0)
+    newer = _stage({"action": "replace", "target": "memory", "old_text": "set classification",
+                    "content": "rewritten", "matched_entry": "set classification entry"},
+                   created_at=2000.0)
+    # The entry was edited AFTER both were staged: only the older record's pin text
+    # matches the current store; both records remain statusless on disk.
+    store._path_for("memory").write_text("set classification entry v2 (current)",
+                                         encoding="utf-8")
+
+    verdicts = dict((r["id"], v) for r, v in wa.classify_pending_memory_queue(_store()))
+    assert verdicts[older["id"]] == "ready"  # active — not hidden by the stale newer one
+    assert verdicts[newer["id"]] == "stale"
+
+
+def test_digest_one_store_load_consistent_under_mid_scan_drift(hermes_home, monkeypatch):
+    """THE old-code failure, reconstructed deterministically: the reviewed digest called
+    ``load_on_disk_store()`` PER RECORD, so a store edit between the two loads produced
+    verdicts from TWO different states — the older record was judged against a state
+    where the newer still looked active (superseding it) while the newer was itself
+    judged stale against the drifted state: NEITHER appeared in the digest. The whole-
+    queue classification loads the store ONCE, so every verdict describes the same
+    snapshot and the active proposal is never lost."""
+    import agent.background_review as bg
+    import tools.memory_tool as mt
+
+    store = _store()
+    store.add("memory", "mid-scan drift witness entry")
+    older = _stage_remove("mid-scan drift witness entry", "mid-scan drift", created_at=1000.0)
+    newer = _stage({"action": "replace", "target": "memory", "old_text": "mid-scan drift",
+                    "content": "mid-scan drift v2",
+                    "matched_entry": "mid-scan drift witness entry"}, created_at=2000.0)
+
+    loads = {"n": 0}
+    real_load = mt.load_on_disk_store
+
+    def drifting_load():
+        loads["n"] += 1
+        fresh = real_load()
+        if loads["n"] == 1:
+            return fresh  # first (and only, post-fix) load: entry present
+        # A second per-record load would see the entry REMOVED (mid-scan drift).
+        store._path_for("memory").write_text("drifted away entirely", encoding="utf-8")
+        return real_load()
+
+    monkeypatch.setattr(mt, "load_on_disk_store", drifting_load)
+    ctx = bg.pending_memory_proposals_context()
+
+    assert loads["n"] == 1  # exactly ONE store load for the whole queue
+    # The single snapshot has the entry present: the NEWER active proposal appears
+    # (the older is its superseded predecessor). Old code: empty digest.
+    assert newer["id"] in ctx
+    assert older["id"] not in ctx
+
+
+def test_queue_classification_newer_valid_suppresses_older(hermes_home):
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "suppress witness entry")
+    older = _stage_remove("suppress witness entry", "suppress witness", created_at=1000.0)
+    newer = _stage({"action": "replace", "target": "memory", "old_text": "suppress witness",
+                    "content": "suppress witness v2", "matched_entry": "suppress witness entry"},
+                   created_at=2000.0)
+    verdicts = dict((r["id"], v) for r, v in wa.classify_pending_memory_queue(store))
+    assert verdicts[older["id"]] == "superseded"
+    assert verdicts[newer["id"]] == "ready"
+
+
+def test_queue_classification_stale_only_absent_from_digest(hermes_home):
+    """End-to-end through the background digest: a queue holding a SAME-TARGET pair where
+    the OLDER record's pin matches the current (edited) entry and the NEWER record's pin
+    matches the pre-edit text keeps exactly the OLDER record in the digest — previously
+    the per-record/multi-snapshot classification could lose both."""
+    import agent.background_review as bg
+    store = _store()
+    store.add("memory", "digest set witness entry")  # later edited in place
+    older = _stage_remove("digest set witness entry v2 (current)", "digest set witness",
+                          created_at=1000.0)
+    newer = _stage({"action": "replace", "target": "memory", "old_text": "digest set witness",
+                    "content": "digest v2", "matched_entry": "digest set witness entry"},
+                   created_at=2000.0)
+    store._path_for("memory").write_text("digest set witness entry v2 (current)",
+                                         encoding="utf-8")
+    assert _status(older["id"])[0] is None and _status(newer["id"])[0] is None  # no prior /memory pending
+
+    ctx = bg.pending_memory_proposals_context()
+    assert older["id"] in ctx   # the ACTIVE proposal is present
+    assert newer["id"] not in ctx  # the stale one is absent
+
+
+def test_queue_classification_newer_valid_suppresses_older_in_digest(hermes_home):
+    import agent.background_review as bg
+    store = _store()
+    store.add("memory", "digest suppress entry")
+    older = _stage_remove("digest suppress entry", "digest suppress", created_at=1000.0)
+    newer = _stage({"action": "replace", "target": "memory", "old_text": "digest suppress",
+                    "content": "digest suppress v2", "matched_entry": "digest suppress entry"},
+                   created_at=2000.0)
+    ctx = bg.pending_memory_proposals_context()
+    assert older["id"] not in ctx
+    assert newer["id"] in ctx
+
+
+def test_queue_classification_stale_only_absent(hermes_home):
+    import agent.background_review as bg
+    store = _store()
+    store.add("memory", "lone stale digest entry")
+    rec = _stage_remove("lone stale digest entry", "lone stale digest")
+    store.remove("memory", "lone stale digest entry")
+    assert _status(rec["id"])[0] is None
+    assert bg.pending_memory_proposals_context() == ""
+
+
+def test_queue_classification_pure_nothing_persisted(hermes_home):
+    """The queue helper is pure: verdicts are returned, statuses on disk unchanged —
+    the background digest consumes them without mutating the queue. (The records use
+    distinct pins so the round-1 STAGING-TIME dedup — which legitimately persists
+    'superseded' at stage_write time — does not fire here; this asserts the queue
+    classifier itself writes nothing.)"""
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "purity witness entry")
+    store.add("memory", "purity second entry")
+    ready = _stage_remove("purity witness entry", "purity witness", created_at=1000.0)
+    stale = _stage_remove("purity second entry", "purity second", created_at=1500.0)
+    invalid = _stage({"action": "batch", "target": "memory", "operations": []})
+    store.remove("memory", "purity second entry")  # drift after staging, no reclassify
+    verdicts = wa.classify_pending_memory_queue(store)
+    assert dict((r["id"], v) for r, v in verdicts) == {
+        ready["id"]: "ready", stale["id"]: "stale", invalid["id"]: "invalid"}
+    for r in (ready, stale, invalid):
+        assert _status(r["id"])[0] is None  # nothing written by classification
+
+
+def test_queue_classification_agrees_with_persisted_lifecycle(hermes_home):
+    """/memory pending persists; the pure queue helper must reach the SAME verdicts for
+    the same queue (the digest and the lifecycle UI cannot disagree)."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    store = _store()
+    store.add("memory", "agreement witness entry")
+    older = _stage_remove("agreement witness entry", "agreement witness", created_at=1000.0)
+    newer = _stage({"action": "replace", "target": "memory", "old_text": "agreement witness",
+                    "content": "agreement v2", "matched_entry": "agreement witness entry"},
+                   created_at=2000.0)
+    handle_pending_subcommand(wa.MEMORY, ["pending"], memory_store=store)
+    persisted = {older["id"]: _status(older["id"])[0], newer["id"]: _status(newer["id"])[0]}
+    fresh = _store()
+    pure = dict((r["id"], v) for r, v in wa.classify_pending_memory_queue(fresh))
+    # 'ready' is persisted as a missing status field; normalize both sides.
+    assert persisted[older["id"]] == "superseded" == pure[older["id"]]
+    assert (persisted[newer["id"]] or "ready") == pure[newer["id"]] == "ready"
