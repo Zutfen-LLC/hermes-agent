@@ -216,6 +216,13 @@ _RULES: dict[str, tuple] = {
             "run: node .github/scripts/run-workspace-checks.mjs\n",
             "run: node .github/scripts/run-workspace-checks.mjs --concurrency 2\n",
         ),
+        # Two concurrent checks must share the hosted runner's four CPUs.
+        Replace(
+            "js: vitest workers",
+            "        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2\n",
+            "        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2\n"
+            "        env:\n          VITEST_MAX_WORKERS: '2'\n",
+        ),
         Replace(
             "js: check bound",
             "    runs-on: ubuntu-latest-32-core\n    timeout-minutes: 30\n",

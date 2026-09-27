@@ -88,3 +88,5 @@ jobs:
       # nothing.
       - name: Run all workspace checks
         run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
+        env:
+          VITEST_MAX_WORKERS: '2'
