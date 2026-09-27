@@ -392,22 +392,34 @@ and only list **ready** items as approval candidates (#109215):
 |--------|---------|
 | `ready` | Active — pinned entries still match the store exactly; listed for approval. |
 | `stale` | A pinned entry is gone or has changed since staging; can recover to `ready` if the entry returns. |
+| `blocked` | Structurally valid, but the current store/config prevents a safe apply right now: the target is disabled, the backing file is temporarily unreadable, or the file has external (non-roundtrippable) edits the write guard would refuse. Non-terminal — re-checked on every classification, and the same proposal becomes `ready` automatically once the condition clears. |
 | `superseded` | A newer active single-op background-review proposal pins the same exact entry on the same target. Multi-op batches are never auto-superseded on partial pin overlap — their distinct work stays independently reviewable. |
-| `invalid` | Malformed payload, a legacy pre-pinning `replace`/`remove` with no verifiable target, or a payload that could not apply against the current store (over-budget replacement/batch, empty or malformed batch) — permanently fail-closed; reject it and recreate the change. |
+| `invalid` | Malformed payload, a legacy pre-pinning `replace`/`remove` with no verifiable target, or a payload that could never apply against any store state (over-budget replacement/batch, empty or malformed batch) — permanently fail-closed; reject it and recreate the change. |
 | `rejected` | You rejected it. The record is kept on disk as audit evidence but never listed again. |
 
-Statused records are archived, not deleted. The listing shows per-status counts
+Blocked is deliberately recoverable: enabling the disabled target, restoring file
+readability, or resolving external drift lets the identical proposal classify `ready`
+again — no recreation, no lost review. Statused records are archived, not deleted. The
+listing shows per-status counts
 and an `Archived:` footer; `/memory approve all` applies **only** ready
-records, while `/memory approve <id>` remains an operator override that will
+records and **skips** blocked ones (no failed retries), while
+`/memory approve <id>` remains an operator override that will
 still tell you when a record fails. Legacy pre-pinning records are refused on
 apply and classify `invalid` — reject them to clean the list.
+
+Every status written by the corrected classifier carries `lifecycle_version: 2` and a
+machine-readable `status_reason` on the record. Records archived `invalid` by the
+earlier (pre-`blocked`) implementation — including ones whose only problem was a
+temporary read failure or external drift — are re-classified once under the corrected
+classifier and recover automatically if they are valid again; `rejected` evidence is
+never resurrected.
 
 ```
 /memory pending                      # re-classify + list ready items, counts, archived footer
 /memory diff <id>                    # bounded BEFORE/AFTER per op (whole pinned entry vs whole new entry)
-/memory approve <id> | all           # apply one (override) or every ready record
+/memory approve <id> | all           # apply one (override) or every ready record (blocked skipped)
 /memory reject <id...> | all         # status-mark rejected; evidence kept on disk
-/memory reject --stale               # bulk-reject every stale record (--superseded / --invalid too)
+/memory reject --stale               # bulk-reject every stale record (--superseded / --invalid / --blocked too)
 /memory undo <audit_id>              # restore the before-state of an autonomous consolidation
 /memory undo list                    # recent consolidation audit records
 ```

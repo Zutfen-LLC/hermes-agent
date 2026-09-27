@@ -9,11 +9,18 @@ from typing import List, Optional, Tuple
 
 from tools import write_approval as wa
 
-# Memory reject flags -> the archived status they bulk-reject.
+# Memory reject flags -> the archived status they bulk-reject. ``--blocked`` clears
+# proposals the operator decides are not worth waiting on; blocked records are never
+# auto-rejected (they recover to ready when the blocking condition clears).
 _BULK_REJECT_FLAGS = {"--stale": wa.STATUS_STALE, "--superseded": wa.STATUS_SUPERSEDED,
-                      "--invalid": wa.STATUS_INVALID}
+                      "--invalid": wa.STATUS_INVALID, "--blocked": wa.STATUS_BLOCKED}
 
 _READY_STATUSES = ("", "ready")
+
+# Human-readable one-line meaning per archived category (the footer's operator text).
+_ARCHIVED_MEANING = {
+    wa.STATUS_BLOCKED: "current store/config prevents safe application",
+}
 
 
 def _fmt_state(subsystem: str) -> str:
@@ -44,11 +51,12 @@ def _fmt_pending_list(subsystem: str, memory_store=None) -> str:
     # Rejected records are invisible everywhere (audit-only, on disk); the footer surfaces
     # only the still-reviewable archived categories.
     archived = [r for r in records if r.get("status") in
-                (wa.STATUS_STALE, wa.STATUS_SUPERSEDED, wa.STATUS_INVALID)]
+                (wa.STATUS_STALE, wa.STATUS_SUPERSEDED, wa.STATUS_INVALID, wa.STATUS_BLOCKED)]
 
     header = f"Pending {subsystem} writes"
     if counts is not None:
-        nonzero = [(label, counts[label]) for label in ("ready", "stale", "superseded", "invalid")
+        nonzero = [(label, counts[label]) for label in
+                   ("ready", "blocked", "stale", "superseded", "invalid")
                    if counts.get(label)]
         if nonzero:
             header += f" ({', '.join(f'{n} {label}' for label, n in nonzero)})"
@@ -75,8 +83,11 @@ def _fmt_pending_list(subsystem: str, memory_store=None) -> str:
         parts = ", ".join(f"{n} {status}" for status, n in sorted(by.items()))
         flags = " / ".join(flag for flag, status in sorted(_BULK_REJECT_FLAGS.items())
                            if status in by)
-        lines.append(f"Archived: {parts} — not listed for approval; "
-                     f"/{subsystem} reject {flags} to clear")
+        footer = f"Archived: {parts} — not listed for approval; /{subsystem} reject {flags} to clear"
+        meanings = [_ARCHIVED_MEANING[status] for status in sorted(by) if status in _ARCHIVED_MEANING]
+        if meanings:
+            footer += f" ({'; '.join(meanings)})"
+        lines.append(footer)
     return "\n".join(lines)
 
 
@@ -133,7 +144,7 @@ def _ready_memory_records(subsystem: str, memory_store) -> Tuple[Optional[str], 
     records = wa.list_pending(subsystem)
     ready = [r for r in records if (r.get("status") or "") in _READY_STATUSES]
     skipped = [r for r in records if r.get("status") in
-               (wa.STATUS_STALE, wa.STATUS_SUPERSEDED, wa.STATUS_INVALID)]
+               (wa.STATUS_STALE, wa.STATUS_SUPERSEDED, wa.STATUS_INVALID, wa.STATUS_BLOCKED)]
     if not skipped:
         return None, ready
     by = {}
@@ -141,7 +152,7 @@ def _ready_memory_records(subsystem: str, memory_store) -> Tuple[Optional[str], 
         status = r.get("status") or "ready"
         by[status] = by.get(status, 0) + 1
     parts = ", ".join(f"{n} {status}" for status, n in sorted(by.items()))
-    return f"skipped {len(skipped)} non-ready ({parts}) — they remain archived", ready
+    return f"skipped {len(skipped)} non-ready ({parts}) — they remain queued or archived", ready
 
 
 def _approve(subsystem: str, rest: List[str], memory_store) -> str:
@@ -254,9 +265,11 @@ def _apply_one(subsystem: str, rec, memory_store):
 
 
 def _reject(subsystem: str, rest: List[str], memory_store=None) -> str:
-    """Reject pending records. Memory bulk flags (``--stale``/``--superseded``/``--invalid``)
-    operate on CURRENT classification — ``memory_store`` (present on every /memory surface)
-    drives a reclassify first, so no prior ``/memory pending`` run is needed."""
+    """Reject pending records. Memory bulk flags (``--stale``/``--superseded``/``--invalid``/
+    ``--blocked``) operate on CURRENT classification — ``memory_store`` (present on every
+    /memory surface) drives a reclassify first, so no prior ``/memory pending`` run is
+    needed. ``--blocked`` is the operator's explicit out; blocked records are never
+    auto-rejected."""
     if not rest:
         return _usage(subsystem)
     if subsystem != wa.MEMORY:

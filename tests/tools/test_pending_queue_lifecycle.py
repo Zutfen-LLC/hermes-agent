@@ -96,7 +96,7 @@ def test_classify_stale_persisted_by_reclassify_and_counts(hermes_home):
     rec = _stage_remove("gamma rule entry", "gamma rule")
     store.remove("memory", "gamma rule entry")
     counts = wa.reclassify_pending_memory(store)
-    assert counts == {"ready": 0, "stale": 1, "superseded": 0, "invalid": 0,
+    assert counts == {"ready": 0, "blocked": 0, "stale": 1, "superseded": 0, "invalid": 0,
                       "rejected": 0, "changed": 1}
     assert _status(rec["id"])[0] == "stale"
 
@@ -167,7 +167,7 @@ def test_classify_rejected_terminal(hermes_home):
     assert wa.classify_pending_memory(rec, store) == "rejected"
     # reclassify skips it entirely: no counts churn, no rewrite.
     counts = wa.reclassify_pending_memory(store)
-    assert counts == {"ready": 0, "stale": 0, "superseded": 0, "invalid": 0,
+    assert counts == {"ready": 0, "blocked": 0, "stale": 0, "superseded": 0, "invalid": 0,
                       "rejected": 1, "changed": 0}
 
 
@@ -541,7 +541,7 @@ def test_approve_all_applies_only_ready_records(hermes_home):
     assert "chi rule entry" not in entries  # the stale remove did NOT apply
     assert "skipped 3 non-ready" in out
     assert "1 stale" in out and "1 superseded" in out and "1 invalid" in out
-    assert "remain archived" in out
+    assert "remain queued or archived" in out
     # Non-ready records stay on disk with statuses persisted; ready records are consumed.
     assert wa.get_pending(wa.MEMORY, ready["id"]) is None
     assert wa.get_pending(wa.MEMORY, superseder["id"]) is None

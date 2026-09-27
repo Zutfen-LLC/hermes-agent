@@ -34,17 +34,13 @@ def _error(message: str, **extra) -> Dict[str, Any]:
     return {"success": False, "error": message, **extra}
 
 
-def _drift_error(path: Path, bak_path: str) -> Dict[str, Any]:
-    """External drift: the file wouldn't round-trip, so flushing would discard content."""
-    return _error((
-        f"Refusing to write {path.name}: file on disk has content that wouldn't round-trip "
-        f"through the memory tool (likely added by the patch tool, a shell append, a manual edit, "
-        f"or a concurrent session). A snapshot was saved to {bak_path}. Resolve the drift first — "
-        f"either rewrite the file as a clean §-delimited list of entries, or move the extra "
-        f"content out — then retry. This guard exists to prevent silent data loss (issue #26045)."
-    ), drift_backup=bak_path, remediation=(
-        "Open the .bak file, integrate the missing entries into the memory tool one at a time via "
-        "memory(action=add, content=...), then remove or rewrite the original file to a clean state."))
+# Stable machine-readable failure kinds for batch/preflight failures (lifecycle v2).
+# These ride the ``failure_kind`` key of error dicts; the pending lifecycle keys off
+# them, NEVER off human-readable error text. Every store failure carries a kind, so
+# re-wording an error message can never silently flip a lifecycle verdict.
+KIND_STALE = "stale"      # an exact staged pin is gone/changed where the sequential walk consumes it
+KIND_BLOCKED = "blocked"  # temporary availability: unreadable file, external drift — retry later
+KIND_INVALID = "invalid"  # permanent semantic failure: malformed, over-budget, empty-batch
 
 
 def _read_failed_error(path: Path) -> Dict[str, Any]:
@@ -53,7 +49,32 @@ def _read_failed_error(path: Path) -> Dict[str, Any]:
         f"Refusing to write {path.name}: the file exists on disk but could not be read right now "
         f"(temporarily locked by another program, a permission change, invalid/corrupt text encoding, "
         f"or a filesystem error). Treating an unreadable file as empty and saving would wipe existing "
-        f"memory, so the write is refused. Nothing was changed — retry in a moment.")
+        f"memory, so the write is refused. Nothing was changed — retry in a moment.",
+        failure_kind=KIND_BLOCKED, reason="store_unreadable")
+
+
+def _drift_error(path: Path, bak_path: Optional[str], *, write_side: bool = True) -> Dict[str, Any]:
+    """External drift: the file wouldn't round-trip, so flushing would discard content.
+    ``write_side=True`` is the REAL commit refusal (names the .bak snapshot + remediation);
+    ``write_side=False`` is the read-only detection message used by preflight/classification
+    (no backup exists to point at, none was created)."""
+    if write_side:
+        detail = (f" A snapshot was saved to {bak_path}. Resolve the drift first — "
+                  f"either rewrite the file as a clean §-delimited list of entries, or move the extra "
+                  f"content out — then retry. This guard exists to prevent silent data loss (issue #26045).")
+        extra: Dict[str, Any] = {"drift_backup": bak_path, "remediation": (
+            "Open the .bak file, integrate the missing entries into the memory tool one at a time via "
+            "memory(action=add, content=...), then remove or rewrite the original file to a clean state.")}
+    else:
+        detail = (" Resolve the drift first — rewrite the file as a clean §-delimited list of "
+                  "entries, or move the extra content out — then retry. This guard exists to "
+                  "prevent silent data loss (issue #26045).")
+        extra = {}
+    return _error((
+        f"Refusing to write {path.name}: file on disk has content that wouldn't round-trip "
+        f"through the memory tool (likely added by the patch tool, a shell append, a manual edit, "
+        f"or a concurrent session)." + detail),
+        failure_kind=KIND_BLOCKED, reason="external_drift", **extra)
 
 
 def _find_unique_match(entries: List[str], old_text: str) -> Tuple[Optional[int], bool]:
@@ -236,23 +257,34 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message, current_entries=self._entries_for(target), usage=self._usage(target)))
 
-    def _batch_failure(self, target: str, message: str, *, count_failure: bool = True) -> Dict[str, Any]:
+    def _batch_failure(self, target: str, message: str, *, count_failure: bool = True,
+                       failure_kind: Optional[str] = None) -> Dict[str, Any]:
         """Batch-abort failure WITHOUT ``current_entries``: the store did not change and the
         caller already holds the inventory, so echoing it made each consolidation retry
         grow the context it was invoked to shrink (#97316).
+
+        ``failure_kind`` (KIND_STALE/KIND_BLOCKED/KIND_INVALID) rides the error dict so
+        machine-readable consumers — pending-queue lifecycle classification — never parse
+        the human-readable message.
 
         ``count_failure=False`` (read-only dry-runs via ``resolve_batch_entries``) skips the
         per-turn failure budget: inspecting the queue — ``/memory pending``, bare ``/memory``,
         bulk hygiene, lifecycle classification — must not consume the retry budget that
         governs the LIVE agent's real memory writes. Commit-path failures keep counting."""
+        extra = {} if failure_kind is None else {"failure_kind": failure_kind}
+        if failure_kind == KIND_STALE:
+            extra["reason"] = "pin_gone"
+        elif failure_kind == KIND_INVALID:
+            extra["reason"] = "semantic_failure"
+        err = _error(message + " No operations were applied (batch is all-or-nothing).",
+                     usage=self._usage(target), **extra)
         if not count_failure:
-            return _error(message + " No operations were applied (batch is all-or-nothing).",
-                          usage=self._usage(target))
-        return self._consolidation_failure(
-            _error(message + " No operations were applied (batch is all-or-nothing).", usage=self._usage(target)))
+            return err
+        return self._consolidation_failure(err)
 
     def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
-                expected_before_raw: Optional[str] = None) -> Dict[str, Any]:
+                expected_before_raw: Optional[str] = None,
+                drift_detect_only: bool = False) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -270,16 +302,26 @@ class MemoryStore:
         The autonomous consolidation path uses it so the audit begin-state is always the
         exact state the commit was validated against — ANY drift, including on unrelated
         entries, applies nothing (a stale-audit commit would let a later undo erase a
-        concurrent write the audit never recorded)."""
+        concurrent write the audit never recorded).
+
+        ``drift_detect_only`` is the READ-ONLY drift probe used by pending-queue lifecycle
+        classification: it runs BEFORE any other check and returns the same drift error the
+        real commit would raise (differently worded — no .bak exists) WITHOUT ever calling
+        ``_detect_external_drift``'s backup write. Under this flag the closure is never
+        invoked and nothing can be written, counted or persisted."""
         path = self._path_for(target)
         with self._file_lock(path):
             raw, read_ok = self._read_raw_checked(path)
             if not read_ok:
                 return _read_failed_error(path)
+            if drift_detect_only:
+                if self._has_external_drift(target, raw):
+                    return _drift_error(path, None, write_side=False)
+                return {"success": True, "drift_detected": False}
             if expected_before_raw is not None and raw != expected_before_raw:
                 return self._batch_failure(target, (
                     "Memory changed on disk since this consolidation was planned and "
-                    "audited; nothing was applied. Retry the operation."))
+                    "audited; nothing was applied. Retry the operation."), failure_kind=KIND_BLOCKED)
             bak = None if skip_drift else self._detect_external_drift(target, raw)
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
             if bak:
@@ -384,37 +426,41 @@ class MemoryStore:
 
     @staticmethod
     def _apply_batch_op(working: List[str], act: str, content: str, old_text: str,
-                        pos: str, matched_entry: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """Apply one batch op to *working*; return ``(error message, previous content)``.
-        Previous content is captured before each replace/remove, under the store lock.
-        It is published only after the entire batch has been validated and persisted.
-        A staged op's *matched_entry* selects exactly that entry, as in ``_locate``.
-        """
+                        pos: str, matched_entry: Optional[str] = None
+                        ) -> Tuple[Optional[str], Optional[str], bool]:
+        """Apply one batch op to *working*; return ``(error message, previous content,
+        stale_pin)``. Previous content is captured before each replace/remove, under the
+        store lock. It is published only after the entire batch has been validated and
+        persisted. A staged op's *matched_entry* selects exactly that entry, as in
+        ``_locate``. ``stale_pin`` is True only when the failure is an exact staged pin
+        that is genuinely gone/changed at its point of consumption (lifecycle STALE)."""
+        stale_pin = False
         if act == "add":
             if not content:
-                return f"{pos}: content is required.", None
+                return f"{pos}: content is required.", None, stale_pin
             if content not in working:  # idempotent -- skip duplicate, don't fail the batch
                 working.append(content)
-            return None, None
+            return None, None, stale_pin
         if act not in ("replace", "remove"):
-            return f"{pos}: unknown action. Use add, replace, or remove.", None
+            return f"{pos}: unknown action. Use add, replace, or remove.", None, stale_pin
         if not old_text:
-            return f"{pos}: old_text is required.", None
+            return f"{pos}: old_text is required.", None, stale_pin
         if act == "replace" and not content:
-            return f"{pos}: content is required (use action='remove' to delete).", None
+            return f"{pos}: content is required (use action='remove' to delete).", None, stale_pin
         if matched_entry is not None:
             idx = _pinned_index(working, matched_entry)
             if idx is None:
-                return f"{pos}: {_stale_entry_message(matched_entry)}", None
+                stale_pin = True
+                return f"{pos}: {_stale_entry_message(matched_entry)}", None, stale_pin
         else:
             idx, ambiguous = _find_unique_match(working, old_text)
             if ambiguous:
-                return f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.", None
+                return f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.", None, stale_pin
             if idx is None:
-                return f"{pos}: no entry matched '{old_text}'.", None
+                return f"{pos}: no entry matched '{old_text}'.", None, stale_pin
         previous_content = working[idx]
         working[idx:idx + 1] = [content] if act == "replace" else []
-        return None, previous_content
+        return None, previous_content, stale_pin
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]], *,
                     expected_before_raw: Optional[str] = None,
@@ -453,25 +499,30 @@ class MemoryStore:
         # budget: classification/preflight inspection is not a consolidation attempt.
         _fail = self._batch_failure if commit else partial(self._batch_failure, count_failure=False)
         if not operations:
-            return _error("operations list is empty.")
+            return _error("operations list is empty.", failure_kind=KIND_INVALID,
+                          reason="empty_operations")
         ops = [op or {} for op in operations]
         # Scan every add/replace content BEFORE touching disk -- one poisoned op rejects the batch.
         for i, op in enumerate(ops):
             scan_error = op.get("action") in {"add", "replace"} and op.get("content") and _scan_memory_content(op["content"])
             if scan_error:
-                return _error(f"Operation {i + 1}: {scan_error}")
+                return _error(f"Operation {i + 1}: {scan_error}", failure_kind=KIND_INVALID,
+                              reason="content_rejected")
 
         def _apply(entries, limit):
             working = list(entries)  # only committed if the whole batch validates
             matched = []  # per op, the entry a replace/remove selected (None for add)
             for i, op in enumerate(ops):
                 act = op.get("action")
-                msg, previous_content = self._apply_batch_op(
+                msg, previous_content, stale_pin = self._apply_batch_op(
                     working, act, (op.get("content") or op.get("new_text") or "").strip(),
                     (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})",
                     op.get("matched_entry"))
                 if msg:
-                    return _fail(target, msg)
+                    # KIND_STALE only for a genuine exact-pin miss at its point of
+                    # consumption; everything else in the walk is a permanent INVALID.
+                    kind = KIND_STALE if stale_pin else KIND_INVALID
+                    return _fail(target, msg, failure_kind=kind)
                 matched.append(previous_content)
             if entries and not working and not allow_empty:
                 # #103419: a consolidation batch that removes the last entry would
@@ -482,13 +533,13 @@ class MemoryStore:
                     f"Refusing to empty {label}: this batch would remove every entry from a "
                     f"previously non-empty store. Keep at least one entry — merge overlapping "
                     f"entries into a shorter one instead of removing the last one. To delete the "
-                    f"final entry deliberately, use single remove() calls."))
+                    f"final entry deliberately, use single remove() calls."), failure_kind=KIND_INVALID)
             new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
             if new_total > limit:
                 return _fail(target, (
                     f"After applying all {len(operations)} operations, memory would be at "
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                    f"entries in the same batch, then retry."))
+                    f"entries in the same batch, then retry."), failure_kind=KIND_INVALID)
             if not commit:
                 return {"success": True, "matched_entries": matched}
             # op index -> full entry text its replace/remove selected (#117952), 1-based to
@@ -501,8 +552,14 @@ class MemoryStore:
             if removed:
                 replaced_fields["removed_entries"] = removed
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
-        return self._mutate(target, _apply, skip_drift=not commit,
-                            expected_before_raw=expected_before_raw if commit else None)
+        result = self._mutate(target, _apply, skip_drift=not commit,
+                              expected_before_raw=expected_before_raw if commit else None)
+        # Every failure above already carries ``failure_kind`` at its source (unreadable
+        # file / drift -> KIND_BLOCKED; op-walk, empty-store and budget -> KIND_STALE or
+        # KIND_INVALID). Belt for any future unkinded failure: fail-closed INVALID.
+        if not result.get("success") and "failure_kind" not in result:
+            result["failure_kind"] = KIND_INVALID
+        return result
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
@@ -571,13 +628,38 @@ class MemoryStore:
         except OSError as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
+    def detect_drift(self, target: str) -> Dict[str, Any]:
+        """READ-ONLY external-drift probe for pending-queue lifecycle preflight: answers
+        whether the REAL commit path would currently refuse with the drift guard, without
+        creating the ``.bak`` backup the commit path writes on refusal. Nothing here can
+        mutate the file, the failure budget or any audit surface."""
+        return self._mutate(target, lambda entries, limit: {"success": True},
+                            skip_drift=False, drift_detect_only=True)
+
+    def check_batch_admissibility(self, target: str, operations: List[Dict[str, Any]], *,
+                                  allow_empty: bool = False) -> Dict[str, Any]:
+        """Whether the REAL commit path (``apply_batch``) would currently accept this
+        exact op set — the FULL write-side guard chain in commit order, entirely
+        read-only: target availability, current-file readability, the external-drift
+        guard (detection only — no backup is written), then the same locked sequential
+        walk ``resolve_batch_entries`` runs. Returns ``{"success": True, ...}`` when the
+        commit is admissible right now, or the first error it would fail with, carrying
+        ``failure_kind`` ('blocked' for availability/drift, 'invalid' for semantic
+        failures, 'stale' for pin drift at its point of consumption)."""
+        if not self.target_enabled(target):
+            label = "USER.md" if target == "user" else "MEMORY.md"
+            return _error(f"Built-in {label} writes are disabled in memory config.",
+                          target=target, failure_kind=KIND_BLOCKED, reason="target_disabled")
+        probe = self.detect_drift(target)
+        if not probe.get("success"):
+            return probe
+        return self.resolve_batch_entries(target, operations, allow_empty=allow_empty)
+
     def _detect_external_drift(self, target: str, raw: str) -> Optional[str]:
         """``.bak.<ts>`` snapshot path if *raw* shows external drift, else None. Signals:
         round-trip mismatch, or one entry over the whole-file limit (no tool-written
         entry can be — an external writer appended free-form text)."""
-        parsed = self._parse_entries(raw)
-        if not raw.strip() or (raw.strip() == ENTRY_DELIMITER.join(parsed)
-                               and max(map(len, parsed), default=0) <= self._char_limit(target)):
+        if not self._has_external_drift(target, raw):
             return None
         path = self._path_for(target)
         bak_path = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
@@ -586,3 +668,12 @@ class MemoryStore:
         except OSError:
             return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak_path)
+
+    def _has_external_drift(self, target: str, raw: str) -> bool:
+        """PURE drift predicate — the exact signals the real commit's drift guard refuses
+        on, with NO side effects. Classification calls this (via ``detect_drift``) instead
+        of ``_detect_external_drift`` so testing the real commit's admissibility never
+        writes the remediation backup."""
+        parsed = self._parse_entries(raw)
+        return bool(raw.strip()) and not (raw.strip() == ENTRY_DELIMITER.join(parsed)
+                                          and max(map(len, parsed), default=0) <= self._char_limit(target))

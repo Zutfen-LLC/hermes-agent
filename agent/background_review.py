@@ -1319,7 +1319,9 @@ def pending_memory_proposals_context(
     (``classify_pending_memory_queue``: newest-first, each record's supersession judged
     against the fresh verdicts of newer records) against ONE store load — the same
     semantics ``/memory pending`` persists, so the digest, the lifecycle UI and bulk
-    reject can never disagree about which records are active. Nothing is persisted from
+    reject can never disagree about which records are active. BLOCKED records are
+    likewise omitted: they are not actionable right now, and when their blocking
+    condition clears the fresh verdict recovers to ready immediately. Nothing is persisted from
     here; the verdicts are consumed and dropped. The RENDERING consumes those fresh
     verdicts, not the persisted ``status`` field: a record persisted 'superseded' whose
     fresh verdict recovered to 'ready' is rendered immediately (the digest is read-only
@@ -1378,7 +1380,12 @@ def pending_memory_proposals_context(
             # status is 'superseded'/'stale' but whose fresh verdict recovered to ready
             # IS rendered — the digest is read-only and must not wait for /memory
             # pending to re-persist statuses first. Genuinely stale/superseded/
-            # invalid/rejected records stay absent.
+            # invalid/rejected records stay absent. BLOCKED records stay absent too:
+            # they are NOT active actionable proposals (the current store/config cannot
+            # apply them), so they must not suppress re-review as if the maintenance
+            # were still queued — and a blocked → ready recovery appears immediately
+            # from the FRESH verdict on the next fork, with no /memory pending run
+            # needed in between.
             if verdict not in ("ready", ""):
                 continue
             line = _emit(record, status=verdict or None)
