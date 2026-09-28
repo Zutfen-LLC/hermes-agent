@@ -202,9 +202,10 @@ _RULES: dict[str, tuple] = {
             "    runs-on: ubuntu-latest-32-core\n    timeout-minutes: 60\n",
             "    runs-on: ubuntu-latest\n    timeout-minutes: 90\n",
         ),
+        # Per shard: each shard is its own 4-vCPU runner.
         Replace(
             "tests: e2e-upgrade workers",
-            'HERMES_TEST_WORKERS: "4"\n          HERMES_TEST_FILE_TIMEOUT: "3000"\n',
+            'HERMES_TEST_WORKERS: "6"\n          HERMES_TEST_FILE_TIMEOUT: "3000"\n',
             'HERMES_TEST_WORKERS: "2"\n          HERMES_TEST_FILE_TIMEOUT: "3000"\n',
         ),
     ),
