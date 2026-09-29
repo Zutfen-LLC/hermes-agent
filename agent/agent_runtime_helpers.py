@@ -1858,7 +1858,16 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     restricted_binding = getattr(agent, "_restricted_wire_binding", None)
     if restricted_binding is None:
         from agent.restricted_init_guard import _restricted_init_binding
-        restricted_binding = _restricted_init_binding.get()
+        carried = _restricted_init_binding.get()
+        if carried is not None:
+            # The ContextVar is active only within a restricted construction's dynamic
+            # extent; a NESTED construction running inside it (e.g. triggered from a
+            # provider hook) sees the same ContextVar, so the carried binding is
+            # accepted only from the instance that carries the minted single-use
+            # construction token. Every other agent builds unguarded.
+            token = getattr(agent, "_restricted_construction_token", None)
+            if token is not None and token is carried[0]:
+                restricted_binding = carried[1]
     restricted_wire = restricted_binding is not None
     if restricted_wire:
         if str(client_kwargs.get("base_url") or "").rstrip("/") != str(

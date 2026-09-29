@@ -158,7 +158,10 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
         _validate_tool_free_route(creds)
     else:
         raise RuntimeError("unknown restricted capability envelope")
+    from agent.restricted_init_guard import (
+        _restricted_init_binding, claim_construction, restricted_construction)
     from run_agent import AIAgent
+    real_agent_new = AIAgent.__new__
     # Never forward profile metadata or credential-resolution bookkeeping as constructor kwargs.
     kwargs: dict[str, Any] = {key: creds.get(key) for key in
                               ("provider", "model", "api_key", "base_url", "api_mode", "request_overrides")
@@ -181,11 +184,32 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
     # initialization-time client build — so later request-time builds keep reading the
     # retained instance binding.
     if envelope == "hermes_tool_free_v1":
+        # One single-use token pairs THIS construction with its binding: the guarded
+        # instance is stamped by the __new__ hook below (the only pre-init seam
+        # AIAgent has), so a nested construction inside the constructor's dynamic
+        # extent sees the ContextVar but cannot claim it and builds unguarded.
+        construction = restricted_construction()
+
+        def stamped_new(cls, *args, **kwargs):
+            instance = real_agent_new(cls)
+            claim_construction(instance, construction)
+            return instance
+
         ctx = contextvars.copy_context()
         ctx.run(_restricted_init_binding.set,
-                (str(creds["provider"]).strip().lower(), creds["model"], creds["base_url"],
-                 "chat_completions"))
-        agent = ctx.run(AIAgent, **kwargs)
+                (construction,
+                 (str(creds["provider"]).strip().lower(), creds["model"], creds["base_url"],
+                  "chat_completions")))
+
+        def construct() -> Any:
+            # The stamping __new__ is bound as an UNBOUND helper: call it for the raw
+            # instance, then run __init__ on it — the exact sequence type.__call__
+            # performs — all inside the guarded context.
+            instance = stamped_new(AIAgent)
+            instance.__init__(**kwargs)
+            return instance
+
+        agent: Any = ctx.run(construct)
     else:
         agent = AIAgent(**kwargs)
     effective = {"provider": agent.provider, "base_url": agent.base_url,
@@ -195,19 +219,19 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
         _validate_restricted_route(effective)
     else:
         _validate_tool_free_route(effective)
-        agent._restricted_wire_binding = (agent.provider, agent.model, agent.base_url, agent.api_mode)
-        agent._disable_streaming = True
+        agent._restricted_wire_binding = (agent.provider, agent.model, agent.base_url, agent.api_mode)  # type: ignore
+        agent._disable_streaming = True  # type: ignore
     if getattr(agent, "_fallback_activated", False) or getattr(agent, "_fallback_chain", []):
         raise RuntimeError("restricted route cannot use fallback providers")
-    agent._auto_recovery_cycles = 0
+    agent._auto_recovery_cycles = 0  # type: ignore
     # Model tool resolution consumes these fields each turn; pin them even if a
     # platform/default toolset resolver is later broadened.
-    agent.enabled_toolsets = []
-    agent.disabled_toolsets = no_toolsets
+    agent.enabled_toolsets = []  # type: ignore
+    agent.disabled_toolsets = no_toolsets  # type: ignore
     if not _check_restricted_tool_boundary(agent):
         raise RuntimeError("restricted tool boundary could not be enforced")
     if authority is not None:
-        agent._auth_authority = authority
+        agent._auth_authority = authority  # type: ignore
         agent._credential_pool_entry_id = authority.entry_id
     return agent
 
