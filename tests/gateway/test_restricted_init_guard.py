@@ -223,17 +223,24 @@ def test_ordinary_construction_is_isolated_from_active_restricted_guard(restrict
     from providers import ProviderProfile
 
     calls = {"ordinary_extras": 0, "ordinary_create_client": 0}
-    hostile_profile = ProviderProfile(name="deepinfra", base_url=CREDS["base_url"],
-                                      auth_type="api_key")
-    hostile_profile.build_client_kwargs_extras = lambda **ctx: (
-        calls.__setitem__("ordinary_extras", calls["ordinary_extras"] + 1) or {})
-    hostile_profile.create_client = lambda **kw: (
-        calls.__setitem__("ordinary_create_client", calls["ordinary_create_client"] + 1) or None)
+    ordinary_profile = ProviderProfile(name="deepinfra", base_url=CREDS["base_url"],
+                                       auth_type="api_key")
+
+    def _counted_extras(**ctx):
+        calls["ordinary_extras"] += 1
+        return {}
+
+    def _counted_create_client(**kw):
+        calls["ordinary_create_client"] += 1
+        return None  # base-class semantics: the SDK client is the correct outcome
+
+    ordinary_profile.build_client_kwargs_extras = _counted_extras
+    ordinary_profile.create_client = _counted_create_client
 
     # Same plugin-discovery-first discipline as the hostile-profile proof above.
     providers.get_provider_profile("deepinfra")
-    monkeypatch.setitem(providers._REGISTRY, "deepinfra", hostile_profile)
-    assert providers.get_provider_profile("deepinfra") is hostile_profile
+    monkeypatch.setitem(providers._REGISTRY, "deepinfra", ordinary_profile)
+    assert providers.get_provider_profile("deepinfra") is ordinary_profile
 
     _, adapter = restricted_service
     parked = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(2)}
@@ -270,9 +277,9 @@ def test_ordinary_construction_is_isolated_from_active_restricted_guard(restrict
     # The ordinary agent ran its OWN provider profile hooks despite the active guard.
     assert calls["ordinary_extras"] > 0, (
         "ordinary profile build_client_kwargs_extras suppressed by the active restricted guard")
-    assert calls["ordinary_create_client"] == 0, (
-        "ordinary profile create_client fired unexpectedly; this recording-only counter "
-        "exists so a future default-profile change keeps the hook observable")
+    assert calls["ordinary_create_client"] == 1, (
+        "ordinary profile create_client not consulted; the provider hook ladder must run "
+        "normally (the stock hook returns None and the SDK client is the correct outcome)")
     assert type(ordinary.client).__name__ == "OpenAI", "ordinary agent lost its normal client"
     assert getattr(ordinary, "_restricted_wire_binding", None) is None, (
         "ordinary agent inherited the restricted binding")

@@ -1845,15 +1845,21 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # that specific path; this copy locks the contract so future transport/keepalive work can't reintroduce
     # the same class of bug.
     client_kwargs = dict(client_kwargs)
-    restricted_binding = getattr(type(agent), "_restricted_wire_binding", None)
-    restricted_wire = getattr(agent, "_restricted_wire_binding", None) is not None
-    if restricted_wire and not restricted_binding:
-        # A restricted constructor lays the binding on the class for the duration of
-        # __init__ because AIAgent has no pre-init hook: the guard must already be
-        # active while THIS function builds the init-time client. Read the class
-        # fallback through type(agent) so a subclass of AIAgent is covered too.
-        restricted_binding = agent._restricted_wire_binding
-        restricted_wire = restricted_binding is not None
+    # Restricted init-time guard (R3): the ONLY source of an initialization-time
+    # binding is the construction-local ContextVar set by ``_new_restricted_agent`` on
+    # the exact ``Context`` the restricted constructor runs in (see
+    # ``agent.restricted_init_guard`` — a dependency-free leaf both layers import, so
+    # this chokepoint has no gateway-layer coupling). It is consulted solely for an
+    # agent that has no durable per-instance binding yet — i.e. its own
+    # initialization-time client build — so a concurrent or later client build for any
+    # other agent (ordinary or restricted) can never observe it, and a completed
+    # restricted agent keeps validating against its retained instance binding. No
+    # mutable class state exists to leak across constructions.
+    restricted_binding = getattr(agent, "_restricted_wire_binding", None)
+    if restricted_binding is None:
+        from agent.restricted_init_guard import _restricted_init_binding
+        restricted_binding = _restricted_init_binding.get()
+    restricted_wire = restricted_binding is not None
     if restricted_wire:
         if str(client_kwargs.get("base_url") or "").rstrip("/") != str(
                 restricted_binding[2]).rstrip("/"):
