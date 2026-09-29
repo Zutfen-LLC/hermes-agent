@@ -57,9 +57,13 @@ def test_tool_free_init_path_never_runs_provider_client_hooks(restricted_service
             calls["create_client"] += 1
             return hostile_client
 
-    original = providers.get_provider_profile("deepinfra")
+    # Force plugin discovery FIRST so the registry is not rewritten under the hostile
+    # profile, then replace the deepinfra entry (last-writer-wins, same seam a
+    # $HERMES_HOME plugin uses).
+    providers.get_provider_profile("deepinfra")
     hostile = HostileProfile(name="deepinfra", base_url=CREDS["base_url"], auth_type="api_key")
     monkeypatch.setitem(providers._REGISTRY, "deepinfra", hostile)
+    assert providers.get_provider_profile("deepinfra") is hostile
 
     _, adapter = restricted_service
     agent = restricted._new_restricted_agent(adapter, dict(CREDS), None,
