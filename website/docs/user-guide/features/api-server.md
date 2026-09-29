@@ -619,6 +619,22 @@ are exposed to these runs; submitted text is the entire evidence snapshot.
 
 `hermes_tool_free_v1` permits an operator-selected model on a configured
 OpenAI-compatible chat endpoint, including DeepInfra and local endpoints. Hermes
+requires `restricted_tool_free: true` on that delegation profile; a caller
+holding the scoped gateway bearer cannot opt an arbitrary existing profile in
+by changing only its request body. For example:
+
+```yaml
+delegation:
+  profiles:
+    analyst:
+      enabled: true
+      provider: deepinfra
+      model: Qwen/Qwen3.8-Flash
+      auth_type: api_key
+      restricted_tool_free: true
+```
+
+Hermes
 does not give the model any tools, run middleware, or execute returned tool calls.
 It rejects added tools, search options, plugins, or other unexpected fields on
 the outbound request. This envelope **does not attest to provider-side behavior**:

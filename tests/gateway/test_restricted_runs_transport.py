@@ -96,7 +96,8 @@ def _route_mocks(monkeypatch, *, secret="native-secret", output="bounded result"
 
     monkeypatch.setattr("tools.delegate_tool_config._resolve_profile_execution", resolve)
     monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._restricted_profile_config",
-                        lambda self, name, **kw: {"profiles": {name: {"enabled": True}}})
+                        lambda self, name, **kw: {"profiles": {name: {
+                            "enabled": True, "restricted_tool_free": True}}})
     monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._new_restricted_agent", create)
     return observed
 
@@ -167,6 +168,21 @@ async def test_tool_free_envelope_is_durable_and_does_not_change_original_run(re
     old_envelope = await client.post("/v1/restricted-runs", json=REQUEST, headers=headers)
     assert old_envelope.status == 409
     assert (await _terminal_status(client, run_id))["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_tool_free_requires_operator_profile_opt_in_before_reservation(restricted_service, monkeypatch):
+    client, adapter = restricted_service
+    observed = _route_mocks(monkeypatch)
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._restricted_profile_config",
+                        lambda self, name, **kw: {"profiles": {name: {"enabled": True}}})
+    response = await client.post("/v1/restricted-runs",
+        json={**REQUEST, "capability_envelope": "hermes_tool_free_v1"},
+        headers={**RESTRICTED_AUTH, "Idempotency-Key": "no-opt-in"})
+    assert response.status == 403
+    assert "agent" not in observed
+    assert not adapter._run_idempotency_store._conn.execute(
+        "SELECT 1 FROM run_idempotency WHERE idempotency_key='no-opt-in'").fetchone()
 
 
 def test_restricted_agent_factory_pins_no_tools(monkeypatch):

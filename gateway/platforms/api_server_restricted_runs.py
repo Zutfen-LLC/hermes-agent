@@ -270,6 +270,8 @@ async def _handle_restricted_runs(self, request, *, _api_server):
         request_profile = _api_server._api_request_profile.get()
         with self._profile_scope(request_profile):
             creds, reasoning, raw, authority = _resolve_restricted_route(self, profile, _api_server=_api_server)
+            if envelope == "hermes_tool_free_v1" and raw.get("restricted_tool_free") is not True:
+                raise RuntimeError("delegation profile has not opted into the tool-free envelope")
             from agent.redact import register_provider_credential_redaction
             credential_lease = register_provider_credential_redaction(creds.get("api_key"))
             agent = _new_restricted_agent(self, creds, reasoning, authority,
