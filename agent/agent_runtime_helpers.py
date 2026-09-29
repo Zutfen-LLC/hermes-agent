@@ -1845,10 +1845,23 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # that specific path; this copy locks the contract so future transport/keepalive work can't reintroduce
     # the same class of bug.
     client_kwargs = dict(client_kwargs)
+    restricted_binding = getattr(type(agent), "_restricted_wire_binding", None)
     restricted_wire = getattr(agent, "_restricted_wire_binding", None) is not None
-    if restricted_wire and str(client_kwargs.get("base_url") or "").rstrip("/") != str(
-            agent._restricted_wire_binding[2]).rstrip("/"):
-        raise RuntimeError("restricted tool-free client route drift")
+    if restricted_wire and not restricted_binding:
+        # A restricted constructor lays the binding on the class for the duration of
+        # __init__ because AIAgent has no pre-init hook: the guard must already be
+        # active while THIS function builds the init-time client. Read the class
+        # fallback through type(agent) so a subclass of AIAgent is covered too.
+        restricted_binding = agent._restricted_wire_binding
+        restricted_wire = restricted_binding is not None
+    if restricted_wire:
+        if str(client_kwargs.get("base_url") or "").rstrip("/") != str(
+                restricted_binding[2]).rstrip("/"):
+            raise RuntimeError("restricted tool-free client route drift")
+        # Provider-profile extras and the provider-supplied-client hook are arbitrary
+        # provider code: they never run (and never build a client) on a restricted wire.
+        client_kwargs.pop("default_headers", None)
+        client_kwargs.pop("default_query", None)
     try:
         from providers import get_provider_profile
 
@@ -1886,6 +1899,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # point can ship a transport without editing this function (what makes an out-of-tree ACP
     # provider possible). None (the default) falls through, so existing providers are unaffected.
     provider_client = None if restricted_wire else _provider_supplied_client(agent, client_kwargs)
+    if provider_client is not None and restricted_wire:
+        # Defense against a stale base_url-prefix lookup: the profile seam was already
+        # skipped above, so a hit here means the resolver returned a cached profile.
+        raise RuntimeError("restricted tool-free route cannot use a provider-supplied client")
     if provider_client is not None:
         _ra().logger.info(
             "%s client created from provider profile (%s, shared=%s) %s",
