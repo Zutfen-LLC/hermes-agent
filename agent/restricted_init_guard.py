@@ -19,4 +19,5 @@ Isolation properties (why this replaced the temporary class attribute):
 
 import contextvars
 
-_restricted_init_binding = contextvars.ContextVar("_restricted_init_binding", default=None)
+_restricted_init_binding: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
+    "_restricted_init_binding", default=None)

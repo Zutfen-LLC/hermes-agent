@@ -160,9 +160,9 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
         raise RuntimeError("unknown restricted capability envelope")
     from run_agent import AIAgent
     # Never forward profile metadata or credential-resolution bookkeeping as constructor kwargs.
-    kwargs = {key: creds.get(key) for key in
-              ("provider", "model", "api_key", "base_url", "api_mode", "request_overrides")
-              if creds.get(key) is not None}
+    kwargs: dict[str, Any] = {key: creds.get(key) for key in
+                              ("provider", "model", "api_key", "base_url", "api_mode", "request_overrides")
+                              if creds.get(key) is not None}
     from toolsets import get_all_toolsets
     no_toolsets = sorted(get_all_toolsets())
     kwargs.update(enabled_toolsets=[], disabled_toolsets=no_toolsets, max_iterations=_MAX_ITERATIONS,

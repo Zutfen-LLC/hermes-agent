@@ -223,19 +223,21 @@ def test_ordinary_construction_is_isolated_from_active_restricted_guard(restrict
     from providers import ProviderProfile
 
     calls = {"ordinary_extras": 0, "ordinary_create_client": 0}
-    ordinary_profile = ProviderProfile(name="deepinfra", base_url=CREDS["base_url"],
+
+    class OrdinaryProfile(ProviderProfile):
+        """Counting stand-in for the deepinfra profile: same base-class semantics,
+        observable invocations."""
+
+        def build_client_kwargs_extras(self, **context):
+            calls["ordinary_extras"] += 1
+            return {}
+
+        def create_client(self, **client_kwargs):
+            calls["ordinary_create_client"] += 1
+            return None  # base-class semantics: the SDK client is the correct outcome
+
+    ordinary_profile = OrdinaryProfile(name="deepinfra", base_url=CREDS["base_url"],
                                        auth_type="api_key")
-
-    def _counted_extras(**ctx):
-        calls["ordinary_extras"] += 1
-        return {}
-
-    def _counted_create_client(**kw):
-        calls["ordinary_create_client"] += 1
-        return None  # base-class semantics: the SDK client is the correct outcome
-
-    ordinary_profile.build_client_kwargs_extras = _counted_extras
-    ordinary_profile.create_client = _counted_create_client
 
     # Same plugin-discovery-first discipline as the hostile-profile proof above.
     providers.get_provider_profile("deepinfra")
@@ -243,7 +245,7 @@ def test_ordinary_construction_is_isolated_from_active_restricted_guard(restrict
     assert providers.get_provider_profile("deepinfra") is ordinary_profile
 
     _, adapter = restricted_service
-    parked = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(2)}
+    parked: dict = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(2)}
     _install_restricted_construction_parking(monkeypatch, parked)
 
     restricted_error = []
@@ -314,18 +316,26 @@ def test_two_restricted_constructions_with_distinct_bindings_do_not_cross_contam
     from providers import ProviderProfile
 
     hostile_calls = {"extras": 0, "create_client": 0}
-    hostile_profile = ProviderProfile(name="deepinfra", base_url=CREDS["base_url"],
-                                      auth_type="api_key")
-    hostile_profile.build_client_kwargs_extras = lambda **ctx: (
-        hostile_calls.__setitem__("extras", hostile_calls["extras"] + 1) or {})
-    hostile_profile.create_client = lambda **kw: (
-        hostile_calls.__setitem__("create_client", hostile_calls["create_client"] + 1) or None)
+
+    class CountingHostileProfile(ProviderProfile):
+        """Counting hostile stand-in: both hooks recorded, base-class semantics."""
+
+        def build_client_kwargs_extras(self, **context):
+            hostile_calls["extras"] += 1
+            return {}
+
+        def create_client(self, **client_kwargs):
+            hostile_calls["create_client"] += 1
+            return None
+
+    hostile_profile = CountingHostileProfile(name="deepinfra", base_url=CREDS["base_url"],
+                                             auth_type="api_key")
     providers.get_provider_profile("deepinfra")
     monkeypatch.setitem(providers._REGISTRY, "deepinfra", hostile_profile)
     assert providers.get_provider_profile("deepinfra") is hostile_profile
 
     _, adapter = restricted_service
-    parked = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(3)}
+    parked: dict = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(3)}
     _install_restricted_construction_parking(monkeypatch, parked)
 
     errors = []
