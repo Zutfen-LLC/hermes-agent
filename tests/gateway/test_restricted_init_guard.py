@@ -14,16 +14,36 @@ and passes on the corrected head (the guard precedes any client construction; th
 request rides the guarded, non-redirecting SDK client through the real production
 client-construction path with only the transport stubbed).
 
+R3 (process-global guard race): the reviewed head activates the init-time guard by
+temporarily mutating the ``AIAgent`` CLASS (``AIAgent._restricted_wire_binding = ...``).
+That state is process-global, so an unrelated construction overlapping a parked
+restricted construction inherits (or is suppressed by) another request's binding, and two
+concurrent restricted constructions overwrite/delete each other's guard.
+
+[RED] ``test_ordinary_construction_is_isolated_from_active_restricted_guard`` — while a
+restricted construction is parked inside the client chokepoint with its guard active, an
+ordinary deepinfra agent must still run its own provider profile hooks; at the reviewed
+head the class-level binding suppresses them (counters stay 0).
+
+[RED] ``test_two_restricted_constructions_with_distinct_bindings_do_not_cross_contaminate``
+— two ``hermes_tool_free_v1`` constructions with different model/base_url bindings,
+deterministically overlapped with a ``threading.Barrier`` inside the chokepoint: each
+must observe only its own binding, neither may overwrite or remove the other's guard, and
+both final per-instance bindings and non-redirecting clients must be intact. At the
+reviewed head the last writer's class attribute is what the chokepoint resolves.
+
 [PIN] The remaining tests pin retained behavior: the ``input_only_v1`` envelope keeps its
 exact v1 initialization semantics, and the tool-free binding drives the guard chokepoint.
 Every positive expectation was probe-verified against the production functions on the
 reviewed head before being written.
 """
 import json
+import threading
 
 import httpx
 import pytest
 
+import agent.agent_runtime_helpers as agent_runtime_helpers
 from gateway.platforms import api_server, api_server_restricted_runs as restricted
 from tests.gateway.test_restricted_runs_transport import restricted_service
 
@@ -153,3 +173,190 @@ def test_tool_free_binding_is_the_resolved_route_and_drives_the_chokepoint(restr
     drifted["base_url"] = "https://evil.invalid/v1"
     with pytest.raises(RuntimeError, match="route drift"):
         agent._create_openai_client(drifted, reason="binding-pin", shared=True)
+
+_RESTRICTED_CREDS_A = dict(CREDS, model="Qwen/Qwen3.8-Flash",
+                           base_url="https://api.deepinfra.com/v1/openai")
+_RESTRICTED_CREDS_B = dict(CREDS, model="Qwen/Qwen3.8-Flash-B",
+                           base_url="https://deepinfra-b.example/v1")
+
+
+def _install_restricted_construction_parking(monkeypatch, parked: dict) -> None:
+    """Park every registered restricted builder thread deterministically INSIDE
+    ``AIAgent.__new__`` — after ``_new_restricted_agent`` has activated its guard and
+    before the constructor reaches the client chokepoint — so a sibling construction
+    deterministically overlaps an ACTIVE restricted guard.
+
+    Membership rides the builder thread's identity (registered at thread start in
+    ``parked["owners"]``), never shared security state; ordinary constructions on other
+    threads pass straight through.
+    """
+    import run_agent
+
+    real_agent_new = run_agent.AIAgent.__new__
+
+    def marked_new(cls, *args, **kwargs):
+        if threading.current_thread().ident in parked["owners"]:
+            parked["parked_ids"].add(threading.current_thread().ident)
+            parked["barrier"].wait(timeout=15)
+        return real_agent_new(cls)
+
+    monkeypatch.setattr(run_agent.AIAgent, "__new__", marked_new)
+
+
+def test_ordinary_construction_is_isolated_from_active_restricted_guard(restricted_service, monkeypatch):
+    """[RED] An ordinary agent constructed while a restricted guard is ACTIVE keeps its
+    own provider profile hooks, route, and client.
+
+    A ``hermes_tool_free_v1`` construction is parked deterministically inside
+    ``AIAgent.__new__`` — its guard is already active (class binding set) and the
+    constructor has not yet reached the client chokepoint. While parked, an ordinary
+    deepinfra agent is constructed through the real ``AIAgent`` constructor. The
+    ordinary agent must execute its own (observable) profile extras hook, build its
+    normal SDK client, and carry no restricted binding; the parked restricted agent
+    must still complete with its own binding intact. At the reviewed head the
+    process-global ``AIAgent._restricted_wire_binding`` class attribute is visible to
+    the ordinary construction (instance lookup falls through to the class), so the
+    profile extras are suppressed and the ordinary agent inherits the binding — the
+    class-state defect.
+    """
+    import providers
+    from providers import ProviderProfile
+
+    calls = {"ordinary_extras": 0, "ordinary_create_client": 0}
+    hostile_profile = ProviderProfile(name="deepinfra", base_url=CREDS["base_url"],
+                                      auth_type="api_key")
+    hostile_profile.build_client_kwargs_extras = lambda **ctx: (
+        calls.__setitem__("ordinary_extras", calls["ordinary_extras"] + 1) or {})
+    hostile_profile.create_client = lambda **kw: (
+        calls.__setitem__("ordinary_create_client", calls["ordinary_create_client"] + 1) or None)
+
+    # Same plugin-discovery-first discipline as the hostile-profile proof above.
+    providers.get_provider_profile("deepinfra")
+    monkeypatch.setitem(providers._REGISTRY, "deepinfra", hostile_profile)
+    assert providers.get_provider_profile("deepinfra") is hostile_profile
+
+    _, adapter = restricted_service
+    parked = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(2)}
+    _install_restricted_construction_parking(monkeypatch, parked)
+
+    restricted_error = []
+    restricted_agent = []
+
+    def build_restricted():
+        parked["owners"][threading.current_thread().ident] = "restricted"
+        try:
+            restricted_agent.append(restricted._new_restricted_agent(
+                adapter, dict(_RESTRICTED_CREDS_A), None,
+                _api_server=api_server, envelope="hermes_tool_free_v1"))
+        except Exception as error:  # pragma: no cover - reported below
+            restricted_error.append(error)
+
+    worker = threading.Thread(target=build_restricted, daemon=True)
+    worker.start()
+    # Pair with the restricted builder: when this wait returns, the restricted guard is
+    # ACTIVE and the construction is parked inside __new__.
+    parked["barrier"].wait(timeout=15)
+    assert parked["parked_ids"], "restricted construction never parked"
+
+    # Overlapping ORDINARY construction through the real production constructor while
+    # the restricted guard is active.
+    from run_agent import AIAgent
+    ordinary = AIAgent(provider="deepinfra", model="Qwen/Qwen3.8-Flash", api_key="ordinary-key",
+                       base_url=CREDS["base_url"], api_mode="chat_completions",
+                       enabled_toolsets=[], disabled_toolsets=[],
+                       max_iterations=3, platform="api_server", quiet_mode=True,
+                       verbose_logging=False, skip_context_files=True, skip_memory=True)
+
+    # The ordinary agent ran its OWN provider profile hooks despite the active guard.
+    assert calls["ordinary_extras"] > 0, (
+        "ordinary profile build_client_kwargs_extras suppressed by the active restricted guard")
+    assert calls["ordinary_create_client"] == 0, (
+        "ordinary profile create_client fired unexpectedly; this recording-only counter "
+        "exists so a future default-profile change keeps the hook observable")
+    assert type(ordinary.client).__name__ == "OpenAI", "ordinary agent lost its normal client"
+    assert getattr(ordinary, "_restricted_wire_binding", None) is None, (
+        "ordinary agent inherited the restricted binding")
+    assert ordinary.base_url == CREDS["base_url"], "ordinary agent route drifted"
+
+    worker.join(timeout=60)
+    assert not restricted_error, f"restricted construction failed: {restricted_error}"
+    assert restricted_agent, "restricted construction never completed"
+    expected = (_RESTRICTED_CREDS_A["provider"], _RESTRICTED_CREDS_A["model"],
+                _RESTRICTED_CREDS_A["base_url"], "chat_completions")
+    assert restricted_agent[0]._restricted_wire_binding == expected
+    assert type(restricted_agent[0].client).__name__ == "OpenAI"
+    assert restricted_agent[0].client._client.follow_redirects is False
+
+
+def test_two_restricted_constructions_with_distinct_bindings_do_not_cross_contaminate(
+        restricted_service, monkeypatch):
+    """[RED] Two overlapping ``hermes_tool_free_v1`` constructions with distinct model /
+    base_url bindings each observe ONLY their own binding at the init-time client build;
+    neither can overwrite or remove the other's guard.
+
+    Deterministic overlap: both builder threads park inside ``AIAgent.__new__`` on a
+    ``threading.Barrier`` (each AFTER its guard is active), so both constructions are
+    open simultaneously before either client chokepoint runs. At the reviewed head the
+    process-global class attribute holds only ONE binding at a time: the second writer's
+    value is what both chokepoints read (route drift for the first), and the first
+    constructor's cleanup ``del`` removes the other's active guard mid-construction.
+    Both constructions must complete with their own per-instance binding and a
+    non-redirecting SDK client, and no provider profile hook may run for either.
+    """
+    import providers
+    from providers import ProviderProfile
+
+    hostile_calls = {"extras": 0, "create_client": 0}
+    hostile_profile = ProviderProfile(name="deepinfra", base_url=CREDS["base_url"],
+                                      auth_type="api_key")
+    hostile_profile.build_client_kwargs_extras = lambda **ctx: (
+        hostile_calls.__setitem__("extras", hostile_calls["extras"] + 1) or {})
+    hostile_profile.create_client = lambda **kw: (
+        hostile_calls.__setitem__("create_client", hostile_calls["create_client"] + 1) or None)
+    providers.get_provider_profile("deepinfra")
+    monkeypatch.setitem(providers._REGISTRY, "deepinfra", hostile_profile)
+    assert providers.get_provider_profile("deepinfra") is hostile_profile
+
+    _, adapter = restricted_service
+    parked = {"owners": {}, "parked_ids": set(), "barrier": threading.Barrier(3)}
+    _install_restricted_construction_parking(monkeypatch, parked)
+
+    errors = []
+    agents = {}
+
+    def build(key, creds):
+        parked["owners"][threading.current_thread().ident] = key
+        try:
+            agents[key] = restricted._new_restricted_agent(
+                adapter, dict(creds), None, _api_server=api_server,
+                envelope="hermes_tool_free_v1")
+        except Exception as error:
+            errors.append((key, error))
+
+    threads = [threading.Thread(target=build, args=(key, creds), daemon=True)
+               for key, creds in (("a", _RESTRICTED_CREDS_A), ("b", _RESTRICTED_CREDS_B))]
+    for thread in threads:
+        thread.start()
+    parked["barrier"].wait(timeout=15)  # third party: release only when BOTH are parked
+    assert len(parked["parked_ids"]) == 2, (
+        f"expected both constructions parked, saw {parked['parked_ids']}")
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert not errors, f"restricted constructions failed: {errors}"
+    assert hostile_calls == {"extras": 0, "create_client": 0}, (
+        f"a restricted construction lost its guard and ran provider hooks: {hostile_calls}")
+    assert len(agents) == 2
+
+    expected = {
+        "a": (_RESTRICTED_CREDS_A["provider"], _RESTRICTED_CREDS_A["model"],
+              _RESTRICTED_CREDS_A["base_url"], "chat_completions"),
+        "b": (_RESTRICTED_CREDS_B["provider"], _RESTRICTED_CREDS_B["model"],
+              _RESTRICTED_CREDS_B["base_url"], "chat_completions"),
+    }
+    for key, agent in agents.items():
+        assert agent._restricted_wire_binding == expected[key], (
+            f"agent {key} carries binding {agent._restricted_wire_binding}")
+        assert (agent.provider, agent.model, agent.base_url, agent.api_mode) == expected[key]
+        assert type(agent.client).__name__ == "OpenAI"
+        assert agent.client._client.follow_redirects is False
