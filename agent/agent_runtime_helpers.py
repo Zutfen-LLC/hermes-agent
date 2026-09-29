@@ -1845,10 +1845,14 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # that specific path; this copy locks the contract so future transport/keepalive work can't reintroduce
     # the same class of bug.
     client_kwargs = dict(client_kwargs)
+    restricted_wire = getattr(agent, "_restricted_wire_binding", None) is not None
+    if restricted_wire and str(client_kwargs.get("base_url") or "").rstrip("/") != str(
+            agent._restricted_wire_binding[2]).rstrip("/"):
+        raise RuntimeError("restricted tool-free client route drift")
     try:
         from providers import get_provider_profile
 
-        profile = get_provider_profile(getattr(agent, "provider", ""))
+        profile = None if restricted_wire else get_provider_profile(getattr(agent, "provider", ""))
         if profile is not None:
             for key, value in profile.build_client_kwargs_extras(
                 base_url=client_kwargs.get("base_url", "")
@@ -1856,6 +1860,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
                 client_kwargs.setdefault(key, value)
     except Exception:
         _ra().logger.debug("Provider client-kwargs hook skipped", exc_info=True)
+    if restricted_wire and "http_client" in client_kwargs:
+        raise RuntimeError("restricted tool-free route cannot use an injected HTTP client")
     # The MoA virtual provider has no OpenAI wire endpoint; the facade *is* the client. Rebuild the
     # facade, never a native client (TypeError; relay re-wire).
     # Rebuilding a native OpenAI client while agent.provider == "moa" (client replacement, stream-retry pool
@@ -1879,7 +1885,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # before the built-in ladder so a profile registered from ~/.hermes/plugins/ or a pip entry
     # point can ship a transport without editing this function (what makes an out-of-tree ACP
     # provider possible). None (the default) falls through, so existing providers are unaffected.
-    provider_client = _provider_supplied_client(agent, client_kwargs)
+    provider_client = None if restricted_wire else _provider_supplied_client(agent, client_kwargs)
     if provider_client is not None:
         _ra().logger.info(
             "%s client created from provider profile (%s, shared=%s) %s",
@@ -1887,7 +1893,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         )
         return provider_client
     from agent.auxiliary_client import _GEMINI_NATIVE_PROVIDER_NAMES
-    if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
+    if not restricted_wire and agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
             return client
@@ -1917,6 +1923,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         )
     if "http_client" not in client_kwargs:
         keepalive_http = agent._build_keepalive_http_client(client_kwargs.get("base_url", ""), verify=httpx_verify)
+        if restricted_wire and (keepalive_http is None or keepalive_http.follow_redirects):
+            raise RuntimeError("restricted tool-free route requires a non-redirecting HTTP client")
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
     # Retries belong to the outer conversation loop (honors Retry-After); SDK retries would
@@ -1936,6 +1944,8 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         client_kwargs, access_token=client_kwargs.get("api_key", ""),
         base_url=str(client_kwargs.get("base_url", "")),
     )
+    if restricted_wire and (client_kwargs.get("default_headers") or client_kwargs.get("default_query")):
+        raise RuntimeError("restricted tool-free client options are not enforceable")
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)

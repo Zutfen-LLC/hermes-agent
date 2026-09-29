@@ -592,7 +592,7 @@ When `session_id` identifies an existing Hermes session and no explicit
 that session's active transcript. Session turn leases serialize concurrent
 writers and refresh the transcript after a contended wait.
 
-### POST /v1/restricted-runs (input-only delegated analysis)
+### POST /v1/restricted-runs (restricted delegated analysis)
 
 For callers that must not receive the full gateway bearer, set a **distinct**
 `API_SERVER_RESTRICTED_KEY` in the served profile's `.env` (or
@@ -606,15 +606,26 @@ An unset, weak, or identical restricted key does not grant scoped access.
 
 The JSON body must contain exactly `delegation_profile_id`, `work_class`
 (`context_gather`, `log_triage`, `process_observe`, or `ci_triage`), `input`
-(a bounded string), and `capability_envelope: "input_only_v1"`. A visible-ASCII
+(a bounded string), and a `capability_envelope` of `input_only_v1` or
+`hermes_tool_free_v1`. A visible-ASCII
 `Idempotency-Key` header is required; retries replay the original run, even
 after a key rotation. The delegation profile, not the request, selects model
-and provider credentials. Currently only approved native OpenAI chat models
+and provider credentials. `input_only_v1` admits only approved native OpenAI chat models
 (GPT-4o, GPT-4.1, GPT-5 and their approved mini/nano variants) and approved
 native Anthropic Claude chat models may run. Unknown variants and models that
 can browse autonomously (including OpenAI search models) are rejected before
 admission. No Hermes tools, repository, filesystem, host, or network access
 are exposed to these runs; submitted text is the entire evidence snapshot.
+
+`hermes_tool_free_v1` permits an operator-selected model on a configured
+OpenAI-compatible chat endpoint, including DeepInfra and local endpoints. Hermes
+does not give the model any tools, run middleware, or execute returned tool calls.
+It rejects added tools, search options, plugins, or other unexpected fields on
+the outbound request. This envelope **does not attest to provider-side behavior**:
+an opaque provider may independently enable browsing or hosted actions without
+Hermes requesting them. The operator must trust the configured provider for that
+property. Use `input_only_v1` when that stronger assurance is required. A caller
+cannot choose a provider, model, URL, credential, or fallback in the request.
 
 If the gateway accepted a run but the client lost its `run_id`, recover it
 without posting another run: `GET /v1/restricted-runs/by-key` with the same
@@ -622,7 +633,7 @@ without posting another run: `GET /v1/restricted-runs/by-key` with the same
 `POST /v1/restricted-runs/by-key/stop` with that header requests interruption
 of that same run. Both require the served profile's restricted bearer (or its
 master bearer); neither accepts an arbitrary run ID or a key in the URL. They
-look up **only** previously admitted `input_only_v1` runs in the authenticated
+look up **only** previously admitted restricted runs with either envelope in the authenticated
 profile's durable store: missing/other-profile keys return 404, malformed keys
 400, absent/invalid bearer 401, and unavailable durable storage 503. A live
 worker remains `stopping` until it actually exits; repeating stop is safe and

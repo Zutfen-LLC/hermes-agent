@@ -20,6 +20,7 @@ _REQUIRED_FIELDS = frozenset({"delegation_profile_id", "work_class", "input", "c
 _MAX_INPUT_CHARS = 32_000
 _MAX_RESULT_CHARS = 16_000
 _MAX_ITERATIONS = 8
+_CAPABILITY_ENVELOPES = frozenset({"input_only_v1", "hermes_tool_free_v1"})
 _TRUSTED_ROUTES = {"openai": ("api.openai.com", "chat_completions"),
                    "anthropic": ("api.anthropic.com", "anthropic_messages")}
 # Explicit model-only chat families. Search-preview and search-api variants can
@@ -62,6 +63,48 @@ def _validate_restricted_route(creds: dict) -> None:
         raise RuntimeError("restricted route cannot guarantee input-only model execution")
 
 
+def _validate_tool_free_route(creds: dict) -> None:
+    """Accept an operator-selected chat route without claiming provider-side isolation."""
+    url = urlsplit(str(creds.get("base_url") or ""))
+    local = url.hostname in {"localhost", "127.0.0.1", "::1"}
+    if (not isinstance(creds.get("provider"), str) or not creds["provider"].strip()
+            or creds["provider"].strip().lower() == "moa"
+            or not isinstance(creds.get("model"), str) or not creds["model"].strip()
+            or (url.scheme != "https" and not (local and url.scheme == "http"))
+            or not url.hostname or url.username or url.password or url.query or url.fragment
+            or creds.get("api_mode", "chat_completions") != "chat_completions"
+            or creds.get("command") or creds.get("request_overrides")
+            or creds.get("fallback_providers")):
+        raise RuntimeError("restricted tool-free route is not enforceable")
+
+
+_TOOL_FREE_WIRE_FIELDS = frozenset({
+    "model", "messages", "temperature", "timeout", "max_tokens", "max_completion_tokens",
+    "top_p", "reasoning_effort", "stop", "seed", "frequency_penalty", "presence_penalty",
+    "response_format", "prompt_cache_key",
+})
+
+
+def _validate_tool_free_wire(agent: Any, kwargs: dict) -> None:
+    """Last local gate before the SDK sends a restricted request."""
+    binding = agent._restricted_wire_binding
+    if ((agent.provider, agent.model, agent.base_url, agent.api_mode) != binding
+            or agent.api_mode != "chat_completions"
+            or getattr(agent, "_fallback_activated", False)
+            or getattr(agent, "_fallback_chain", [])
+            or not _check_restricted_tool_boundary(agent)
+            or not isinstance(kwargs, dict)
+            or set(kwargs) - _TOOL_FREE_WIRE_FIELDS
+            or kwargs.get("model") != binding[1]
+            or not isinstance(kwargs.get("messages"), list)
+            or any(not isinstance(message, dict)
+                   or set(message) - {"role", "content"}
+                   or message.get("role") not in {"system", "developer", "user", "assistant"}
+                   or not isinstance(message.get("content"), str)
+                   for message in kwargs["messages"])):
+        raise RuntimeError("restricted tool-free outbound request was rejected")
+
+
 def _restricted_scope(self, request, *, _api_server) -> str:
     """Per served profile, never derived from rotating bearer key material."""
     profile = _api_server._api_request_profile.get() or "default"
@@ -93,13 +136,19 @@ def _resolve_restricted_route(self, profile: str, *, _api_server) -> tuple[dict,
     return creds, reasoning, raw if isinstance(raw, dict) else {}, authority
 
 
-def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = None, *, _api_server):
+def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = None, *,
+                          _api_server, envelope: str = "input_only_v1"):
     """Build a model-only agent: explicit empty tool selection and tight turn budget."""
     # External-process transports may be autonomous agents with their own host tools.
     # Hermes' empty tool schema cannot constrain such a child process.
     if creds.get("command") or getattr(authority, "auth_type", None) == "external_process":
         raise RuntimeError("restricted external-process transport is not enforceable")
-    _validate_restricted_route(creds)
+    if envelope == "input_only_v1":
+        _validate_restricted_route(creds)
+    elif envelope == "hermes_tool_free_v1":
+        _validate_tool_free_route(creds)
+    else:
+        raise RuntimeError("unknown restricted capability envelope")
     from run_agent import AIAgent
     # Never forward profile metadata or credential-resolution bookkeeping as constructor kwargs.
     kwargs = {key: creds.get(key) for key in
@@ -116,9 +165,15 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
     if reasoning is not None:
         kwargs["reasoning_config"] = reasoning
     agent = AIAgent(**kwargs)
-    _validate_restricted_route({"provider": agent.provider, "base_url": agent.base_url,
-                                "api_mode": agent.api_mode, "model": agent.model,
-                                "request_overrides": getattr(agent, "request_overrides", None)})
+    effective = {"provider": agent.provider, "base_url": agent.base_url,
+                 "api_mode": agent.api_mode, "model": agent.model,
+                 "request_overrides": getattr(agent, "request_overrides", None)}
+    if envelope == "input_only_v1":
+        _validate_restricted_route(effective)
+    else:
+        _validate_tool_free_route(effective)
+        agent._restricted_wire_binding = (agent.provider, agent.model, agent.base_url, agent.api_mode)
+        agent._disable_streaming = True
     if getattr(agent, "_fallback_activated", False) or getattr(agent, "_fallback_chain", []):
         raise RuntimeError("restricted route cannot use fallback providers")
     agent._auto_recovery_cycles = 0
@@ -188,7 +243,7 @@ async def _handle_restricted_runs(self, request, *, _api_server):
     if (not isinstance(profile, str) or not profile or len(profile) > 128
             or not isinstance(work_class, str) or work_class not in _ALLOWED_WORK_CLASSES
             or not isinstance(text, str) or not text.strip()
-            or len(text) > _MAX_INPUT_CHARS or envelope != "input_only_v1"):
+            or len(text) > _MAX_INPUT_CHARS or envelope not in _CAPABILITY_ENVELOPES):
         return _json_error(_api_server._openai_error, "Restricted run parameters are invalid.",
                            code="invalid_restricted_run", status=400)
     key = request.headers.get("Idempotency-Key", "")
@@ -217,7 +272,8 @@ async def _handle_restricted_runs(self, request, *, _api_server):
             creds, reasoning, raw, authority = _resolve_restricted_route(self, profile, _api_server=_api_server)
             from agent.redact import register_provider_credential_redaction
             credential_lease = register_provider_credential_redaction(creds.get("api_key"))
-            agent = _new_restricted_agent(self, creds, reasoning, authority, _api_server=_api_server)
+            agent = _new_restricted_agent(self, creds, reasoning, authority,
+                                          _api_server=_api_server, envelope=envelope)
             identity = _identity(self, profile, creds, raw, authority, agent=agent, _api_server=_api_server)
     except Exception:
         if "credential_lease" in locals() and credential_lease is not None:
@@ -275,7 +331,7 @@ def _recover_restricted_run(self, request, *, _api_server):
     try:
         scope = _restricted_scope(self, request, _api_server=_api_server)
         record = self._run_idempotency_store.lookup_key(scope, key)
-        if record is None or record["status"].get("capability_envelope") != "input_only_v1":
+        if record is None or record["status"].get("capability_envelope") not in _CAPABILITY_ENVELOPES:
             return None, None, _json_error(_api_server._openai_error, "Restricted run not found.",
                                            code="run_not_found", status=404)
         run_id = record["run_id"]
@@ -285,7 +341,7 @@ def _recover_restricted_run(self, request, *, _api_server):
             return None, None, _json_error(_api_server._openai_error, "Restricted run not found.",
                                            code="run_not_found", status=404)
         status = self._durable_run_status(request, run_id)
-        if status is None or status.get("capability_envelope") != "input_only_v1":
+        if status is None or status.get("capability_envelope") not in _CAPABILITY_ENVELOPES:
             return None, None, _json_error(_api_server._openai_error, "Restricted run not found.",
                                            code="run_not_found", status=404)
         return run_id, status, None
