@@ -32,10 +32,28 @@ must observe only its own binding, neither may overwrite or remove the other's g
 both final per-instance bindings and non-redirecting clients must be intact. At the
 reviewed head the last writer's class attribute is what the chokepoint resolves.
 
-[PIN] The remaining tests pin retained behavior: the ``input_only_v1`` envelope keeps its
-exact v1 initialization semantics, and the tool-free binding drives the guard chokepoint.
-Every positive expectation was probe-verified against the production functions on the
-reviewed head before being written.
+R4 (nested-construction inheritance): the R3 independent adversarial review found that
+a NESTED ordinary construction running inside a guarded constructor's dynamic extent
+(e.g. triggered from a provider-policy seam) still read the same ContextVar and
+inherited the parent's binding — its provider hooks were suppressed and a differing
+route would route-drift-fail. Commit e8e1370e paired the ContextVar with a single-use
+construction token (the chokepoint accepts the carried binding only from the
+token-holding instance), but shipped with NO committed regression: the reproducer
+lived only in the reviewer's scratch probe.
+
+[RED] ``test_nested_ordinary_construction_inside_guarded_extent_builds_unguarded`` —
+while a ``hermes_tool_free_v1`` construction's init guard is active, a nested ordinary
+deepinfra construction through the real ``AIAgent`` constructor must run its own
+provider profile hooks, receive no ``_restricted_wire_binding``, claim/consume no
+construction token, and build its normal SDK client; the parent restricted agent must
+retain its exact binding, run no provider hook, and keep its guarded non-redirecting
+client. At 337a7cb (ContextVar without the construction token) the nested hooks are
+suppressed — the inheritance defect.
+
+[PIN] The remaining tests pin retained behavior: the ``input_only_v1`` envelope keeps
+its exact v1 initialization semantics, and the tool-free binding drives the guard
+chokepoint. Every positive expectation was probe-verified against the production
+functions on the reviewed head before being written.
 """
 import json
 import threading
@@ -178,6 +196,117 @@ _RESTRICTED_CREDS_A = dict(CREDS, model="Qwen/Qwen3.8-Flash",
                            base_url="https://api.deepinfra.com/v1/openai")
 _RESTRICTED_CREDS_B = dict(CREDS, model="Qwen/Qwen3.8-Flash-B",
                            base_url="https://deepinfra-b.example/v1")
+
+
+def test_nested_ordinary_construction_inside_guarded_extent_builds_unguarded(
+        restricted_service, monkeypatch):
+    """[RED] A nested ORDINARY construction inside an ACTIVE restricted construction's
+    dynamic extent builds unguarded — and cannot disturb the parent's guard.
+
+    The ``hermes_tool_free_v1`` factory has already minted its single-use construction
+    token and set the ContextVar on the constructor's own ``Context``; the constructor is
+    running on the same thread. From a production init seam
+    (``agent_init._apply_openai_header_policy``, invoked from ``_build_client`` before the
+    client chokepoint), an ordinary deepinfra agent is constructed through the real
+    ``AIAgent`` constructor, with an observable provider profile recording both hook
+    invocations. The nested agent must run its OWN hooks, carry no restricted binding,
+    claim no construction token, and build the normal SDK client over the real
+    ``create_openai_client`` chokepoint; the parent restricted agent must retain its exact
+    binding, run no provider hook itself, and keep its guarded non-redirecting SDK client
+    after the nested construction completes. No sleeps: the nesting rides the guarded
+    constructor's own dynamic extent. At 337a7cb (ContextVar without the construction
+    token) the nested construction reads the parent's carried binding, its hooks are
+    suppressed, and it inherits the binding — the reviewer's MEDIUM finding.
+    """
+    import providers
+    from providers import ProviderProfile
+
+    nested_calls = {"extras": 0, "create_client": 0}
+
+    class NestedCountingProfile(ProviderProfile):
+        """Counting stand-in for the deepinfra profile: same base-class semantics,
+        observable invocations (the stock ``create_client`` returns None and the normal
+        SDK client is the correct outcome)."""
+
+        def build_client_kwargs_extras(self, **context):
+            nested_calls["extras"] += 1
+            return {}
+
+        def create_client(self, **client_kwargs):
+            nested_calls["create_client"] += 1
+            return None
+
+    # Same plugin-discovery-first discipline as the hostile-profile proof above:
+    # force discovery BEFORE replacing the registry entry, then swap the deepinfra
+    # profile for the counting stand-in (the same seam a $HERMES_HOME plugin uses).
+    providers.get_provider_profile("deepinfra")
+    nested_profile = NestedCountingProfile(name="deepinfra", base_url=CREDS["base_url"],
+                                           auth_type="api_key")
+    monkeypatch.setitem(providers._REGISTRY, "deepinfra", nested_profile)
+    assert providers.get_provider_profile("deepinfra") is nested_profile
+
+    _, adapter = restricted_service
+    nested: list = []
+    inside_nested = [False]
+
+    import agent.agent_init as agent_init
+    from run_agent import AIAgent
+
+    real_policy = agent_init._apply_openai_header_policy
+
+    def nesting_policy(agent, kwargs):
+        # Fire exactly once: during the PARENT restricted constructor's client build,
+        # nest an ordinary construction on the same thread/context. The parent's own
+        # client build happens on the restricted wire, where this policy seam is
+        # reachable but the nested construction is not re-entered.
+        if not inside_nested[0]:
+            inside_nested[0] = True
+            try:
+                nested.append(AIAgent(
+                    provider="deepinfra", model="Qwen/Qwen3.8-Flash", api_key="nested-key",
+                    base_url=CREDS["base_url"], api_mode="chat_completions",
+                    enabled_toolsets=[], disabled_toolsets=[], max_iterations=2,
+                    platform="api_server", quiet_mode=True, verbose_logging=False,
+                    skip_context_files=True, skip_memory=True))
+            finally:
+                inside_nested[0] = False
+        return real_policy(agent, kwargs)
+
+    monkeypatch.setattr(agent_init, "_apply_openai_header_policy", nesting_policy)
+
+    parent = restricted._new_restricted_agent(
+        adapter, dict(_RESTRICTED_CREDS_A), None, _api_server=api_server,
+        envelope="hermes_tool_free_v1")
+
+    # The nested construction ran (the reproducer is engaged, not vacuous).
+    assert nested, "nested construction never ran"
+    nested_agent = nested[0]
+    # The nested ordinary agent executed its OWN provider profile hooks through the
+    # real create_openai_client chokepoint despite the parent's active guard.
+    assert nested_calls["extras"] > 0, (
+        "nested ordinary profile build_client_kwargs_extras suppressed by the parent's "
+        "active restricted guard (nested construction inherited the binding)")
+    assert nested_calls["create_client"] == 1, (
+        "nested ordinary profile create_client not consulted; the provider hook ladder "
+        "must run normally (the stock hook returns None and the SDK client is the "
+        "correct outcome)")
+    # The nested agent is an ordinary agent: no restricted binding, no construction
+    # token (it did not consume or claim the parent's single-use token), normal client.
+    assert getattr(nested_agent, "_restricted_wire_binding", None) is None, (
+        "nested ordinary agent inherited the restricted binding")
+    assert getattr(nested_agent, "_restricted_construction_token", None) is None, (
+        "nested ordinary agent claims a construction token")
+    assert type(nested_agent.client).__name__ == "OpenAI", (
+        "nested agent lost its normal SDK client")
+
+    # The PARENT restricted agent is intact after the nested construction completed:
+    # exact binding retained, no provider hook ran for its own builds, and its
+    # initialization-time client is the guarded non-redirecting SDK client.
+    assert parent._restricted_wire_binding == (
+        _RESTRICTED_CREDS_A["provider"], _RESTRICTED_CREDS_A["model"],
+        _RESTRICTED_CREDS_A["base_url"], "chat_completions")
+    assert type(parent.client).__name__ == "OpenAI"
+    assert parent.client._client.follow_redirects is False
 
 
 def _install_restricted_construction_parking(monkeypatch, parked: dict) -> None:
