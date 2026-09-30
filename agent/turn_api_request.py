@@ -137,29 +137,35 @@ def build_api_request(
     if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
         _set_extra_header(api_kwargs, "x-initiator", "user")
         agent._is_user_initiated_turn = False
-    try:
-        from hermes_cli.middleware import apply_llm_request_middleware
-
-        _llm_request_mw = apply_llm_request_middleware(
-            api_kwargs, task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
-            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
-            api_call_count=api_call_count,
-        )
-        api_kwargs = _llm_request_mw.payload
-        _original_api_kwargs = _llm_request_mw.original_payload
-        _llm_middleware_trace = _llm_request_mw.trace
-    except Exception:
+    if getattr(agent, "_restricted_wire_binding", None) is not None:
+        # A restricted run cannot allow request middleware or observers to
+        # execute arbitrary provider actions or append hosted capabilities.
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
+    else:
+        try:
+            from hermes_cli.middleware import apply_llm_request_middleware
 
-    _fire_pre_api_request_hook(
-        agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
-        original_user_message=original_user_message, approx_tokens=approx_tokens,
-        total_chars=total_chars, retry_count=retry_count, api_call_count=api_call_count,
-        api_request_id=api_request_id, api_start_time=api_start_time,
-        effective_task_id=effective_task_id, turn_id=turn_id,
-    )
+            _llm_request_mw = apply_llm_request_middleware(
+                api_kwargs, task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+                session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+                provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+                api_call_count=api_call_count,
+            )
+            api_kwargs = _llm_request_mw.payload
+            _original_api_kwargs = _llm_request_mw.original_payload
+            _llm_middleware_trace = _llm_request_mw.trace
+        except Exception:
+            _original_api_kwargs = dict(api_kwargs)
+            _llm_middleware_trace = []
+
+        _fire_pre_api_request_hook(
+            agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
+            original_user_message=original_user_message, approx_tokens=approx_tokens,
+            total_chars=total_chars, retry_count=retry_count, api_call_count=api_call_count,
+            api_request_id=api_request_id, api_start_time=api_start_time,
+            effective_task_id=effective_task_id, turn_id=turn_id,
+        )
 
     if env_var_enabled("HERMES_DUMP_REQUESTS"):
         agent._dump_api_request_debug(api_kwargs, reason="preflight")

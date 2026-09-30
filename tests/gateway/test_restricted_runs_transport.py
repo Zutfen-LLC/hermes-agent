@@ -96,7 +96,8 @@ def _route_mocks(monkeypatch, *, secret="native-secret", output="bounded result"
 
     monkeypatch.setattr("tools.delegate_tool_config._resolve_profile_execution", resolve)
     monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._restricted_profile_config",
-                        lambda self, name, **kw: {"profiles": {name: {"enabled": True}}})
+                        lambda self, name, **kw: {"profiles": {name: {
+                            "enabled": True, "restricted_tool_free": True}}})
     monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._new_restricted_agent", create)
     return observed
 
@@ -150,6 +151,38 @@ async def test_restricted_route_late_binds_profile_and_never_builds_tools(restri
     assert status["output"] == "bounded result"
     assert status["resolved_identity"]["hermes_delegation_profile_id"] == "logical-helper"
     assert "native-secret" not in str(status)
+
+
+@pytest.mark.asyncio
+async def test_tool_free_envelope_is_durable_and_does_not_change_original_run(restricted_service, monkeypatch):
+    client, _ = restricted_service
+    _route_mocks(monkeypatch)
+    body = {**REQUEST, "capability_envelope": "hermes_tool_free_v1"}
+    headers = {**RESTRICTED_AUTH, "Idempotency-Key": "user-route"}
+    admitted = await client.post("/v1/restricted-runs", json=body, headers=headers)
+    assert admitted.status == 202
+    run_id = (await admitted.json())["run_id"]
+    recovered = await client.get("/v1/restricted-runs/by-key", headers=headers)
+    assert recovered.status == 200
+    assert (await recovered.json())["capability_envelope"] == "hermes_tool_free_v1"
+    old_envelope = await client.post("/v1/restricted-runs", json=REQUEST, headers=headers)
+    assert old_envelope.status == 409
+    assert (await _terminal_status(client, run_id))["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_tool_free_requires_operator_profile_opt_in_before_reservation(restricted_service, monkeypatch):
+    client, adapter = restricted_service
+    observed = _route_mocks(monkeypatch)
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._restricted_profile_config",
+                        lambda self, name, **kw: {"profiles": {name: {"enabled": True}}})
+    response = await client.post("/v1/restricted-runs",
+        json={**REQUEST, "capability_envelope": "hermes_tool_free_v1"},
+        headers={**RESTRICTED_AUTH, "Idempotency-Key": "no-opt-in"})
+    assert response.status == 403
+    assert "agent" not in observed
+    assert not adapter._run_idempotency_store._conn.execute(
+        "SELECT 1 FROM run_idempotency WHERE idempotency_key='no-opt-in'").fetchone()
 
 
 def test_restricted_agent_factory_pins_no_tools(monkeypatch):
@@ -688,6 +721,75 @@ def test_restricted_real_chat_completions_wire_is_model_only(restricted_service,
                for _, body in wire)
     assert all(not body.get("tools") and not body.get("web_search_options")
                and not body.get("extra_body") for _, body in wire)
+
+
+def test_user_selected_deepinfra_route_is_tool_free_on_real_wire(restricted_service, monkeypatch):
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    creds = {"provider": "deepinfra", "model": "Qwen/Qwen3.8-Flash", "api_key": "test-key",
+             "base_url": "https://api.deepinfra.com/v1/openai", "api_mode": "chat_completions"}
+    with pytest.raises(RuntimeError, match="input-only"):
+        restricted._new_restricted_agent(adapter, creds, None, _api_server=api_server)
+    agent = restricted._new_restricted_agent(
+        adapter, creds, None, _api_server=api_server, envelope="hermes_tool_free_v1")
+    wire = []
+
+    def respond(request):
+        wire.append((str(request.url), json.loads(request.content)))
+        return httpx.Response(200, json={"id": "chatcmpl-restricted", "object": "chat.completion",
+            "model": creds["model"], "created": 1, "choices": [{"index": 0,
+                "message": {"role": "assistant", "content": "bounded"}, "finish_reason": "stop"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+        with OpenAI(api_key="test-key", base_url=creds["base_url"],
+                    http_client=transport, max_retries=0) as client:
+            monkeypatch.setattr(agent, "_create_openai_client", lambda *args, **kw: client)
+            monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware",
+                                lambda *args, **kw: pytest.fail("request middleware ran"))
+            monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware",
+                                lambda *args, **kw: pytest.fail("execution middleware ran"))
+            monkeypatch.setattr("agent.turn_api_request._fire_pre_api_request_hook",
+                                lambda *args, **kw: pytest.fail("request hook ran"))
+            agent._cached_system_prompt = "Supplied input only."
+            result = restricted._restricted_agent_turn(agent, "Only this snapshot")
+    assert result["final_response"] == "bounded"
+    assert wire and all(url == "https://api.deepinfra.com/v1/openai/chat/completions" for url, _ in wire)
+    assert all(body["model"] == creds["model"] and not body.get("tools")
+               and not body.get("extra_body") and not body.get("web_search_options")
+               for _, body in wire)
+
+
+def test_tool_free_wire_rejects_hosted_actions_and_route_drift_before_network(restricted_service, monkeypatch):
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    agent = restricted._new_restricted_agent(adapter, {
+        "provider": "deepinfra", "model": "Qwen/Qwen3.8-Flash", "api_key": "test-key",
+        "base_url": "https://api.deepinfra.com/v1/openai", "api_mode": "chat_completions",
+    }, None, _api_server=api_server, envelope="hermes_tool_free_v1")
+    safe = {"model": agent.model, "messages": [{"role": "user", "content": "snapshot"}]}
+    restricted._validate_tool_free_wire(agent, safe)
+    for field, value in (("tools", [{"type": "function"}]),
+                         ("web_search_options", {}), ("extra_body", {"plugins": [{"id": "web"}]}),
+                         ("tool_choice", "required")):
+        with pytest.raises(RuntimeError, match="outbound request"):
+            restricted._validate_tool_free_wire(agent, {**safe, field: value})
+    agent.model = "different-model"
+    with pytest.raises(RuntimeError, match="outbound request"):
+        restricted._validate_tool_free_wire(agent, safe)
+
+
+def test_tool_free_request_client_cannot_follow_provider_redirects(restricted_service):
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    agent = restricted._new_restricted_agent(adapter, {
+        "provider": "deepinfra", "model": "Qwen/Qwen3.8-Flash", "api_key": "test-key",
+        "base_url": "https://api.deepinfra.com/v1/openai", "api_mode": "chat_completions",
+    }, None, _api_server=api_server, envelope="hermes_tool_free_v1")
+    client = agent._create_request_openai_client(reason="restricted-redirect-check")
+    try:
+        assert client._client.follow_redirects is False
+    finally:
+        agent._close_request_openai_client(client, reason="restricted-redirect-check")
 
 @pytest.mark.asyncio
 async def test_restricted_credential_cannot_invoke_general_endpoints_or_control_general_runs(
