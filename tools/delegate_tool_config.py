@@ -135,6 +135,9 @@ def _resolve_profile_execution(cfg: dict, name: Any, parent_agent) -> tuple[Dict
     auth_type = str(raw.get("auth_type") or "").strip().lower() or None
     if auth_type is not None and auth_type not in _PROFILE_AUTH_TYPES:
         raise ValueError(f"delegation profile {name!r} has unknown auth_type {auth_type!r}")
+    explicit_mode = str(raw.get("api_mode") or "").strip().lower() or None
+    if explicit_mode is not None and not _is_explicit_api_mode(explicit_mode):
+        raise ValueError(f"delegation profile {name!r} has unknown api_mode {raw.get('api_mode')!r}")
     route_cfg = {k: raw.get(k) for k in _PROFILE_ROUTE_KEYS if raw.get(k) is not None}
     creds = dict(_resolve_delegation_credentials(route_cfg, parent_agent))
     creds.update(auth_type=auth_type, profile=name, routing_cfg=route_cfg)
@@ -490,8 +493,26 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         key_origin="explicit" if v["api_key"] else None,
     )
 
+def _is_explicit_api_mode(mode: Optional[str]) -> bool:
+    """Whether *mode* counts as an operator-explicit wire protocol: an in-tree mode or a
+    provider plugin's registered dialect (same authority as the direct-endpoint branch)."""
+    if not mode:
+        return False
+    if mode in _EXPLICIT_API_MODES:
+        return True
+    from agent.transports import registered_api_modes
+    return mode in registered_api_modes()
+
+
 def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
-    """``delegation.provider`` branch: full bundle via the runtime provider system."""
+    """``delegation.provider`` branch: full bundle via the runtime provider system.
+
+    api_mode precedence: an operator-explicit valid ``api_mode`` beats the URL-derived mode
+    of a direct-alias/custom runtime (``provider: openai`` expands to custom +
+    api.openai.com, whose host mandate would otherwise force ``codex_responses`` and make
+    the input_only_v1 trusted route (openai, chat_completions) unsatisfiable — #33). A
+    registry/native provider's own wire is never overridden, and the explicit
+    ``codex_app_server`` overlay (a different transport with its own credential) stands."""
     configured_provider = v["provider"]
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -528,10 +549,14 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
             f"Refusing to build a subagent with an incomplete credential bundle — check the provider's "
             f"configuration / auth, or set delegation.base_url for a direct endpoint."
         )
+    api_mode = runtime.get("api_mode")
+    if (runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM and api_mode != "codex_app_server"
+            and _is_explicit_api_mode(v["api_mode"])):
+        api_mode = v["api_mode"]
     return _credential_bundle(
         v["model"] or runtime.get("model") or None,
         configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
-        runtime.get("base_url"), api_key, runtime.get("api_mode"),
+        runtime.get("base_url"), api_key, api_mode,
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
         key_origin="runtime", key_source=runtime.get("source"), key_auth_type=runtime.get("auth_type"),
