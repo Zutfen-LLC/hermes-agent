@@ -89,6 +89,18 @@ def perform_api_call(
     def _perform_api_call(next_api_kwargs):
         if getattr(agent, "_restricted_wire_binding", None) is not None:
             from gateway.platforms.api_server_restricted_runs import _validate_tool_free_wire
+            if agent.api_mode == "codex_responses":
+                # #35: the restricted Codex request still passes through the dialect's
+                # OWN preflight (normalization + dialect validation) first; the
+                # restricted wire gate then judges the normalized request at the exact
+                # outbound boundary, default-denying every field outside the restricted
+                # Codex allowlist. Ordinary (non-restricted) Codex evolution therefore
+                # cannot silently widen restricted execution.
+                next_api_kwargs = agent._get_transport().preflight_kwargs(
+                    next_api_kwargs, allow_stream=False,
+                    is_github_responses=agent._is_copilot_url(),
+                    sanitize_harmony_tokens=agent._is_codex_backend(),
+                )
             _validate_tool_free_wire(agent, next_api_kwargs)
             # Bypass execution middleware and relay hooks. They can make their
             # own model calls and cannot be constrained by the outbound check.

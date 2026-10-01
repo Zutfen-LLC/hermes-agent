@@ -32,6 +32,15 @@ _CAPABILITY_ENVELOPES = frozenset({"input_only_v1", "hermes_tool_free_v1"})
 from agent.restricted_init_guard import _restricted_init_binding
 _TRUSTED_ROUTES = {"openai": ("api.openai.com", "chat_completions"),
                    "anthropic": ("api.anthropic.com", "anthropic_messages")}
+# Restricted Codex Responses dialect (#35). The trusted endpoint authority is derived
+# from the SAME constant Hermes runtime resolution uses for the ChatGPT/Codex OAuth
+# route (hermes_cli.auth_constants.DEFAULT_CODEX_BASE_URL), so the restricted table
+# can never drift from the canonical endpoint the provider system itself pins.
+from hermes_cli.auth_constants import DEFAULT_CODEX_BASE_URL as _DEFAULT_CODEX_BASE_URL
+_codex_canonical = urlsplit(_DEFAULT_CODEX_BASE_URL)
+_CODEX_TRUSTED_ROUTE = ("openai-codex", "codex_responses")
+_CODEX_TRUSTED_ORIGIN = (_codex_canonical.scheme, _codex_canonical.hostname,
+                         _codex_canonical.port, _codex_canonical.path.rstrip("/"))
 # Explicit model-only chat families. Search-preview and search-api variants can
 # browse without Hermes tools; never infer safety from a provider/model prefix.
 _APPROVED_MODELS = {
@@ -72,8 +81,50 @@ def _validate_restricted_route(creds: dict) -> None:
         raise RuntimeError("restricted route cannot guarantee input-only model execution")
 
 
+def _validate_codex_tool_free_route(creds: dict) -> None:
+    """#35: the Codex Responses dialect of ``hermes_tool_free_v1``.
+
+    Fail-closed on anything but the exact trusted route tuple — provider
+    ``openai-codex``, wire ``codex_responses``, profile auth ``oauth`` — pinned to
+    the canonical ChatGPT/Codex origin (scheme, exact host, path) derived from the
+    same constant runtime resolution uses. Canonical URL parsing only: hostname
+    equality (never substring), explicit scheme/port/userinfo/query/fragment checks.
+    """
+    url = urlsplit(str(creds.get("base_url") or ""))
+    provider = str(creds.get("provider") or "").strip().lower()
+    if (provider != _CODEX_TRUSTED_ROUTE[0]
+            or creds.get("api_mode") != _CODEX_TRUSTED_ROUTE[1]
+            or creds.get("auth_type") != "oauth"
+            or url.scheme != _CODEX_TRUSTED_ORIGIN[0]
+            or url.hostname != _CODEX_TRUSTED_ORIGIN[1]
+            or url.port != _CODEX_TRUSTED_ORIGIN[2]
+            or url.username or url.password
+            or url.path.rstrip("/") != _CODEX_TRUSTED_ORIGIN[3]
+            or url.query or url.fragment
+            or not isinstance(creds.get("model"), str) or not creds["model"].strip()
+            or creds.get("command") or creds.get("request_overrides")
+            or creds.get("fallback_providers")):
+        raise RuntimeError("restricted tool-free route is not enforceable")
+
+
+def _tool_free_dialect(creds: dict) -> str | None:
+    """The restricted wire dialect for *creds*, or None when the route is not one.
+
+    ``openai-codex`` IS the Codex dialect on every mode spelling: registry providers
+    keep their own wire, so a ``chat_completions`` claim on that provider is dialect
+    confusion and routes into the Codex validator (which fails closed on it).
+    """
+    if str(creds.get("provider") or "").strip().lower() == _CODEX_TRUSTED_ROUTE[0]:
+        return "codex_responses"
+    return "chat_completions" if (creds.get("api_mode", "chat_completions")
+                                  == "chat_completions") else None
+
+
 def _validate_tool_free_route(creds: dict) -> None:
     """Accept an operator-selected chat route without claiming provider-side isolation."""
+    if _tool_free_dialect(creds) == "codex_responses":
+        _validate_codex_tool_free_route(creds)
+        return
     url = urlsplit(str(creds.get("base_url") or ""))
     local = url.hostname in {"localhost", "127.0.0.1", "::1"}
     if (not isinstance(creds.get("provider"), str) or not creds["provider"].strip()
@@ -93,16 +144,44 @@ _TOOL_FREE_WIRE_FIELDS = frozenset({
     "response_format", "prompt_cache_key",
 })
 
+# #35: the Codex Responses dialect's OWN outbound allowlist — deliberately NOT a union
+# with the chat-completions set above. A Responses request is mechanically
+# model/instructions/input only; the transport's mechanically required non-capability
+# companions are admitted explicitly, each with its justification:
+#   store=False            — hard contract of the Responses preflight (never True;
+#                            host-side retention stays off)
+#   prompt_cache_key       — opaque server-side cache routing hint derived from a
+#                            content hash; no capability or routing-authority meaning
+#   reasoning / include    — effort/verbosity tuning + the encrypted-reasoning replay
+#                            flag the dialect requires to keep multi-item turns working
+#   timeout                — client-side SDK timeout, never reaches the wire body
+#   extra_headers          — transport-mechanical session/request-id headers ONLY
+#                            (names allowlisted below; arbitrary headers fail closed)
+# Everything else — tools, tool_choice, hosted capabilities, arbitrary extra_body,
+# unknown Responses extensions — is default-deny.
+_CODEX_TOOL_FREE_WIRE_FIELDS = frozenset({
+    "model", "instructions", "input", "store", "prompt_cache_key", "reasoning",
+    "include", "timeout", "extra_headers",
+})
+# Header names the Codex transport itself derives mechanically (build_kwargs on the
+# codex backend); an attacker-controlled header would need one of these names to
+# survive, and each of these is transport bookkeeping, not capability.
+_CODEX_TOOL_FREE_HEADER_FIELDS = frozenset({"session_id", "x-client-request-id"})
+
 
 def _validate_tool_free_wire(agent: Any, kwargs: dict) -> None:
     """Last local gate before the SDK sends a restricted request."""
     binding = agent._restricted_wire_binding
     if ((agent.provider, agent.model, agent.base_url, agent.api_mode) != binding
-            or agent.api_mode != "chat_completions"
             or getattr(agent, "_fallback_activated", False)
             or getattr(agent, "_fallback_chain", [])
             or not _check_restricted_tool_boundary(agent)
-            or not isinstance(kwargs, dict)
+            or not isinstance(kwargs, dict)):
+        raise RuntimeError("restricted tool-free outbound request was rejected")
+    if agent.api_mode == "codex_responses":
+        _validate_codex_tool_free_wire(agent, kwargs)
+        return
+    if (agent.api_mode != "chat_completions"
             or set(kwargs) - _TOOL_FREE_WIRE_FIELDS
             or kwargs.get("model") != binding[1]
             or not isinstance(kwargs.get("messages"), list)
@@ -111,6 +190,28 @@ def _validate_tool_free_wire(agent: Any, kwargs: dict) -> None:
                    or message.get("role") not in {"system", "developer", "user", "assistant"}
                    or not isinstance(message.get("content"), str)
                    for message in kwargs["messages"])):
+        raise RuntimeError("restricted tool-free outbound request was rejected")
+
+
+def _validate_codex_tool_free_wire(agent: Any, kwargs: dict) -> None:
+    """#35: dialect-native outbound contract for a restricted Codex Responses request.
+
+    Enforced at the final boundary AFTER the ordinary Codex preflight has produced the
+    normalized dialect request, immediately before the SDK sends it. The request must
+    carry exactly the minimal required shape (model/instructions/input) plus the
+    explicitly justified companions in ``_CODEX_TOOL_FREE_WIRE_FIELDS``; any other
+    field — capability-bearing (tools, tool_choice, hosted/web_search/computer-use
+    selectors, context_management), arbitrary extra_body, unknown Responses extensions,
+    credential/auth fields, fallback or routing controls — fails closed.
+    """
+    headers = kwargs.get("extra_headers")
+    if (set(kwargs) - _CODEX_TOOL_FREE_WIRE_FIELDS
+            or kwargs.get("model") != agent.model
+            or not isinstance(kwargs.get("instructions"), str)
+            or not isinstance(kwargs.get("input"), list)
+            or kwargs.get("store") is not False
+            or (headers is not None and (not isinstance(headers, dict)
+                or set(headers) - _CODEX_TOOL_FREE_HEADER_FIELDS))):
         raise RuntimeError("restricted tool-free outbound request was rejected")
 
 
@@ -148,6 +249,7 @@ def _resolve_restricted_route(self, profile: str, *, _api_server) -> tuple[dict,
 def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = None, *,
                           _api_server, envelope: str = "input_only_v1"):
     """Build a model-only agent: explicit empty tool selection and tight turn budget."""
+    expected_auth_type = (getattr(authority, "auth_type", None) or creds.get("auth_type"))
     # External-process transports may be autonomous agents with their own host tools.
     # Hermes' empty tool schema cannot constrain such a child process.
     if creds.get("command") or getattr(authority, "auth_type", None) == "external_process":
@@ -156,6 +258,7 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
         _validate_restricted_route(creds)
     elif envelope == "hermes_tool_free_v1":
         _validate_tool_free_route(creds)
+        _validate_tool_free_route({**creds, "auth_type": expected_auth_type})
     else:
         raise RuntimeError("unknown restricted capability envelope")
     from agent.restricted_init_guard import (
@@ -199,7 +302,7 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
         ctx.run(_restricted_init_binding.set,
                 (construction,
                  (str(creds["provider"]).strip().lower(), creds["model"], creds["base_url"],
-                  "chat_completions")))
+                  str(creds.get("api_mode") or "chat_completions").strip().lower())))
 
         def construct() -> Any:
             # The stamping __new__ is bound as an UNBOUND helper: call it for the raw
@@ -218,7 +321,9 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
     if envelope == "input_only_v1":
         _validate_restricted_route(effective)
     else:
-        _validate_tool_free_route(effective)
+        # auth_type is authority-owned route identity, not an agent attribute: the
+        # effective-route revalidation carries the profile's expected auth_type (#35).
+        _validate_tool_free_route({**effective, "auth_type": expected_auth_type})
         agent._restricted_wire_binding = (agent.provider, agent.model, agent.base_url, agent.api_mode)  # type: ignore
         agent._disable_streaming = True  # type: ignore
     if getattr(agent, "_fallback_activated", False) or getattr(agent, "_fallback_chain", []):

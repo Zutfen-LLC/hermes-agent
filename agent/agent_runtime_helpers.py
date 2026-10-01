@@ -1976,8 +1976,21 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         client_kwargs, access_token=client_kwargs.get("api_key", ""),
         base_url=str(client_kwargs.get("base_url", "")),
     )
-    if restricted_wire and (client_kwargs.get("default_headers") or client_kwargs.get("default_query")):
+    if restricted_wire and client_kwargs.get("default_query"):
         raise RuntimeError("restricted tool-free client options are not enforceable")
+    if restricted_wire and client_kwargs.get("default_headers"):
+        # #35: the ONLY default_headers a restricted wire may carry are the required
+        # Codex identity headers the trusted leaf above installs on the official
+        # endpoint (fixed names, derived from the bound OAuth token; without them the
+        # endpoint refuses the request). Caller-supplied headers were already dropped
+        # earlier; anything else here fails closed.
+        from agent.codex_headers import codex_cloudflare_headers, is_official_codex_base_url
+        _restricted_base_url = str(client_kwargs.get("base_url", ""))
+        _required_names = ({str(name).lower() for name in codex_cloudflare_headers(
+            client_kwargs.get("api_key", ""), base_url=_restricted_base_url)}
+            if is_official_codex_base_url(_restricted_base_url) else set())
+        if not {str(name).lower() for name in client_kwargs["default_headers"]} <= _required_names:
+            raise RuntimeError("restricted tool-free client options are not enforceable")
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
