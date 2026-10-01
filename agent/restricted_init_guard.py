@@ -5,7 +5,10 @@ Holds the restricted binding for EXACTLY one ``AIAgent`` construction:
 private ``contextvars.Context`` and runs the constructor inside it, and the
 client-construction chokepoint (``agent.agent_runtime_helpers.create_openai_client``)
 reads it only for an agent that has no durable per-instance binding yet — i.e. its own
-initialization-time client build.
+initialization-time client build. The carried binding tuple's fourth element is the
+restricted wire dialect (``chat_completions`` or, since #35, ``codex_responses``),
+taken from the resolved route rather than hardcoded, so each dialect's guard binds its
+own wire identity.
 
 Isolation properties (why this replaced the temporary class attribute):
 - The variable lives on the construction's own ``Context`` (``copy_context().run``), so

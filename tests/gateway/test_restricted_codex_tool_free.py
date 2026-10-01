@@ -30,17 +30,18 @@ CODEX_CREDS = {
 }
 
 
-def _codex_runtime(*, requested, target_model=None, **_kw):
+def _codex_runtime(*, requested, target_model=None, base_url=CODEX_BASE, **_kw):
     """The exact runtime shape the openai-codex OAuth rung returns."""
     return {"provider": "openai-codex", "model": target_model or "gpt-5-codex",
-            "base_url": CODEX_BASE, "api_mode": "codex_responses",
+            "base_url": base_url, "api_mode": "codex_responses",
             "api_key": CODEX_SECRET, "auth_type": "oauth",
             "source": "hermes-auth-store"}
 
 
 def _write_profile(home, profile_yaml):
     from hermes_constants import get_hermes_home
-    (get_hermes_home() / "config.yaml").write_text("delegation:\n  profiles:\n" + profile_yaml)
+    (get_hermes_home() / "config.yaml").write_text(
+        "delegation:\n  profiles:\n" + profile_yaml, encoding="utf-8")
 
 
 CODEX_PROFILE_YAML = """    codex-restricted:
@@ -334,40 +335,32 @@ def test_codex_restricted_agent_turn_detects_late_tool_contamination(restricted_
     agent = restricted._new_restricted_agent(
         None, creds, reasoning, authority, _api_server=None, envelope="hermes_tool_free_v1")
     agent.tools = [{"type": "function", "function": {"name": "terminal"}}]
+    import contextlib
+
+    @contextlib.contextmanager
+    def _profile_scope(_profile):
+        yield
+
     with pytest.raises(RuntimeError, match="unexpectedly has tools"):
         restricted._restricted_agent_turn_scoped(
-            type("S", (), {"_profile_scope": lambda self, p: _null_ctx()})(),
+            type("S", (), {"_profile_scope": staticmethod(_profile_scope)})(),
             agent, "input", None)
-
-
-class _null_ctx:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
-def _null_ctx():
-    return _null_ctx()
 
 
 def test_codex_init_guard_binds_codex_dialect_during_construction(restricted_service, monkeypatch):
     """The R3 construction-local guard carries the codex_responses wire identity."""
+    import agent.agent_init as agent_init
+    real_policy = agent_init._apply_openai_header_policy
+    observed = {}
+
+    def spy_policy(agent, kwargs):
+        from agent.restricted_init_guard import _restricted_init_binding
+        observed["carried"] = _restricted_init_binding.get()
+        return real_policy(agent, kwargs)
+
+    monkeypatch.setattr(agent_init, "_apply_openai_header_policy", spy_policy)
     _write_profile(None, CODEX_PROFILE_YAML)
     creds, reasoning, authority = _resolve_codex_route(monkeypatch)
-    from agent.restricted_init_guard import _restricted_init_binding
-    observed = {}
-    real_init = _restricted_init_binding.get
-
-    import agent.agent_runtime_helpers as helpers
-    real_create = helpers.create_openai_client
-
-    def spy_create(agent, client_kwargs, *, reason, shared):
-        observed["carried"] = real_init.get()
-        return real_create(agent, client_kwargs, reason=reason, shared=shared)
-
-    monkeypatch.setattr(helpers, "create_openai_client", spy_create)
     agent = restricted._new_restricted_agent(
         None, creds, reasoning, authority, _api_server=None, envelope="hermes_tool_free_v1")
     carried = observed.get("carried")
@@ -465,12 +458,25 @@ async def test_codex_restricted_gateway_end_to_end(restricted_service, monkeypat
         origin = srv.base_url.rstrip("/")
         from urllib.parse import urlsplit as _us
         _o = _us(origin)
-        # Repoint the trusted-origin table at the loopback fake (canonical parsing of
-        # the fake's own origin; the production value stays pinned in the module).
+        # Repoint the trusted-origin table AND the runtime's endpoint at the loopback
+        # fake (canonical parsing of the fake's own origin; production stays pinned to
+        # the canonical ChatGPT/Codex origin in the module constants).
         monkeypatch.setattr(restricted, "_CODEX_TRUSTED_ORIGIN",
-                            (_o.scheme, _o.hostname, _o.path.rstrip("/")))
-        profile_yaml = CODEX_PROFILE_YAML.replace(CODEX_BASE, origin)
-        _write_profile(get_hermes_home(), profile_yaml + "      restricted_tool_free: true\n")
+                            (_o.scheme, _o.hostname, _o.port, _o.path.rstrip("/")))
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider",
+                            lambda **kw: _codex_runtime(base_url=origin, **kw))
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_oauth_store_runtime",
+                            lambda *a, **k: _codex_runtime(requested="openai-codex", base_url=origin))
+        # No pinned base_url: the endpoint comes from runtime resolution, exactly the
+        # production shape (a base_url in the profile would take the direct-endpoint
+        # branch and reclassify the provider).
+        _write_profile(get_hermes_home(), """    codex-restricted:
+      provider: openai-codex
+      model: gpt-5-codex
+      auth_type: oauth
+      api_mode: codex_responses
+      restricted_tool_free: true
+""")
 
         payload = {"delegation_profile_id": "codex-restricted", "work_class": "context_gather",
                    "input": "Analyze this supplied snapshot only.",
