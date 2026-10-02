@@ -140,8 +140,9 @@ const attachmentTurnAssistantMatchIndex = (
 
   const localCaptionOrdinal = localMessages
     .slice(0, localMessages.indexOf(localUser))
-    .filter(message => message.role === 'user' && attachmentTolerantUserText(chatMessageText(message)) === localCaption)
-    .length
+    .filter(
+      message => message.role === 'user' && attachmentTolerantUserText(chatMessageText(message)) === localCaption
+    ).length
 
   const matchingStoredUserIndices: number[] = []
 
@@ -329,6 +330,33 @@ function hydratedIdResolver(mergedNextMessages: ChatMessage[]): (message: ChatMe
         : hydratedIdByRowId.get(message.rowId)
 }
 
+// The refresh already carries this tail turn's error card, rebuilt from its
+// failed-turn boundary row (see hydration `failedTurnError`).
+function persistedTailErrorMatches(
+  mergedNextMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+  localIndex: number
+): boolean {
+  const local = currentMessages[localIndex]
+  const visibleUser = (message: ChatMessage) => message.role === 'user' && !message.hidden
+
+  if (currentMessages.slice(localIndex + 1).some(visibleUser)) {
+    return false
+  }
+
+  const storedUserIndex = mergedNextMessages.findLastIndex(visibleUser)
+
+  return mergedNextMessages
+    .slice(storedUserIndex + 1)
+    .some(
+      message =>
+        message.role === 'assistant' &&
+        !message.hidden &&
+        Boolean(message.error) &&
+        message.errorSurface?.code === local.errorSurface?.code
+    )
+}
+
 function localAssistantErrorIdsToPreserve(
   mergedNextMessages: ChatMessage[],
   currentMessages: ChatMessage[]
@@ -356,8 +384,10 @@ function localAssistantErrorIdsToPreserve(
   const captionOrdinal = (messages: ChatMessage[], target: ChatMessage): number =>
     messages
       .slice(0, messages.indexOf(target))
-      .filter(message => message.role === 'user' && attachmentTolerantUserText(chatMessageText(message)) === tailUserTolerantText)
-      .length
+      .filter(
+        message =>
+          message.role === 'user' && attachmentTolerantUserText(chatMessageText(message)) === tailUserTolerantText
+      ).length
 
   const tailCaptionOrdinal = tailUserInNext ? captionOrdinal(mergedNextMessages, tailUserInNext) : 0
 
@@ -366,7 +396,8 @@ function localAssistantErrorIdsToPreserve(
     ((normalizedMessageText(candidate) === tailUserText &&
       (candidate.attachmentRefs ?? []).join('\n') === tailUserRefs) ||
       (tailUserInNext
-        ? sameAttachmentTurn(tailUserInNext, candidate) && captionOrdinal(currentMessages, candidate) === tailCaptionOrdinal
+        ? sameAttachmentTurn(tailUserInNext, candidate) &&
+          captionOrdinal(currentMessages, candidate) === tailCaptionOrdinal
         : false))
 
   for (let index = 0; index < currentMessages.length; index += 1) {
@@ -389,9 +420,7 @@ function localAssistantErrorIdsToPreserve(
     // hydrated user row, still names the turn: fold the error onto the first
     // settled assistant reply after that row.
     const hydratedAttachmentAssistantIndex =
-      hydratedAssistantIndex === -1
-        ? attachmentTurnAssistantMatchIndex(mergedNextMessages, currentMessages, index)
-        : -1
+      hydratedAssistantIndex === -1 ? attachmentTurnAssistantMatchIndex(mergedNextMessages, currentMessages, index) : -1
 
     if (hydratedAttachmentAssistantIndex !== -1) {
       mergedNextMessages[hydratedAttachmentAssistantIndex] = {
@@ -401,6 +430,12 @@ function localAssistantErrorIdsToPreserve(
         pending: false
       }
 
+      continue
+    }
+
+    // #124379: the refresh already carries this tail turn's error card, rebuilt
+    // from its failed-turn boundary row — the local card is redundant, not missing.
+    if (hydratedAssistantIndex === -1 && persistedTailErrorMatches(mergedNextMessages, currentMessages, index)) {
       continue
     }
 
@@ -503,6 +538,41 @@ export function preserveLocalAssistantErrors(
   const preserveIds: Set<string> = localAssistantErrorIdsToPreserve(merged, currentMessages)
 
   return insertPreservedErrorRuns(merged, currentMessages, preserveIds)
+}
+
+/**
+ * Re-graft trailing client-local `system` notices (the fallback-switch notice
+ * from status.update): refreshes rebuild from stored rows, which never carry
+ * them, so the notice vanished on the next refresh (#126422). Stored rows own
+ * a `rowId` and are left to the page. Idempotent by id and text.
+ */
+export function preserveLocalSystemNotices(nextMessages: ChatMessage[], currentMessages: ChatMessage[]): ChatMessage[] {
+  const trailing: ChatMessage[] = []
+
+  for (let index = currentMessages.length - 1; index >= 0; index -= 1) {
+    const message = currentMessages[index]
+
+    if (message.role !== 'system') {
+      break
+    }
+
+    if (message.rowId === undefined) {
+      trailing.unshift(message)
+    }
+  }
+
+  if (!trailing.length) {
+    return nextMessages
+  }
+
+  const nextIds = new Set(nextMessages.map(message => message.id))
+  const nextTexts = new Set(nextMessages.map(message => chatMessageText(message).trim()))
+
+  const unstored = trailing.filter(
+    message => !nextIds.has(message.id) && !nextTexts.has(chatMessageText(message).trim())
+  )
+
+  return unstored.length ? [...nextMessages, ...unstored] : nextMessages
 }
 
 export function branchGroupForUser(userMessage: ChatMessage): string {

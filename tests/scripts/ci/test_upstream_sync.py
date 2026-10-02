@@ -193,7 +193,10 @@ if args[:2] == ['run', 'list']:
     ]
     dispatched = [args for args in requests if args[:2] == ["workflow", "run"]]
     assert len(dispatched) == 2
-    assert all("release=true" in args for args in dispatched)
+    by_workflow = {args[2]: args for args in dispatched}
+    assert "release=true" in by_workflow["ci.yaml"]
+    assert "sync=true" in by_workflow["nix.yml"]
+    assert "release=true" not in by_workflow["nix.yml"]
     assert output.read_text(encoding="utf-8-sig").splitlines() == [
         "ci_run_id=12",
         "nix_run_id=13",

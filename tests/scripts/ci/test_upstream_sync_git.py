@@ -62,6 +62,7 @@ def sync_repos(tmp_path):
     env = {
         **os.environ,
         "UPSTREAM_URL": str(upstream),
+        "SYNC_TOKEN_CONFIGURED": "true",
         "SYNC_BRANCH": "automation/upstream-sync",
         "GITHUB_OUTPUT": str(tmp_path / "outputs"),
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
@@ -71,12 +72,20 @@ def sync_repos(tmp_path):
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize(
-    "change", ["clean", "workflow-conflict", "source-conflict", "policy-drift"]
+    "change",
+    ["clean", "workflow-conflict", "source-conflict", "policy-drift", "missing-token"],
 )
 def test_prepare_only_pushes_supported_candidates_and_preserves_main(
     sync_repos, change
 ):
     fork, origin, upstream, workflow, env = sync_repos
+    if change == "missing-token":
+        env["SYNC_TOKEN_CONFIGURED"] = "false"
+        target = upstream / ".github/workflows/tests.yml"
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n# upstream workflow change\n",
+            encoding="utf-8",
+        )
     if change in {"workflow-conflict", "source-conflict"}:
         path = (
             ".github/workflows/tests.yml"
@@ -151,11 +160,12 @@ def test_prepare_only_pushes_supported_candidates_and_preserves_main(
     else:
         assert not candidate_ref
         summary = Path(env["GITHUB_STEP_SUMMARY"]).read_text(encoding="utf-8-sig")
-        assert (
-            "outside CI workflows"
-            if change == "source-conflict"
-            else "js: check concurrency"
-        ) in summary
+        expected = {
+            "source-conflict": "outside CI workflows",
+            "policy-drift": "js: check concurrency",
+            "missing-token": "UPSTREAM_SYNC_TOKEN is required",
+        }
+        assert expected[change] in summary
 
 
 @pytest.mark.platforms("posix")
