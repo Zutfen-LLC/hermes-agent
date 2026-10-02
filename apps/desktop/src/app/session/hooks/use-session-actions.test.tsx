@@ -2965,6 +2965,7 @@ describe('resumeSession warm switch away from a streaming session (#89696)', () 
 
 function BranchHarness({
   activeSessionId = null,
+  getRouteToken = () => 'token',
   navigate = vi.fn(),
   onCurrentReady,
   onLoadedReady,
@@ -2975,6 +2976,7 @@ function BranchHarness({
   selectedStoredSessionId = null
 }: {
   activeSessionId?: string | null
+  getRouteToken?: () => string
   navigate?: ReturnType<typeof vi.fn>
   onCurrentReady?: (branchCurrentSession: (messageId?: string) => Promise<boolean>) => void
   onLoadedReady?: (branchLoadedSession: ReturnType<typeof useSessionActions>['branchLoadedSession']) => void
@@ -2999,7 +3001,7 @@ function BranchHarness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
-    getRouteToken: () => 'token',
+    getRouteToken,
     getRoutedStoredSessionId: () => null,
     navigate: navigate as never,
     requestGateway,
@@ -3041,6 +3043,111 @@ describe('branchStoredSession desktop source tagging', () => {
     $sessionTiles.set([])
     setSelectedStoredSessionId(null)
     vi.restoreAllMocks()
+  })
+
+  it('loads the branch runtime when navigation updates the route during resume', async () => {
+    clearAllSessionStates()
+    _resetSessionOwnerHintsForTests()
+    setConnection(null)
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      session_id: 'branch-stored',
+      messages: [{ role: 'user', content: 'branch history', timestamp: 1 }]
+    } as never)
+    let routeToken = 'parent-route'
+
+    const navigate = vi.fn(() => {
+      queueMicrotask(() => {
+        routeToken = 'branch-route'
+      })
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.branch_stored') {
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored', message_count: 1 } as never
+      }
+
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 1,
+          messages: [{ role: 'user', content: 'branch history' }],
+          resumed: 'branch-stored',
+          session_id: 'branch-runtime',
+          session_key: 'branch-stored'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(requestGatewayForProfile).mockImplementation((_profile, method) => requestGateway(method))
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    setSelectedStoredSessionId('stored-parent')
+    setActiveSessionId('parent-runtime')
+    let branch: ((id: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        activeSessionId="parent-runtime"
+        getRouteToken={() => routeToken}
+        navigate={navigate}
+        onReady={value => (branch = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
+      />
+    )
+    await waitFor(() => expect(branch).not.toBeNull())
+    await act(async () => {
+      await expect(branch!('stored-parent')).resolves.toBe(true)
+    })
+    expect($activeSessionId.get()).toBe('branch-runtime')
+    expect(navigate).toHaveBeenCalledWith(sessionRoute('branch-stored'), { replace: true })
+  })
+
+  it('keeps a user navigation that occurs while the branch runtime loads', async () => {
+    clearAllSessionStates()
+    _resetSessionOwnerHintsForTests()
+    setConnection(null)
+    let routeToken = 'parent-route'
+    const resume = deferred<Record<string, unknown>>()
+    const navigate = vi.fn()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.branch_stored') {
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored', message_count: 1 } as never
+      }
+
+      if (method === 'session.resume') {
+        return (await resume.promise) as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(requestGatewayForProfile).mockImplementation((_profile, method) => requestGateway(method))
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    setSelectedStoredSessionId('stored-parent')
+    let branch: ((id: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        getRouteToken={() => routeToken}
+        navigate={navigate}
+        onReady={value => (branch = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-parent"
+      />
+    )
+    await waitFor(() => expect(branch).not.toBeNull())
+    let pending!: Promise<boolean>
+    act(() => {
+      pending = branch!('stored-parent')
+    })
+    await waitFor(() => expect(requestGateway.mock.calls.some(([method]) => method === 'session.resume')).toBe(true))
+    routeToken = 'other-route'
+    await act(async () => {
+      resume.resolve({ session_id: 'branch-runtime', messages: [], info: {} })
+      await pending
+    })
+    expect(navigate).not.toHaveBeenCalled()
   })
 
   it('opens the branch as the primary session in the main workspace (#93444)', async () => {

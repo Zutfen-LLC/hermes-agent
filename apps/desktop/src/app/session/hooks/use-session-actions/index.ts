@@ -2924,8 +2924,14 @@ export function useSessionActions({
         // unconditionally). resumeSession reuses the runtime warm-cached above
         // (ensureSessionState/updateSessionState) instead of an extra resume RPC.
         if (parentStoredId !== null && selectedStoredSessionIdRef.current === parentStoredId) {
-          navigate(sessionRoute(routedSessionId), { replace: true })
+          // Load the runtime before navigation changes the resume's route token.
+          const startingRouteToken = getRouteToken()
           await resumeSession(routedSessionId)
+
+          if (getRouteToken() === startingRouteToken && selectedStoredSessionIdRef.current === routedSessionId) {
+            armPendingCreatedSession(routedSessionId)
+            navigate(sessionRoute(routedSessionId), { replace: true })
+          }
         } else {
           // Carry the exact owner onto the tile: its persisted ownerRoute is
           // what pins the owning backend's socket in the gateway keep-set
@@ -2981,10 +2987,13 @@ export function useSessionActions({
       }
     },
     [
+      armPendingCreatedSession,
       copy,
       creatingSessionRef,
       ensureSessionState,
+      getRouteToken,
       navigate,
+      releaseCreatingSessionGuard,
       requestGateway,
       resumeSession,
       selectedStoredSessionIdRef,
