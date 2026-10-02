@@ -49,9 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          # The pull_request checkout is GitHub's merge commit; depth 2 brings its
-          # first parent (the base tip), which is all the diff below needs.
-          fetch-depth: 2
+          # Full history identifies trusted upstream catalog ancestry.
+          fetch-depth: 0
           # `hermes plugins validate` below runs pinned-repo code; keep the
           # job's token out of .git/config where that code could read it.
           persist-credentials: false
@@ -75,6 +74,14 @@ jobs:
           # The grep can only shrink the list and runs on its own so a git diff
           # failure still fails the step instead of looking like "no changes".
           CHANGED=$(printf '%s' "$CHANGED" | grep -v '/removed\.yaml$' || true)
+
+          if [ "${GITHUB_REPOSITORY:-NousResearch/hermes-agent}" != "NousResearch/hermes-agent" ]; then
+            git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git main
+            UPSTREAM_BASE="$(git merge-base HEAD FETCH_HEAD)"
+            if git diff --quiet "$UPSTREAM_BASE" HEAD -- 'plugin-catalog/*.yaml' 'plugin-catalog/*.yml'; then
+              CHANGED=""
+            fi
+          fi
 
           if [ -n "$CHANGED" ]; then
             # Admission PRs must be data-only: the gate's own enforcement code

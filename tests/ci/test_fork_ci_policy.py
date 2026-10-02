@@ -111,8 +111,8 @@ def test_test_resources_preserve_commands_and_force_hosted_budgets(upstream_work
         if name == "test":
             jobs += "          HERMES_TEST_SLICE: ${{ matrix.slice }}/2\n"
         jobs += '          HERMES_TEST_FILE_TIMEOUT: "3000"\n'
-    fixed = policy.apply_policy("tests.yml", jobs)
-    assert policy.apply_policy("tests.yml", fixed) == fixed
+    fixed = policy.TestResources().apply(jobs)
+    assert policy.TestResources().apply(fixed) == fixed
     parsed = YAML(typ="base").load(fixed)["jobs"]
     for name, (minutes, workers) in {
         "test": (45, 4),

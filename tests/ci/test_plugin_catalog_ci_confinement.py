@@ -303,9 +303,57 @@ def test_changed_entries_step(tmp_path, change, rc, listed, text):
     out = tmp_path / "gh-output.txt"
     out.touch()
     res = _run(_step("Find changed catalog"), tmp_path, repo,
-               {**os.environ, "GITHUB_OUTPUT": str(out)})
+               {**os.environ, "GITHUB_OUTPUT": str(out),
+                "GITHUB_REPOSITORY": "NousResearch/hermes-agent"})
     assert res.returncode == rc, res.stdout + res.stderr
     lines = out.read_text(encoding="utf-8").splitlines()
     assert [f for f in lines if f and "__EOF__" not in f and f != "files<<__EOF__"] == listed
     if text:
         assert text in res.stdout
+
+
+@pytest.mark.parametrize("modified", [False, True])
+def test_upstream_import_is_exempt_only_when_catalog_matches_trusted_ancestry(
+    tmp_path, modified
+):
+    repo = tmp_path / "fork"
+    _write(repo, {"plugin-catalog/old.yaml": "name: old\n"})
+    _git(repo, "init", "-qb", "main")
+    _commit(repo, "base")
+    _git(repo, "checkout", "-qb", "upstream")
+    _write(repo, {**NEW, "scripts/tool.py": "upstream code\n"})
+    imported = _commit(repo, "upstream")
+    trusted = tmp_path / "trusted.git"
+    _git(tmp_path, "clone", "--bare", str(repo), str(trusted))
+    _git(trusted, "update-ref", "refs/heads/main", imported)
+    _git(repo, "checkout", "main")
+    _write(repo, {"fork.txt": "retained fork code\n"})
+    _commit(repo, "fork")
+    _git(repo, "checkout", "-qb", "pr")
+    _git(repo, "merge", "--no-ff", "-m", "sync", "upstream")
+    if modified:
+        _write(repo, {"plugin-catalog/new.yaml": "name: fork-modified\n"})
+        _commit(repo, "modify entry")
+    _git(repo, "checkout", "main")
+    _git(repo, "merge", "--no-ff", "-m", "PR merge", "pr")
+    out = tmp_path / "output"
+    out.touch()
+    result = _run(
+        _step("Find changed catalog"),
+        tmp_path,
+        repo,
+        {
+            **os.environ,
+            "GITHUB_REPOSITORY": "owner/fork",
+            "GITHUB_OUTPUT": str(out),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{trusted.as_uri()}.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://github.com/NousResearch/hermes-agent.git",
+        },
+    )
+    assert (result.returncode == 0) is (not modified), result.stdout + result.stderr
+    if modified:
+        assert "catalog entry PRs may only touch" in result.stdout
+    else:
+        assert "plugin-catalog/new.yaml" not in out.read_text(encoding="utf-8")
+        assert (repo / "fork.txt").read_text(encoding="utf-8") == "retained fork code\n"

@@ -212,6 +212,13 @@ _RULES: dict[str, tuple] = {
     ),
     "tests.yml": (
         TestResources(),
+        Replace(
+            "tests: fetch upstream release baselines",
+            "          fetch-tags: true\n",
+            "          fetch-tags: true\n\n"
+            "      - name: Fetch upstream release baselines\n"
+            "        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'\n",
+        ),
         DropStep("tests: no duration cache restore", "Restore per-file duration cache"),
         DropStep(
             "tests: no duration cache save", "Save per-file duration cache (main only)"
@@ -236,6 +243,47 @@ _RULES: dict[str, tuple] = {
             "js: check bound",
             "    runs-on: ubuntu-latest-32-core\n    timeout-minutes: 30\n",
             "    runs-on: ubuntu-latest\n    timeout-minutes: 45\n",
+        ),
+    ),
+    "install-e2e.yml": (
+        Replace(
+            "install: fetch upstream release baselines",
+            "      - id: pick\n",
+            "      - name: Fetch upstream release baselines\n"
+            "        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'\n\n"
+            "      - id: pick\n",
+        ),
+    ),
+    "install-e2e-run.yml": (
+        Replace(
+            "install: make upstream baselines reachable by the driver",
+            "          fetch-depth: 0\n",
+            "          fetch-depth: 0\n\n"
+            "      - name: Fetch upstream release baselines\n"
+            "        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'\n",
+        ),
+    ),
+    "plugin-catalog-ci.yml": (
+        Replace(
+            "catalog: retain upstream ancestry for admission checks",
+            "          # The pull_request checkout is GitHub's merge commit; depth 2 brings its\n"
+            "          # first parent (the base tip), which is all the diff below needs.\n"
+            "          fetch-depth: 2\n",
+            "          # Full history identifies trusted upstream catalog ancestry.\n"
+            "          fetch-depth: 0\n",
+        ),
+        Replace(
+            "catalog: distinguish upstream imports from fork submissions",
+            '          if [ -n "$CHANGED" ]; then\n',
+            '          if [ "${GITHUB_REPOSITORY:-NousResearch/hermes-agent}" != "NousResearch/hermes-agent" ]; then\n'
+            "            git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git main\n"
+            '            UPSTREAM_BASE="$(git merge-base HEAD FETCH_HEAD)"\n'
+            '            if git diff --quiet "$UPSTREAM_BASE" HEAD -- '
+            "'plugin-catalog/*.yaml' 'plugin-catalog/*.yml'; then\n"
+            '              CHANGED=""\n'
+            "            fi\n"
+            "          fi\n\n"
+            '          if [ -n "$CHANGED" ]; then\n',
         ),
     ),
     "contributor-check.yml": (

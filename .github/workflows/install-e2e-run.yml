@@ -102,6 +102,9 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Fetch upstream release baselines
+        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'
+
       # The checkout owns the chat driver, not OLD's installed Node/runtime.
       - name: Set up driver tools only
         uses: ./.github/actions/setup-pm

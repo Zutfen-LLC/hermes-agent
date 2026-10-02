@@ -185,6 +185,9 @@ jobs:
             scripts/sandbox/pick-release-tags.sh
             scripts/releases/pick_tags.py
           sparse-checkout-cone-mode: false
+      - name: Fetch upstream release baselines
+        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'
+
       - id: pick
         env:
           # Inputs never touch shell syntax directly: TAG_COUNT arrives via

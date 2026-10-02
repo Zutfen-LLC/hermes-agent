@@ -211,3 +211,59 @@ def test_promote_requires_the_validated_base_and_candidate(sync_repos, moved):
         assert "promoted=true" in Path(env["GITHUB_OUTPUT"]).read_text(
             encoding="utf-8-sig"
         )
+
+
+@pytest.mark.platforms("posix")
+def test_install_jobs_fetch_release_baselines_without_changing_candidate(sync_repos):
+    fork, _, upstream, _, env = sync_repos
+    baseline = git(upstream, "rev-parse", "HEAD")
+    git(upstream, "tag", "v2026.10.1")
+    git(upstream, "push", "origin", "refs/tags/v2026.10.1")
+    trusted = git(upstream, "remote", "get-url", "origin")
+    candidate = git(fork, "rev-parse", "HEAD")
+    env = {
+        **env,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.{Path(trusted).as_uri()}.insteadOf",
+        "GIT_CONFIG_VALUE_0": "https://github.com/NousResearch/hermes-agent.git",
+    }
+    for filename in ("install-e2e.yml", "install-e2e-run.yml", "tests.yml"):
+        if git(fork, "tag", "--list"):
+            git(fork, "tag", "-d", "v2026.10.1")
+        workflow = YAML(typ="safe").load(
+            (ROOT / ".github/workflows" / filename).read_text(encoding="utf-8")
+        )
+        steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job.get("steps", [])
+            if step.get("name") == "Fetch upstream release baselines"
+        ]
+        assert len(steps) == 1
+        result = subprocess.run(
+            ["bash", "-c", steps[0]["run"]],
+            cwd=fork,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert git(fork, "rev-parse", "HEAD") == candidate
+        assert git(fork, "rev-parse", "refs/tags/v2026.10.1") == baseline
+        picked = subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts/sandbox/pick-release-tags.sh"),
+                "--repo",
+                str(fork),
+                "--count",
+                "1",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert picked.returncode == 0, picked.stderr
+        assert picked.stdout.strip() == '["v2026.10.1"]'
