@@ -8,6 +8,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
@@ -252,6 +253,16 @@ def _resolve_restricted_route(self, profile: str, *, _api_server) -> tuple[dict,
     return creds, reasoning, raw if isinstance(raw, dict) else {}, authority
 
 
+def _close_restricted_agent(agent: Any) -> None:
+    """Cleanup must not replace admission errors or log credential-bearing exceptions."""
+    try:
+        close = getattr(agent, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.warning("[api_server] restricted agent cleanup failed")
+
+
 def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = None, *,
                           _api_server, envelope: str = "input_only_v1"):
     """Build a model-only agent: explicit empty tool selection and tight turn budget."""
@@ -321,30 +332,34 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
         agent: Any = ctx.run(construct)
     else:
         agent = AIAgent(**kwargs)
-    effective = {"provider": agent.provider, "base_url": agent.base_url,
-                 "api_mode": agent.api_mode, "model": agent.model,
-                 "request_overrides": getattr(agent, "request_overrides", None)}
-    if envelope == "input_only_v1":
-        _validate_restricted_route(effective)
-    else:
-        # auth_type is authority-owned route identity, not an agent attribute: the
-        # effective-route revalidation carries the profile's expected auth_type (#35).
-        _validate_tool_free_route({**effective, "auth_type": expected_auth_type})
-        agent._restricted_wire_binding = (agent.provider, agent.model, agent.base_url, agent.api_mode)  # type: ignore
-        agent._disable_streaming = True  # type: ignore
-    if getattr(agent, "_fallback_activated", False) or getattr(agent, "_fallback_chain", []):
-        raise RuntimeError("restricted route cannot use fallback providers")
-    agent._auto_recovery_cycles = 0  # type: ignore
-    # Model tool resolution consumes these fields each turn; pin them even if a
-    # platform/default toolset resolver is later broadened.
-    agent.enabled_toolsets = []  # type: ignore
-    agent.disabled_toolsets = no_toolsets  # type: ignore
-    if not _check_restricted_tool_boundary(agent):
-        raise RuntimeError("restricted tool boundary could not be enforced")
-    if authority is not None:
-        agent._auth_authority = authority  # type: ignore
-        agent._credential_pool_entry_id = authority.entry_id
-    return agent
+    try:
+        effective = {"provider": agent.provider, "base_url": agent.base_url,
+                     "api_mode": agent.api_mode, "model": agent.model,
+                     "request_overrides": getattr(agent, "request_overrides", None)}
+        if envelope == "input_only_v1":
+            _validate_restricted_route(effective)
+        else:
+            # auth_type is authority-owned route identity, not an agent attribute: the
+            # effective-route revalidation carries the profile's expected auth_type (#35).
+            _validate_tool_free_route({**effective, "auth_type": expected_auth_type})
+            agent._restricted_wire_binding = (agent.provider, agent.model, agent.base_url, agent.api_mode)  # type: ignore
+            agent._disable_streaming = True  # type: ignore
+        if getattr(agent, "_fallback_activated", False) or getattr(agent, "_fallback_chain", []):
+            raise RuntimeError("restricted route cannot use fallback providers")
+        agent._auto_recovery_cycles = 0  # type: ignore
+        # Model tool resolution consumes these fields each turn; pin them even if a
+        # platform/default toolset resolver is later broadened.
+        agent.enabled_toolsets = []  # type: ignore
+        agent.disabled_toolsets = no_toolsets  # type: ignore
+        if not _check_restricted_tool_boundary(agent):
+            raise RuntimeError("restricted tool boundary could not be enforced")
+        if authority is not None:
+            agent._auth_authority = authority  # type: ignore
+            agent._credential_pool_entry_id = authority.entry_id
+        return agent
+    except BaseException:
+        _close_restricted_agent(agent)
+        raise
 
 
 def _identity(self, profile: str, creds: dict, raw: dict, authority: Any = None,
@@ -498,67 +513,62 @@ async def _admit_restricted_runs(self, request, *, _api_server, checked: bool):
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
-    # Route resolution occurs only for a new request and under the served profile scope.
-    try:
-        request_profile = _api_server._api_request_profile.get()
-        with self._profile_scope(request_profile):
-            creds, reasoning, raw, authority = _resolve_restricted_route(self, profile, _api_server=_api_server)
-            if envelope == "hermes_tool_free_v1" and raw.get("restricted_tool_free") is not True:
-                raise RuntimeError("delegation profile has not opted into the tool-free envelope")
-            from agent.redact import register_provider_credential_redaction
-            credential_lease = register_provider_credential_redaction(creds.get("api_key"))
-            agent = _new_restricted_agent(self, creds, reasoning, authority,
-                                          _api_server=_api_server, envelope=envelope)
-            identity = _identity(self, profile, creds, raw, authority, agent=agent, _api_server=_api_server,
-                                 work_class=work_class if checked else None,
-                                 envelope=envelope if checked else None)
-            if checked and expected_identity != identity:
+    with ExitStack() as ownership:
+        # Route resolution occurs only for a new request and under the served profile scope.
+        try:
+            request_profile = _api_server._api_request_profile.get()
+            with self._profile_scope(request_profile):
+                creds, reasoning, raw, authority = _resolve_restricted_route(self, profile, _api_server=_api_server)
+                if envelope == "hermes_tool_free_v1" and raw.get("restricted_tool_free") is not True:
+                    raise RuntimeError("delegation profile has not opted into the tool-free envelope")
+                from agent.redact import register_provider_credential_redaction
+                credential_lease = register_provider_credential_redaction(creds.get("api_key"))
                 if credential_lease is not None:
-                    credential_lease.release()
-                close = getattr(agent, "close", None)
-                if callable(close):
-                    close()
-                return _json_error(_api_server._openai_error, "Resolved restricted identity does not match.",
-                                   code="restricted_identity_mismatch", status=409)
-    except Exception:
-        if "credential_lease" in locals() and credential_lease is not None:
-            credential_lease.release()
-        logger.warning("[api_server] restricted run profile resolution failed")
-        return _json_error(_api_server._openai_error, "Delegation profile could not be resolved.",
-                           code="delegation_profile_unavailable", status=403)
-    run_id = f"run_{uuid.uuid4().hex}"
-    status = {"object": "hermes.run", "run_id": run_id, "status": "queued", "created_at": time.time(),
-              "updated_at": time.time(), "resolved_identity": identity,
-              "work_class": work_class, "capability_envelope": envelope}
-    try:
-        outcome, record = self._run_idempotency_store.reserve(
-            scope, key, digest, run_id, status, owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
-    except Exception:
-        if credential_lease is not None:
-            credential_lease.release()
-        logger.warning("[api_server] restricted run reservation failed")
-        return _json_error(_api_server._openai_error, "Durable run storage is unavailable.",
-                           code="run_storage_unavailable", status=503)
-    if outcome != "created":
-        if credential_lease is not None:
-            credential_lease.release()
-        if outcome == "conflict":
-            return _json_error(_api_server._openai_error, "Idempotency key conflicts with a prior request.",
-                               code="idempotency_key_conflict", status=409)
-        status = self._durable_run_status(request, record["run_id"]) or record["status"]
-        return _replay_response(record["run_id"], status)
-    self._run_owners[run_id] = scope
-    self._run_statuses[run_id] = status
-    self._run_idempotency_ids.add(run_id)
-    self._active_run_agents[run_id] = agent
-    self._activate_admitted_request()
-    task = asyncio.create_task(_execute_restricted(
-        self, run_id, text, agent, credential_lease, request_profile, _api_server=_api_server))
-    self._active_run_tasks[run_id] = task
-    self._background_tasks.add(task)
-    task.add_done_callback(self._background_tasks.discard)
-    return _api_server.web.json_response({"run_id": run_id, "status": "queued", "replayed": False,
-                                          "resolved_identity": identity}, status=202)
+                    ownership.callback(credential_lease.release)
+                agent = _new_restricted_agent(self, creds, reasoning, authority,
+                                              _api_server=_api_server, envelope=envelope)
+                ownership.callback(_close_restricted_agent, agent)
+                identity = _identity(self, profile, creds, raw, authority, agent=agent, _api_server=_api_server,
+                                     work_class=work_class if checked else None,
+                                     envelope=envelope if checked else None)
+                if checked and expected_identity != identity:
+                    return _json_error(_api_server._openai_error, "Resolved restricted identity does not match.",
+                                       code="restricted_identity_mismatch", status=409)
+        except Exception:
+            logger.warning("[api_server] restricted run profile resolution failed")
+            return _json_error(_api_server._openai_error, "Delegation profile could not be resolved.",
+                               code="delegation_profile_unavailable", status=403)
+        run_id = f"run_{uuid.uuid4().hex}"
+        status = {"object": "hermes.run", "run_id": run_id, "status": "queued", "created_at": time.time(),
+                  "updated_at": time.time(), "resolved_identity": identity,
+                  "work_class": work_class, "capability_envelope": envelope}
+        try:
+            outcome, record = self._run_idempotency_store.reserve(
+                scope, key, digest, run_id, status, owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
+        except Exception:
+            logger.warning("[api_server] restricted run reservation failed")
+            return _json_error(_api_server._openai_error, "Durable run storage is unavailable.",
+                               code="run_storage_unavailable", status=503)
+        if outcome != "created":
+            if outcome == "conflict":
+                return _json_error(_api_server._openai_error, "Idempotency key conflicts with a prior request.",
+                                   code="idempotency_key_conflict", status=409)
+            status = self._durable_run_status(request, record["run_id"]) or record["status"]
+            return _replay_response(record["run_id"], status)
+        self._run_owners[run_id] = scope
+        self._run_statuses[run_id] = status
+        self._run_idempotency_ids.add(run_id)
+        self._active_run_agents[run_id] = agent
+        self._activate_admitted_request()
+        task = asyncio.create_task(_execute_restricted(
+            self, run_id, text, agent, credential_lease, request_profile, _api_server=_api_server))
+        self._active_run_tasks[run_id] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        # No awaits occur between construction and this transfer to the execution task.
+        ownership.pop_all()
+        return _api_server.web.json_response({"run_id": run_id, "status": "queued", "replayed": False,
+                                              "resolved_identity": identity}, status=202)
 
 
 def _recover_restricted_run(self, request, *, _api_server):
@@ -693,6 +703,12 @@ async def _execute_restricted(self, run_id: str, text: str, agent: Any, credenti
             except Exception:
                 self._run_statuses[run_id]["status"] = "interrupted"
     finally:
+        # The wrapper may be cancelled while its executor thread is still using
+        # the agent. That worker's completion, not cancellation, owns final close.
+        if worker_future is not None and not worker_future.done():
+            worker_future.add_done_callback(lambda _: _close_restricted_agent(agent))
+        else:
+            _close_restricted_agent(agent)
         if credential_lease is not None:
             if worker_future is not None and not worker_future.done():
                 worker_future.add_done_callback(lambda _: credential_lease.release())
