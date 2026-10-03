@@ -32,6 +32,8 @@ REQUEST = {
 class FakeAgent:
     provider = "provider-test"
     model = "model-test"
+    base_url = "https://provider.invalid"
+    api_mode = "chat_completions"
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -624,6 +626,34 @@ def test_real_delegation_profile_config_uses_runtime_credentials_not_request_fie
     identity = restricted._identity(adapter, "logical-helper", creds, raw, authority, _api_server=api_server)
     assert identity["resolved_model"] == "operator-model"
     assert "runtime-only-secret" not in str(identity)
+
+
+def test_restricted_identity_uses_effective_agent_endpoint(restricted_service):
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    creds = {"provider": "openai", "model": "gpt-4.1-mini", "base_url": "https://configured.invalid/v1"}
+    agent = FakeAgent()
+    agent.provider = "openai"
+    agent.model = "gpt-4.1-mini"
+    agent.base_url = "https://effective.invalid/v1"
+    identity = restricted._identity(adapter, "helper", creds, {}, agent=agent,
+                                    _api_server=api_server, work_class="context_gather",
+                                    envelope="input_only_v1")
+    assert identity["endpoint_identity"] == "https://effective.invalid"
+
+
+def test_generic_identity_route_revision_preserves_legacy_digest(restricted_service):
+    import hashlib
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    raw = {"provider": "openai", "model": "gpt-4.1-mini", "base_url": "https://provider.invalid/v1",
+           "api_mode": "chat_completions", "enabled": True, "restricted_tool_free": True}
+    keys = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers", "auth_type")
+    payload = {key: raw.get(key) for key in keys}
+    expected = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                         default=str).encode()).hexdigest()
+    identity = restricted._identity(adapter, "helper", raw, raw, _api_server=api_server)
+    assert identity["route_revision"] == expected
 
 
 def test_restricted_route_identity_strips_url_userinfo_path_query_and_fragment(restricted_service):

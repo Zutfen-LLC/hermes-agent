@@ -351,8 +351,9 @@ def _identity(self, profile: str, creds: dict, raw: dict, authority: Any = None,
               agent: Any = None, *, _api_server, work_class: str | None = None,
               envelope: str | None = None) -> dict:
     from agent.redact import redact_sensitive_text
-    route_keys = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers", "auth_type",
-                  "enabled", "restricted_tool_free")
+    route_keys = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers", "auth_type")
+    if work_class is not None:
+        route_keys += ("enabled", "restricted_tool_free")
     revision = hashlib.sha256(json.dumps({k: raw.get(k) for k in route_keys}, sort_keys=True,
                                          separators=(",", ":"), default=str).encode()).hexdigest()
     auth_type = str(getattr(authority, "auth_type", None) or raw.get("auth_type") or creds.get("auth_type") or "none")
@@ -364,7 +365,7 @@ def _identity(self, profile: str, creds: dict, raw: dict, authority: Any = None,
                        "external_process" if auth_type == "external_process" else
                        "none" if auth_type == "none" else "native")
     # A path or query may hold a signed token; endpoint identity is deliberately origin-only.
-    endpoint = urlsplit(str(creds.get("base_url") or ""))
+    endpoint = urlsplit(str(getattr(agent, "base_url", None) or creds.get("base_url") or ""))
     origin = f"{endpoint.scheme}://{endpoint.hostname}" if endpoint.scheme and endpoint.hostname else ""
     if origin and endpoint.port:
         origin += f":{endpoint.port}"
