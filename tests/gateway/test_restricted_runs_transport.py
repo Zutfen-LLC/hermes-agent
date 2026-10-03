@@ -640,6 +640,7 @@ def test_restricted_identity_uses_effective_agent_endpoint(restricted_service):
                                     _api_server=api_server, work_class="context_gather",
                                     envelope="input_only_v1")
     assert identity["endpoint_identity"] == "https://effective.invalid"
+    assert identity["endpoint_identity"] != "https://configured.invalid"
 
 
 def test_generic_identity_route_revision_preserves_legacy_digest(restricted_service):
