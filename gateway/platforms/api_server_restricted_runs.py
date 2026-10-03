@@ -18,6 +18,12 @@ from gateway.platforms.api_server_runs import _submit_api_worker, terminal_run_s
 logger = logging.getLogger("gateway.platforms.api_server")
 _ALLOWED_WORK_CLASSES = frozenset({"context_gather", "log_triage", "process_observe", "ci_triage"})
 _REQUIRED_FIELDS = frozenset({"delegation_profile_id", "work_class", "input", "capability_envelope"})
+_RESOLVE_FIELDS = frozenset({"delegation_profile_id", "work_class", "capability_envelope"})
+_CHECKED_FIELDS = _REQUIRED_FIELDS | {"expected_identity"}
+_RESTRICTED_IDENTITY_VERSION = 1
+_RESTRICTED_IDENTITY_CONTRACT = {"version": _RESTRICTED_IDENTITY_VERSION,
+    "resolve": {"method": "POST", "path": "/v1/restricted-runs/resolve"},
+    "checked_admission": {"method": "POST", "path": "/v1/restricted-runs/identity-checked"}}
 _MAX_INPUT_CHARS = 32_000
 _MAX_RESULT_CHARS = 16_000
 _MAX_ITERATIONS = 8
@@ -342,9 +348,11 @@ def _new_restricted_agent(self, creds: dict, reasoning: Any, authority: Any = No
 
 
 def _identity(self, profile: str, creds: dict, raw: dict, authority: Any = None,
-              agent: Any = None, *, _api_server) -> dict:
+              agent: Any = None, *, _api_server, work_class: str | None = None,
+              envelope: str | None = None) -> dict:
     from agent.redact import redact_sensitive_text
-    route_keys = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers", "auth_type")
+    route_keys = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers", "auth_type",
+                  "enabled", "restricted_tool_free")
     revision = hashlib.sha256(json.dumps({k: raw.get(k) for k in route_keys}, sort_keys=True,
                                          separators=(",", ":"), default=str).encode()).hexdigest()
     auth_type = str(getattr(authority, "auth_type", None) or raw.get("auth_type") or creds.get("auth_type") or "none")
@@ -367,6 +375,11 @@ def _identity(self, profile: str, creds: dict, raw: dict, authority: Any = None,
              "auth_type": auth_type,
              "auth_source_category": source_category,
              "route_revision": revision, "source": "hermes_delegation_profile"}
+    if work_class is not None:
+        route["version"] = _RESTRICTED_IDENTITY_VERSION
+        route["effective_api_mode"] = str(getattr(agent, "api_mode", None) or creds.get("api_mode") or "chat_completions")
+        route["work_class"] = work_class
+        route["capability_envelope"] = envelope
     # Redacted route metadata must not be represented as a successfully resolved route.
     secret = creds.get("api_key")
     for value in route.values():
@@ -375,8 +388,8 @@ def _identity(self, profile: str, creds: dict, raw: dict, authority: Any = None,
     return route
 
 
-async def _handle_restricted_runs(self, request, *, _api_server):
-    """POST /v1/restricted-runs: exact low-authority contract, durable idempotent admission."""
+async def _handle_resolve_restricted_identity(self, request, *, _api_server):
+    """Resolve the effective restricted agent route without reserving or running it."""
     auth = self._check_restricted_auth(request)
     if auth:
         return auth
@@ -387,17 +400,82 @@ async def _handle_restricted_runs(self, request, *, _api_server):
         body = await request.json()
     except Exception:
         return _json_error(_api_server._openai_error, "Invalid JSON", status=400)
-    if not isinstance(body, dict) or set(body) != _REQUIRED_FIELDS:
+    if (not isinstance(body, dict) or set(body) != _RESOLVE_FIELDS
+            or not isinstance(body.get("delegation_profile_id"), str)
+            or not body["delegation_profile_id"] or len(body["delegation_profile_id"]) > 128
+            or body.get("work_class") not in _ALLOWED_WORK_CLASSES
+            or body.get("capability_envelope") not in _CAPABILITY_ENVELOPES):
+        return _json_error(_api_server._openai_error, "Restricted identity parameters are invalid.",
+                           code="invalid_restricted_identity", status=400)
+    profile, work_class, envelope = (body["delegation_profile_id"], body["work_class"],
+                                     body["capability_envelope"])
+    agent = None
+    try:
+        with self._profile_scope(_api_server._api_request_profile.get()):
+            creds, reasoning, raw, authority = _resolve_restricted_route(self, profile, _api_server=_api_server)
+            if envelope == "hermes_tool_free_v1" and raw.get("restricted_tool_free") is not True:
+                raise RuntimeError("delegation profile has not opted into the tool-free envelope")
+            agent = _new_restricted_agent(self, creds, reasoning, authority,
+                                          _api_server=_api_server, envelope=envelope)
+            identity = _identity(self, profile, creds, raw, authority, agent=agent,
+                                 _api_server=_api_server, work_class=work_class, envelope=envelope)
+        return _api_server.web.json_response({"object": "hermes.restricted_route_identity",
+                                               "identity": identity})
+    except Exception:
+        logger.warning("[api_server] restricted identity resolution failed")
+        return _json_error(_api_server._openai_error, "Delegation profile could not be resolved.",
+                           code="delegation_profile_unavailable", status=403)
+    finally:
+        close = getattr(agent, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("[api_server] restricted identity cleanup failed")
+
+
+async def _handle_restricted_runs(self, request, *, _api_server):
+    return await _admit_restricted_runs(self, request, _api_server=_api_server, checked=False)
+
+
+async def _handle_identity_checked_restricted_runs(self, request, *, _api_server):
+    return await _admit_restricted_runs(self, request, _api_server=_api_server, checked=True)
+
+
+async def _admit_restricted_runs(self, request, *, _api_server, checked: bool):
+    """POST admission; checked mode compares identity before durable reservation."""
+    auth = self._check_restricted_auth(request)
+    if auth:
+        return auth
+    if request.headers.get("X-Hermes-Provider-API-Key") is not None:
+        return _json_error(_api_server._openai_error, "Provider credential injection is not accepted.",
+                           code="forbidden_credential_injection", status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error(_api_server._openai_error, "Invalid JSON", status=400)
+    expected_fields = _CHECKED_FIELDS if checked else _REQUIRED_FIELDS
+    if not isinstance(body, dict) or set(body) != expected_fields:
         return _json_error(_api_server._openai_error, "Request must contain exactly the restricted-run fields.",
                            code="invalid_restricted_run", status=400)
-    profile, work_class, text, envelope = (body.get("delegation_profile_id"), body.get("work_class"),
-                                           body.get("input"), body.get("capability_envelope"))
-    if (not isinstance(profile, str) or not profile or len(profile) > 128
-            or not isinstance(work_class, str) or work_class not in _ALLOWED_WORK_CLASSES
-            or not isinstance(text, str) or not text.strip()
-            or len(text) > _MAX_INPUT_CHARS or envelope not in _CAPABILITY_ENVELOPES):
+    expected_identity = body.get("expected_identity") if checked else None
+    if (not isinstance(profile := body.get("delegation_profile_id"), str) or not profile or len(profile) > 128
+            or not isinstance(work_class := body.get("work_class"), str) or work_class not in _ALLOWED_WORK_CLASSES
+            or not isinstance(text := body.get("input"), str) or not text.strip()
+            or len(text) > _MAX_INPUT_CHARS
+            or (envelope := body.get("capability_envelope")) not in _CAPABILITY_ENVELOPES):
         return _json_error(_api_server._openai_error, "Restricted run parameters are invalid.",
                            code="invalid_restricted_run", status=400)
+    if checked and (not isinstance(expected_identity, dict)
+                    or set(expected_identity) != {"version", "hermes_delegation_profile_id", "resolved_provider",
+                        "resolved_model", "effective_api_mode", "endpoint_identity", "auth_type",
+                        "auth_source_category", "route_revision", "work_class", "capability_envelope", "source"}
+                    or type(expected_identity.get("version")) is not int
+                    or expected_identity.get("version") != _RESTRICTED_IDENTITY_VERSION
+                    or any(not isinstance(value, str) for key, value in expected_identity.items()
+                           if key != "version")):
+        return _json_error(_api_server._openai_error, "Expected restricted identity is invalid.",
+                           code="invalid_expected_identity", status=400)
     key = request.headers.get("Idempotency-Key", "")
     if not _valid_idempotency_key(key):
         return _json_error(_api_server._openai_error, "A valid Idempotency-Key is required.",
@@ -428,7 +506,17 @@ async def _handle_restricted_runs(self, request, *, _api_server):
             credential_lease = register_provider_credential_redaction(creds.get("api_key"))
             agent = _new_restricted_agent(self, creds, reasoning, authority,
                                           _api_server=_api_server, envelope=envelope)
-            identity = _identity(self, profile, creds, raw, authority, agent=agent, _api_server=_api_server)
+            identity = _identity(self, profile, creds, raw, authority, agent=agent, _api_server=_api_server,
+                                 work_class=work_class if checked else None,
+                                 envelope=envelope if checked else None)
+            if checked and expected_identity != identity:
+                if credential_lease is not None:
+                    credential_lease.release()
+                close = getattr(agent, "close", None)
+                if callable(close):
+                    close()
+                return _json_error(_api_server._openai_error, "Resolved restricted identity does not match.",
+                                   code="restricted_identity_mismatch", status=409)
     except Exception:
         if "credential_lease" in locals() and credential_lease is not None:
             credential_lease.release()
