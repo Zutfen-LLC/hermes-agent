@@ -2622,9 +2622,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("[%s] GET /api/model/options failed", self.name)
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
 
-    @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
-        """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
+        """GET /v1/capabilities — scoped discovery never grants control-plane authority."""
+        if self._is_restricted_credential(request):
+            # Ops needs only this static identity contract. Do not expose configured
+            # models, storage/browser state, or unrelated control surfaces to it.
+            return web.json_response({
+                "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
+                "features": {"restricted_run_identity": _RESTRICTED_IDENTITY_CONTRACT},
+                "endpoints": {name: {"method": method, "path": path}
+                    for name, (method, path) in _CAPABILITY_ENDPOINTS
+                    if name in {"restricted_run_identity_resolve", "restricted_run_identity_checked"}},
+            })
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
