@@ -1215,6 +1215,79 @@ async def test_restricted_identity_resolution_is_nonexecuting_and_checked_admiss
     assert conflict.status == 409
 
 
+@pytest.mark.asyncio
+async def test_http_resolve_reports_effective_endpoint_and_rejects_endpoint_drift_before_admission(
+        restricted_service, monkeypatch):
+    client, adapter = restricted_service
+    observed = _route_mocks(monkeypatch)
+
+    def create_effective_agent(_self, creds, reasoning, authority=None, **_kw):
+        config = {**creds, "provider": "provider-test", "model": "model-test",
+                  "base_url": "https://effective-provider.invalid/v2", "enabled_toolsets": [],
+                  "disabled_toolsets": ["all toolsets"], "skip_context_files": True,
+                  "skip_memory": True}
+        agent = FakeAgent(**config)
+        agent.base_url = config["base_url"]
+        observed["agent"] = agent
+        observed["agent_config"] = config
+        return agent
+
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._new_restricted_agent",
+                        create_effective_agent)
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._resolve_restricted_route",
+        lambda *a, **kw: ({"provider": "provider-test", "model": "model-test",
+            "api_key": "resolve-secret", "base_url": "https://configured-provider.invalid/v1",
+            "auth_type": "api_key"}, None,
+            {"provider": "provider-test", "model": "model-test",
+             "base_url": "https://configured-provider.invalid/v1", "auth_type": "api_key"}, None))
+    body = {key: REQUEST[key] for key in (
+        "delegation_profile_id", "work_class", "capability_envelope")}
+    resolved = await client.post("/v1/restricted-runs/resolve", json=body, headers=RESTRICTED_AUTH)
+    assert resolved.status == 200
+    identity = (await resolved.json())["identity"]
+    assert identity["endpoint_identity"] == "https://effective-provider.invalid"
+    assert identity["endpoint_identity"] != "https://configured-provider.invalid"
+    assert observed["agent"].closed is True
+
+    # Checked admission resolves again, but now the constructed runtime agent
+    # points at the stale configured endpoint. Compare against the opaque identity.
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._new_restricted_agent",
+        lambda _self, creds, reasoning, authority=None, **_kw: FakeAgent(**{
+            **creds, "provider": "provider-test", "model": "model-test",
+            "base_url": "https://configured-provider.invalid/v1"}))
+    before = adapter._run_idempotency_store._conn.execute(
+        "SELECT COUNT(*) FROM run_idempotency").fetchone()[0]
+    response = await client.post("/v1/restricted-runs/identity-checked",
+        json={**REQUEST, "expected_identity": identity},
+        headers={**RESTRICTED_AUTH, "Idempotency-Key": "endpoint-drift"})
+    assert response.status == 409
+    assert (await response.json())["error"]["code"] == "restricted_identity_mismatch"
+    assert adapter._run_idempotency_store._conn.execute(
+        "SELECT COUNT(*) FROM run_idempotency").fetchone()[0] == before
+    assert not adapter._active_run_agents
+    assert not adapter._active_run_tasks
+    assert not adapter._run_statuses
+
+
+@pytest.mark.parametrize("field,value", [
+    ("work_class", ["context_gather"]),
+    ("work_class", {"unexpected": "shape"}),
+    ("capability_envelope", ["input_only_v1"]),
+    ("capability_envelope", {"unexpected": "shape"}),
+])
+@pytest.mark.asyncio
+async def test_resolve_malformed_policy_fields_return_400_not_500(restricted_service, field, value):
+    client, adapter = restricted_service
+    response = await client.post("/v1/restricted-runs/resolve",
+        json={"delegation_profile_id": "logical-helper", "work_class": "context_gather",
+              "capability_envelope": "input_only_v1", field: value}, headers=RESTRICTED_AUTH)
+    assert response.status == 400
+    assert (await response.json())["error"]["code"] != "internal_error"
+    assert adapter._run_idempotency_store._conn.execute(
+        "SELECT COUNT(*) FROM run_idempotency").fetchone()[0] == 0
+    assert not adapter._active_run_agents
+
+
 @pytest.mark.parametrize(("field", "wrong"), [
     ("hermes_delegation_profile_id", "other-profile"),
     ("resolved_provider", "other-provider"), ("resolved_model", "other-model"),
