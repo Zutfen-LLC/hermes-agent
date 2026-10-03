@@ -404,7 +404,9 @@ async def _handle_resolve_restricted_identity(self, request, *, _api_server):
     if (not isinstance(body, dict) or set(body) != _RESOLVE_FIELDS
             or not isinstance(body.get("delegation_profile_id"), str)
             or not body["delegation_profile_id"] or len(body["delegation_profile_id"]) > 128
+            or not isinstance(body.get("work_class"), str)
             or body.get("work_class") not in _ALLOWED_WORK_CLASSES
+            or not isinstance(body.get("capability_envelope"), str)
             or body.get("capability_envelope") not in _CAPABILITY_ENVELOPES):
         return _json_error(_api_server._openai_error, "Restricted identity parameters are invalid.",
                            code="invalid_restricted_identity", status=400)
