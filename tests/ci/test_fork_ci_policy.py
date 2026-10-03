@@ -97,3 +97,41 @@ def test_native_clients_are_disabled_and_linux_validation_remains_strict():
           - runner: windows-latest
 """,
         )
+
+
+@pytest.mark.parametrize("upstream_workers", [16, 32, 64])
+def test_test_resources_preserve_commands_and_force_hosted_budgets(upstream_workers):
+    jobs = "jobs:\n"
+    for name in ("test", "e2e", "e2e-upgrade"):
+        jobs += f"  {name}:\n    runs-on: ubuntu-latest-{upstream_workers}-core\n    timeout-minutes: 30\n"
+        if name == "test":
+            jobs += "    name: Run tests (${{ matrix.slice }}/2)\n    strategy:\n      matrix:\n        slice: [1, 2]\n"
+        jobs += "    steps:\n      - run: scripts/run_tests.sh\n        env:\n"
+        jobs += f'          HERMES_TEST_WORKERS: "{upstream_workers}"\n'
+        if name == "test":
+            jobs += "          HERMES_TEST_SLICE: ${{ matrix.slice }}/2\n"
+        jobs += '          HERMES_TEST_FILE_TIMEOUT: "3000"\n'
+    fixed = policy.TestResources().apply(jobs)
+    assert policy.TestResources().apply(fixed) == fixed
+    parsed = YAML(typ="base").load(fixed)["jobs"]
+    for name, (minutes, workers) in {
+        "test": (45, 4),
+        "e2e": (60, 2),
+        "e2e-upgrade": (90, 2),
+    }.items():
+        job = parsed[name]
+        assert job["runs-on"] == "ubuntu-latest"
+        assert int(job["timeout-minutes"]) == minutes
+        (step,) = job["steps"]
+        assert step["run"] == "scripts/run_tests.sh"
+        assert int(step["env"]["HERMES_TEST_WORKERS"]) == workers
+        assert step["env"]["HERMES_TEST_FILE_TIMEOUT"] == "3000"
+    assert parsed["test"]["strategy"]["matrix"]["slice"] == ["1", "2", "3", "4"]
+    assert (
+        parsed["test"]["steps"][0]["env"]["HERMES_TEST_SLICE"]
+        == "${{ matrix.slice }}/4"
+    )
+    with pytest.raises(policy.PolicyError, match="expected one job"):
+        policy.apply_policy(
+            "tests.yml", jobs.replace("  e2e-upgrade:", "  renamed-upgrade:")
+        )

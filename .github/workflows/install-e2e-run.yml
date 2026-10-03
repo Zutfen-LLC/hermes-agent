@@ -97,10 +97,13 @@ jobs:
       # Full history: the driver bare-clones this checkout as the repo the
       # installer/updater talk to, and both OLD and HEAD must be reachable
       # in that clone. A shallow clone cannot serve either need.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - name: Fetch upstream release baselines
+        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'
 
       # The checkout owns the chat driver, not OLD's installed Node/runtime.
       - name: Set up driver tools only

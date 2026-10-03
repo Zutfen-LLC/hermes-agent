@@ -4,6 +4,8 @@ name: Validated upstream sync
 #   NousResearch/main -> temporary merge candidate -> CI + Nix -> fork/main.
 # Local Hermes installs track fork origin/main, so "hermes update" only sees
 # upstream code after this workflow has validated and promoted it.
+# UPSTREAM_SYNC_TOKEN must grant Contents and Workflows write access to this fork.
+# GITHUB_TOKEN cannot push upstream workflow changes.
 on:
   workflow_dispatch:
   schedule:
@@ -51,11 +53,13 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Build candidate
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
+          SYNC_TOKEN_CONFIGURED: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -141,6 +145,12 @@ jobs:
 
           # Dedicated automation branch: force is intentional. main is never
           # force-pushed, and concurrency guarantees one sync writer at a time.
+          if [ "$SYNC_TOKEN_CONFIGURED" != true ] && \
+              ! git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows; then
+            report_blocker "UPSTREAM_SYNC_TOKEN is required to push workflow changes. main was not changed." \
+              "Add a repository secret with Contents and Workflows write access for this fork."
+            exit 1
+          fi
           git push --force origin "HEAD:refs/heads/$SYNC_BRANCH"
 
           echo "needed=true" >> "$GITHUB_OUTPUT"
@@ -154,7 +164,7 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.needed == 'true'
     runs-on: ubuntu-latest
-    # Sliced unit suite, Windows, e2e and desktop lanes on standard runners.
+    # Run all required Linux lanes on the exact candidate.
     timeout-minutes: 180
     outputs:
       ci_run_id: ${{ steps.dispatch.outputs.ci_run_id }}
@@ -200,7 +210,7 @@ jobs:
             exit 1
           }
           echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
-          gh workflow run nix.yml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH" -f release=true
+          gh workflow run nix.yml -R "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH" -f sync=true
           NIX_RUN_ID="$(find_run nix.yml)" || {
             echo "::error::Could not find dispatched Nix run for $CANDIDATE_SHA"
             exit 1
@@ -240,6 +250,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Fast-forward main to the validated SHA
         id: promote

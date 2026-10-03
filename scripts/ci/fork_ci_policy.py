@@ -133,6 +133,57 @@ class DropStep:
         return pattern.sub("", text, count=1)
 
 
+class TestResources:
+    """Set hosted-runner resources in each supported test job."""
+
+    def apply(self, text: str) -> str:
+        budgets = {"test": (45, 4), "e2e": (60, 2), "e2e-upgrade": (90, 2)}
+        for job, (minutes, workers) in budgets.items():
+            pattern = re.compile(
+                rf"^  {re.escape(job)}:\n(?:(?!  \S).*\n)*", re.MULTILINE
+            )
+            matches = list(pattern.finditer(text))
+            if len(matches) != 1:
+                raise PolicyError(f"tests: {job}: expected one job")
+            block = matches[0][0]
+            fields = [
+                (
+                    r"^    runs-on: ubuntu-(?:latest(?:-\d+-core)?|24\.04)\n",
+                    "    runs-on: ubuntu-latest\n",
+                ),
+                (r"^    timeout-minutes: \d+\n", f"    timeout-minutes: {minutes}\n"),
+                (
+                    r'^          HERMES_TEST_WORKERS: ["\']?\d+["\']?\n',
+                    f'          HERMES_TEST_WORKERS: "{workers}"\n',
+                ),
+            ]
+            if job == "test":
+                fields += [
+                    (
+                        r"^    name: Run tests(?: \([^\n]+\))?\n",
+                        "    name: Run tests (slice ${{ matrix.slice }}/4)\n",
+                    ),
+                    (
+                        r"^        slice: \[\d+(?:, *\d+)*\]\n",
+                        "        slice: [1, 2, 3, 4]\n",
+                    ),
+                    (
+                        r"^          HERMES_TEST_SLICE: \$\{\{ matrix.slice \}\}/\d+\n",
+                        "          HERMES_TEST_SLICE: ${{ matrix.slice }}/4\n",
+                    ),
+                ]
+            for anchor, replacement in fields:
+                block, count = re.subn(
+                    anchor, lambda _: replacement, block, flags=re.MULTILINE
+                )
+                if count != 1:
+                    raise PolicyError(
+                        f"tests: {job}: resource field matched {count} times: {anchor}"
+                    )
+            text = text[: matches[0].start()] + block + text[matches[0].end() :]
+        return text
+
+
 # Rules run before the generic label map, so their anchors can name upstream's labels.
 _RULES: dict[str, tuple] = {
     "ci.yaml": (
@@ -149,64 +200,28 @@ _RULES: dict[str, tuple] = {
         Replace(
             "nix: workflow_dispatch trigger",
             "on:\n  pull_request:\n",
-            "on:\n  workflow_dispatch:\n    inputs:\n      release:\n"
-            "        description: 'Require the flake-check lane for a sync candidate.'\n"
+            "on:\n  workflow_dispatch:\n    inputs:\n      sync:\n"
+            "        description: 'Require checks without release stamping.'\n"
             "        type: boolean\n        default: false\n  pull_request:\n",
+        ),
+        Replace(
+            "nix: force sync checks",
+            "if: needs.detect.outputs.nix == 'true' || inputs.release == true\n",
+            "if: needs.detect.outputs.nix == 'true' || inputs.release == true || inputs.sync == true\n",
         ),
     ),
     "tests.yml": (
-        # One quarter of the suite per 4-vCPU runner instead of one 96-core runner.
+        TestResources(),
         Replace(
-            "tests: slice matrix",
-            "    name: Run tests\n",
-            "    name: Run tests (slice ${{ matrix.slice }}/4)\n"
-            "    strategy:\n"
-            "      fail-fast: false\n"
-            "      matrix:\n"
-            "        slice: [1, 2, 3, 4]\n",
+            "tests: fetch upstream release baselines",
+            "          fetch-tags: true\n",
+            "          fetch-tags: true\n\n"
+            "      - name: Fetch upstream release baselines\n"
+            "        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'\n",
         ),
-        Replace(
-            "tests: unit job bound",
-            "    runs-on: ubuntu-latest-96-core\n    timeout-minutes: 30\n",
-            "    runs-on: ubuntu-latest\n    timeout-minutes: 45\n",
-        ),
-        Replace(
-            "tests: sliced run",
-            "          scripts/run_tests.sh\n        env:\n",
-            "          scripts/run_tests.sh --slice ${{ matrix.slice }}/4 -j 4\n        env:\n",
-        ),
-        Replace(
-            "tests: unit workers",
-            "HERMES_TEST_WORKERS: 96\n",
-            "HERMES_TEST_WORKERS: 4\n",
-        ),
-        # Four slices restoring whichever slice saved last would slice the suite
-        # differently per job; without the cache every slice splits by file count.
         DropStep("tests: no duration cache restore", "Restore per-file duration cache"),
         DropStep(
             "tests: no duration cache save", "Save per-file duration cache (main only)"
-        ),
-        # Fewer concurrent process trees on 4 vCPUs, with longer job bounds.
-        Replace(
-            "tests: e2e bound",
-            "    runs-on: ubuntu-latest-32-core\n    timeout-minutes: 30\n",
-            "    runs-on: ubuntu-latest\n    timeout-minutes: 60\n",
-        ),
-        Replace(
-            "tests: e2e workers",
-            'HERMES_TEST_WORKERS: "3"\n',
-            'HERMES_TEST_WORKERS: "2"\n',
-        ),
-        Replace(
-            "tests: e2e-upgrade bound",
-            "    runs-on: ubuntu-latest-32-core\n    timeout-minutes: 60\n",
-            "    runs-on: ubuntu-latest\n    timeout-minutes: 90\n",
-        ),
-        # Per shard: each shard is its own 4-vCPU runner.
-        Replace(
-            "tests: e2e-upgrade workers",
-            'HERMES_TEST_WORKERS: "6"\n          HERMES_TEST_FILE_TIMEOUT: "3000"\n',
-            'HERMES_TEST_WORKERS: "2"\n          HERMES_TEST_FILE_TIMEOUT: "3000"\n',
         ),
     ),
     "js-tests.yml": (
@@ -228,6 +243,47 @@ _RULES: dict[str, tuple] = {
             "js: check bound",
             "    runs-on: ubuntu-latest-32-core\n    timeout-minutes: 30\n",
             "    runs-on: ubuntu-latest\n    timeout-minutes: 45\n",
+        ),
+    ),
+    "install-e2e.yml": (
+        Replace(
+            "install: fetch upstream release baselines",
+            "      - id: pick\n",
+            "      - name: Fetch upstream release baselines\n"
+            "        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'\n\n"
+            "      - id: pick\n",
+        ),
+    ),
+    "install-e2e-run.yml": (
+        Replace(
+            "install: make upstream baselines reachable by the driver",
+            "          fetch-depth: 0\n",
+            "          fetch-depth: 0\n\n"
+            "      - name: Fetch upstream release baselines\n"
+            "        run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git 'refs/tags/v*:refs/tags/v*'\n",
+        ),
+    ),
+    "plugin-catalog-ci.yml": (
+        Replace(
+            "catalog: retain upstream ancestry for admission checks",
+            "          # The pull_request checkout is GitHub's merge commit; depth 2 brings its\n"
+            "          # first parent (the base tip), which is all the diff below needs.\n"
+            "          fetch-depth: 2\n",
+            "          # Full history identifies trusted upstream catalog ancestry.\n"
+            "          fetch-depth: 0\n",
+        ),
+        Replace(
+            "catalog: distinguish upstream imports from fork submissions",
+            '          if [ -n "$CHANGED" ]; then\n',
+            '          if [ "${GITHUB_REPOSITORY:-NousResearch/hermes-agent}" != "NousResearch/hermes-agent" ]; then\n'
+            "            git fetch --quiet --no-tags https://github.com/NousResearch/hermes-agent.git main\n"
+            '            UPSTREAM_BASE="$(git merge-base HEAD FETCH_HEAD)"\n'
+            '            if git diff --quiet "$UPSTREAM_BASE" HEAD -- '
+            "'plugin-catalog/*.yaml' 'plugin-catalog/*.yml'; then\n"
+            '              CHANGED=""\n'
+            "            fi\n"
+            "          fi\n\n"
+            '          if [ -n "$CHANGED" ]; then\n',
         ),
     ),
     "contributor-check.yml": (

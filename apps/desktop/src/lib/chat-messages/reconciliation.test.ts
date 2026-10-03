@@ -1,6 +1,13 @@
 import { expect, it } from 'vitest'
 
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, textPart, toChatMessages } from './index'
+import {
+  type ChatMessage,
+  chatMessageText,
+  preserveLocalAssistantErrors,
+  preserveLocalSystemNotices,
+  textPart,
+  toChatMessages
+} from './index'
 
 const row = (id: string, role: 'user' | 'assistant', text: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
   id,
@@ -260,12 +267,7 @@ it('folds a preserved attachment error onto the durable reply via the tolerant c
     ]
   )
 
-  expect(merged.map(message => message.id)).toEqual([
-    '9-0-user',
-    '9-1-assistant',
-    '9-2-user',
-    '9-3-assistant'
-  ])
+  expect(merged.map(message => message.id)).toEqual(['9-0-user', '9-1-assistant', '9-2-user', '9-3-assistant'])
   expect(merged[1]).toMatchObject({ error: 'upstream timeout', pending: false })
 })
 
@@ -285,12 +287,7 @@ it('never tolerance-matches a plain repeated prompt without attachment evidence 
     ]
   )
 
-  expect(merged.map(message => message.id)).toEqual([
-    '9-0-user',
-    '9-1-assistant',
-    'user-repeat',
-    'assistant-stream-x'
-  ])
+  expect(merged.map(message => message.id)).toEqual(['9-0-user', '9-1-assistant', 'user-repeat', 'assistant-stream-x'])
 })
 
 it('never folds a captionless attachment error onto another paste\u2019s reply (#120978)', () => {
@@ -380,12 +377,7 @@ it('keeps a repeated-caption attachment error local when its prompt never commit
     ]
   )
 
-  expect(merged.map(message => message.id)).toEqual([
-    '9-0-user',
-    '9-1-assistant',
-    'user-paste-2',
-    'assistant-stream-x'
-  ])
+  expect(merged.map(message => message.id)).toEqual(['9-0-user', '9-1-assistant', 'user-paste-2', 'assistant-stream-x'])
   expect(merged.find(message => message.id === '9-1-assistant')?.error).toBeUndefined()
   expect(merged.find(message => message.id === 'assistant-stream-x')?.error).toBe('upstream timeout')
 })
@@ -425,10 +417,41 @@ it('keeps a rowId-less preserved run trailing (#118002 behavior unchanged)', () 
     ]
   )
 
-  expect(merged.map(message => message.id)).toEqual([
-    '9-0-user',
-    '9-1-assistant',
-    'user-no-row',
-    'assistant-stream-x'
-  ])
+  expect(merged.map(message => message.id)).toEqual(['9-0-user', '9-1-assistant', 'user-no-row', 'assistant-stream-x'])
+})
+
+// #126422: the fallback-switch notice is a client-local `system` row the
+// stored page cannot carry; the post-turn refresh rebuilds from stored rows
+// and must re-graft it instead of silently dropping it.
+it('preserveLocalSystemNotices re-grafts trailing client-local system notices', () => {
+  const notice: ChatMessage = {
+    id: 'fallback-switch-1234',
+    parts: [textPart('Model fallback: using xiaomi/mimo via nous.')],
+    role: 'system',
+    timestamp: 1234
+  }
+
+  const refreshed = [row('s1', 'user', 'prompt'), row('s2', 'assistant', 'reply')]
+
+  const preserved = preserveLocalSystemNotices(refreshed, [...refreshed, notice])
+
+  expect(preserved.at(-1)?.id).toBe('fallback-switch-1234')
+})
+
+it('preserveLocalSystemNotices does not duplicate a notice the page already carries', () => {
+  const notice: ChatMessage = {
+    id: 'fallback-switch-1234',
+    parts: [textPart('Model fallback: using xiaomi/mimo via nous.')],
+    role: 'system',
+    timestamp: 1234
+  }
+
+  const refreshed = [
+    row('s1', 'user', 'prompt'),
+    row('s2', 'assistant', 'reply'),
+    { ...notice, id: 'fallback-switch-5678' }
+  ]
+
+  const preserved = preserveLocalSystemNotices(refreshed, [...refreshed, { ...notice, id: 'other' }])
+  expect(preserved).toBe(refreshed)
 })
