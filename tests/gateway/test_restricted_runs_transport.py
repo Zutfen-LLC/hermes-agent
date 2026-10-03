@@ -1123,3 +1123,19 @@ async def test_stale_restricted_run_is_interrupted_not_falsely_stopped(restricte
             other._response_store.close()
     finally:
         release.set()
+
+
+def test_checked_restricted_identity_endpoints_are_advertised_and_registered(restricted_service):
+    _, adapter = restricted_service
+    from gateway.platforms import api_server
+
+    paths = {(method, path) for method, path, _ in adapter._http_route_table()}
+    assert ("POST", "/v1/restricted-runs/resolve") in paths
+    assert ("POST", "/v1/restricted-runs/identity-checked") in paths
+    advertised = {name: {"method": method, "path": path}
+                  for name, (method, path) in api_server._CAPABILITY_ENDPOINTS}
+    assert advertised["restricted_run_identity_resolve"] == {
+        "method": "POST", "path": "/v1/restricted-runs/resolve"}
+    assert advertised["restricted_run_identity_checked"] == {
+        "method": "POST", "path": "/v1/restricted-runs/identity-checked"}
+    assert api_server._RESTRICTED_IDENTITY_CONTRACT["version"] == 1
