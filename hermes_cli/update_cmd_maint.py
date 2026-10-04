@@ -964,18 +964,36 @@ def _migrate_relay_exporter_env() -> None:
 
 
 def _project_root() -> Path:
-    """The checkout root without the application import graph.
+    """The checkout root, resolvable without the application import graph.
 
     The maintenance tail runs inside cold-bootstrap completion (PM's interpreter, a
     minimal app recipe, a reduced source snapshot), where importing ``hermes_cli.main``
     would drag in the full application graph (dotenv, the CLI parser tree, i18n
-    consumers) and break the bootstrap. ``_startup_fast.project_root_str`` is the
-    canonical stdlib-only root resolver main.py's ``PROJECT_ROOT`` itself derives from,
-    so the value is identical on full installs.
+    consumers) and break the bootstrap. When the application graph is importable —
+    full installs, and tests patching ``update_cmd._m`` — its ``PROJECT_ROOT`` remains
+    the authority (and the historical monkeypatch surface); only when that import is
+    unavailable does the tail fall back to ``hermes_cli._startup_fast.project_root_str``,
+    the canonical stdlib-only resolver ``main.py``'s ``PROJECT_ROOT`` itself derives
+    from, so the value is identical either way. Any import error other than the
+    expected cold-shape ``ModuleNotFoundError`` still raises.
     """
-    from hermes_cli._startup_fast import project_root_str
+    try:
+        from hermes_cli.update_cmd import _m
 
-    return Path(project_root_str())
+        return Path(_m().PROJECT_ROOT)
+    except ModuleNotFoundError:
+        # The cold completion child has no application dependencies: importing
+        # ``hermes_cli.main`` fails inside its import wall (first at ``dotenv``).
+        # Fall back to the stdlib resolver ONLY in that shape — when the application
+        # dependency set is genuinely absent. A full install whose graph is broken
+        # (dotenv present but main still failing to import) must keep failing loudly.
+        import importlib.util
+
+        if importlib.util.find_spec("dotenv") is not None:
+            raise
+        from hermes_cli._startup_fast import project_root_str
+
+        return Path(project_root_str())
 
 
 def _run_post_update_maintenance(
