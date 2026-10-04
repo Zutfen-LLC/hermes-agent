@@ -560,8 +560,27 @@ async def _admit_restricted_runs(self, request, *, _api_server, checked: bool):
         self._run_idempotency_ids.add(run_id)
         self._active_run_agents[run_id] = agent
         self._activate_admitted_request()
-        task = asyncio.create_task(_execute_restricted(
-            self, run_id, text, agent, credential_lease, request_profile, _api_server=_api_server))
+        execution = _execute_restricted(
+            self, run_id, text, agent, credential_lease, request_profile, _api_server=_api_server)
+        # The explicit handoff failure path below owns cleanup once bookkeeping starts.
+        ownership.pop_all()
+        try:
+            task = asyncio.create_task(execution)
+        except BaseException:
+            execution.close()
+            try:
+                _settle_restricted(self, run_id, "failed", error="Restricted run could not be started.",
+                                   completed=False)
+            except Exception:
+                logger.warning("[api_server] restricted handoff status update failed")
+            _close_restricted_agent(agent)
+            if credential_lease is not None:
+                credential_lease.release()
+            from gateway.platforms.api_server_runs import _retire_live_run
+            _retire_live_run(self, run_id)
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
+            raise
         self._active_run_tasks[run_id] = task
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)

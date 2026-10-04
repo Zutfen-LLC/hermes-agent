@@ -1,6 +1,7 @@
 """Constructed-agent ownership regressions for #39; all execution is synthetic."""
 
 import asyncio
+import run_agent
 from types import SimpleNamespace
 
 import pytest
@@ -70,6 +71,22 @@ def test_factory_post_construction_validation_closes_once(counting_agents, monke
         restricted._new_restricted_agent(None, CREDS, None, _api_server=api_server)
     print("post-construction validation counters:", counters)
     assert counters == {"constructed": 1, "closed": 1, "executions": 0}
+
+
+def test_constructor_failure_does_not_close_partially_initialized_agent(counting_agents, monkeypatch):
+    counters, agents = counting_agents
+    original = run_agent.AIAgent
+
+    def fail_after_allocation(**kwargs):
+        partial = object.__new__(original)
+        partial.close = lambda: counters.__setitem__("closed", counters["closed"] + 1)
+        agents.append(partial)
+        raise RuntimeError("synthetic constructor failure")
+
+    monkeypatch.setattr("run_agent.AIAgent", fail_after_allocation)
+    with pytest.raises(RuntimeError, match="synthetic constructor failure"):
+        restricted._new_restricted_agent(None, CREDS, None, _api_server=api_server)
+    assert counters == {"constructed": 0, "closed": 0, "executions": 0}
 
 
 @pytest.mark.parametrize("failure", [ValueError("synthetic validation failure"),
@@ -180,3 +197,58 @@ async def test_success_transfers_ownership_without_close_before_use(restricted_s
     await asyncio.wait_for(task, 2)
     assert counters == {"constructed": 1, "closed": 1, "executions": 1}
     assert agents[0].close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_task_handoff_failure_closes_and_terminalizes_reservation(
+        restricted_service, counting_agents, monkeypatch):
+    client, adapter = restricted_service
+    counters, _ = counting_agents
+    raw = mock_route(monkeypatch)
+    identity = restricted._identity(adapter, REQUEST["delegation_profile_id"], CREDS, raw,
+        _api_server=api_server, work_class=REQUEST["work_class"], envelope=REQUEST["capability_envelope"])
+    original_create_task = asyncio.create_task
+    monkeypatch.setattr(restricted.asyncio, "create_task", lambda coro, **kwargs: (
+        coro.close(), (_ for _ in ()).throw(RuntimeError("synthetic task handoff failure")))[1])
+    try:
+        response = await client.post("/v1/restricted-runs/identity-checked",
+            json={**REQUEST, "expected_identity": identity},
+            headers={**AUTH, "Idempotency-Key": "handoff-failure"})
+    finally:
+        monkeypatch.setattr(restricted.asyncio, "create_task", original_create_task)
+    assert response.status == 500
+    assert counters == {"constructed": 1, "closed": 1, "executions": 0}
+    assert not adapter._active_run_agents
+    row = adapter._run_idempotency_store._conn.execute(
+        "SELECT status_json FROM run_idempotency WHERE idempotency_key='handoff-failure'").fetchone()
+    assert row is not None
+    import json
+    assert json.loads(row[0])["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_wrapper_keeps_agent_until_worker_finishes(restricted_service, counting_agents, monkeypatch):
+    _, adapter = restricted_service
+    counters, agents = counting_agents
+    agent = restricted._new_restricted_agent(adapter, CREDS, None, _api_server=api_server)
+    worker_started, worker_release = asyncio.Event(), asyncio.Event()
+
+    async def worker():
+        worker_started.set()
+        await worker_release.wait()
+        return {"final_response": "synthetic result", "completed": True}
+
+    future = asyncio.create_task(worker())
+    monkeypatch.setattr(restricted, "_submit_api_worker", lambda *args, **kwargs: future)
+    run_id = "run_synthetic_cancel"
+    adapter._run_statuses[run_id] = {"run_id": run_id, "status": "queued"}
+    adapter._active_run_agents[run_id] = agent
+    task = asyncio.create_task(restricted._execute_restricted(
+        adapter, run_id, "synthetic input", agent, None, None, _api_server=api_server))
+    await worker_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert counters["closed"] == 0
+    worker_release.set()
+    await asyncio.gather(task, return_exceptions=True)
+    assert counters == {"constructed": 1, "closed": 1, "executions": 0}
