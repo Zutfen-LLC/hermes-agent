@@ -324,10 +324,9 @@ def _print_update_completion(message: str) -> None:
 def _read_project_version() -> str | None:
     """``version`` from the checkout's pyproject.toml (not importlib.metadata, which still
     describes the OLD version after a pull). None on any failure — cosmetic, never breaks."""
-    from hermes_cli.update_cmd import _m
     try:
         import tomllib
-        with open(_m().PROJECT_ROOT / "pyproject.toml", "rb") as fh:  # windows-footgun: ok — binary mode, tomllib requires bytes
+        with open(_project_root() / "pyproject.toml", "rb") as fh:  # windows-footgun: ok — binary mode, tomllib requires bytes
             version = tomllib.load(fh).get("project", {}).get("version")
         return str(version) if version else None
     except Exception:
@@ -340,9 +339,8 @@ def _checkout_version() -> str | None:
     pyproject.toml is an inert 0.0.0 on source checkouts; the release a checkout
     runs is derived from its reachable tags.
     """
-    from hermes_cli.update_cmd import _m
     from hermes_cli.version_info import _git_version_info
-    info = _git_version_info(Path(_m().PROJECT_ROOT), include_untracked=True)
+    info = _git_version_info(_project_root(), include_untracked=True)
     return info.derived_version if info.commit else None
 
 
@@ -965,6 +963,39 @@ def _migrate_relay_exporter_env() -> None:
     run_relay_migration_after_update()
 
 
+def _project_root() -> Path:
+    """The checkout root, resolvable without the application import graph.
+
+    The maintenance tail runs inside cold-bootstrap completion (PM's interpreter, a
+    minimal app recipe, a reduced source snapshot), where importing ``hermes_cli.main``
+    would drag in the full application graph (dotenv, the CLI parser tree, i18n
+    consumers) and break the bootstrap. When the application graph is importable —
+    full installs, and tests patching ``update_cmd._m`` — its ``PROJECT_ROOT`` remains
+    the authority (and the historical monkeypatch surface); only when that import is
+    unavailable does the tail fall back to ``hermes_cli._startup_fast.project_root_str``,
+    the canonical stdlib-only resolver ``main.py``'s ``PROJECT_ROOT`` itself derives
+    from, so the value is identical either way. Any import error other than the
+    expected cold-shape ``ModuleNotFoundError`` still raises.
+    """
+    try:
+        from hermes_cli.update_cmd import _m
+
+        return Path(_m().PROJECT_ROOT)
+    except ModuleNotFoundError:
+        # The cold completion child has no application dependencies: importing
+        # ``hermes_cli.main`` fails inside its import wall (first at ``dotenv``).
+        # Fall back to the stdlib resolver ONLY in that shape — when the application
+        # dependency set is genuinely absent. A full install whose graph is broken
+        # (dotenv present but main still failing to import) must keep failing loudly.
+        import importlib.util
+
+        if importlib.util.find_spec("dotenv") is not None:
+            raise
+        from hermes_cli._startup_fast import project_root_str
+
+        return Path(project_root_str())
+
+
 def _run_post_update_maintenance(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, had_desktop_app_before_update,
     pre_update_version, completion_message=None,
@@ -1007,7 +1038,7 @@ def _run_post_update_maintenance(
     try:
         from hermes_cli.gitlock import fetch_full_commit_graph
         from hermes_cli.update_cmd import _no_prompt_git_kwargs
-        if fetch_full_commit_graph(Path(_m().PROJECT_ROOT), **_no_prompt_git_kwargs()):
+        if fetch_full_commit_graph(_project_root(), **_no_prompt_git_kwargs()):
             print("  ✓ Fetched release history (commits only) for version identity")
     except (OSError, subprocess.SubprocessError) as exc:
         detail = (getattr(exc, "stderr", None) or str(exc)).strip().splitlines()[-1:] or [type(exc).__name__]
@@ -1016,7 +1047,7 @@ def _run_post_update_maintenance(
     # Seed the model-catalog cache from the checkout instead of a bot-gated, flaky fetch.
     with _best_effort('Model catalog seed during update failed: %s'):
         from hermes_cli.model_catalog import seed_cache_from_checkout
-        if seed_cache_from_checkout(_m().PROJECT_ROOT):
+        if seed_cache_from_checkout(_project_root()):
             print("  ✓ Model catalog cache refreshed from checkout")
 
     # Drop the cached live plugin catalog under every profile: the checkout is shared, so a
