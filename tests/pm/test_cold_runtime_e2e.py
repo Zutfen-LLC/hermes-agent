@@ -104,6 +104,22 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     for name in ("utils.py", "hermes_constants.py", "hermes_yaml.py",
                  "hermes_bootstrap.py"):
         shutil.copy2(source / name, repo / name)
+    # The CLI's user-facing text resolves through the i18n kernel (agent.i18n + the English
+    # catalog), which the update-completion tail imports through hermes_cli.config ->
+    # hermes_cli.cli_output; the rest of agent/ stays out so the tail cannot grow a
+    # dependency on the agent runtime. Same minimal closure the installer e2e stages
+    # (tests/scripts/test_fresh_source_install.py).
+    (repo / "agent").mkdir()
+    for name in ("__init__.py", "jiter_preload.py", "i18n.py", "i18n_layers.py",
+                 "i18n_languages.py"):
+        shutil.copy2(source / "agent" / name, repo / "agent" / name)
+    (repo / "locales").mkdir()
+    shutil.copy2(source / "locales" / "en.yaml", repo / "locales" / "en.yaml")
+    # hermes_constants' secure-dir policy resolves the container detector through
+    # hermes_platform (stdlib-only); the completion tail reads config during launcher
+    # publication, so the platform package is part of the cold closure too.
+    shutil.copytree(source / "hermes_platform", repo / "hermes_platform",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     # No production application lock or metadata enters this source snapshot.
     recipe = tomllib.loads((repo / "pm" / "pyproject.toml").read_text())
     yaml_requirement = next(dep for dep in recipe["project"]["dependencies"]

@@ -83,3 +83,51 @@ assert result.returncode == 0, result
                             env=dict(os.environ, HERMES_HOME=str(tmp_path / "home")),
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_update_maintenance_tail_imports_without_application_graph(tmp_path):
+    """Cold-bootstrap completion runs the maintenance tail on PM's interpreter with a
+    minimal app recipe and a reduced source snapshot: only the i18n kernel of ``agent/``
+    is staged (installer e2e contract), and importing ``hermes_cli.main`` would drag in
+    the full application graph (dotenv & co.). The tail must therefore resolve its
+    project root through the stdlib fast path and import neither ``hermes_cli.main``
+    nor any ``agent`` module beyond the i18n kernel. Failures stay loud: an import that
+    escapes this closure still raises ModuleNotFoundError here.
+    """
+    repo = Path(__file__).resolve().parents[2]
+    allowed_agent = {"agent", "agent.jiter_preload", "agent.i18n",
+                     "agent.i18n_layers", "agent.i18n_languages"}
+    script = """
+import sys
+ALLOWED = %ALLOWED%
+class NoApplicationGraph:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'hermes_cli.main' or fullname.startswith('hermes_cli.main.'):
+            raise AssertionError('maintenance tail imported ' + fullname)
+        if fullname.startswith('dotenv'):
+            raise AssertionError('maintenance tail imported ' + fullname)
+        if fullname == 'agent' or fullname.startswith('agent.'):
+            if fullname not in ALLOWED:
+                raise AssertionError('maintenance tail imported ' + fullname)
+        return None
+sys.meta_path.insert(0, NoApplicationGraph())
+import hermes_cli.update_cmd_maint as tail
+# Localization during bootstrap still resolves: the staged i18n kernel formats an en key
+# without any further agent imports. Under ``-S`` ruamel is absent, so the catalog layer
+# degrades to the bare key by design (i18n's documented last-resort fallback, logged, not
+# raised); what must NOT happen is an import escaping the closure. Assert the degraded
+# resolution is the bare key — deterministic — rather than a translated string that would
+# depend on the outer environment.
+import agent.i18n
+translated = agent.i18n.t('cli.shared.n_more', lang='en', count=5)
+assert translated == 'cli.shared.n_more', translated
+# The tail's root resolver never returns None and needs no heavy imports.
+assert tail._project_root().name
+assert tail._read_project_version() is None or isinstance(tail._read_project_version(), str)
+print('tail-closure-ok')
+""".replace("%ALLOWED%", repr(sorted(allowed_agent)))
+    result = subprocess.run([sys.executable, "-S", "-c", script], cwd=repo,
+                            env=dict(os.environ, HERMES_HOME=str(tmp_path / "home")),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "tail-closure-ok" in result.stdout
