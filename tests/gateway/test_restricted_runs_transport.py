@@ -32,6 +32,8 @@ REQUEST = {
 class FakeAgent:
     provider = "provider-test"
     model = "model-test"
+    base_url = "https://provider.invalid"
+    api_mode = "chat_completions"
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -52,6 +54,9 @@ class FakeAgent:
         self.interrupted = True
         self.stop_event.set()
 
+    def close(self):
+        self.closed = True
+
 
 @pytest_asyncio.fixture
 async def restricted_service(tmp_path, monkeypatch):
@@ -62,6 +67,8 @@ async def restricted_service(tmp_path, monkeypatch):
         "key": "test-gateway-key", "restricted_key": "restricted-scope-key-0123456789"}))
     app = web.Application()
     app.router.add_post("/v1/restricted-runs", adapter._handle_restricted_runs)
+    app.router.add_post("/v1/restricted-runs/resolve", adapter._handle_resolve_restricted_identity)
+    app.router.add_post("/v1/restricted-runs/identity-checked", adapter._handle_identity_checked_restricted_runs)
     app.router.add_get("/v1/restricted-runs/by-key", adapter._handle_restricted_run_by_key)
     app.router.add_post("/v1/restricted-runs/by-key/stop", adapter._handle_stop_restricted_run_by_key)
     app.router.add_post("/v1/runs", adapter._handle_runs)
@@ -621,6 +628,35 @@ def test_real_delegation_profile_config_uses_runtime_credentials_not_request_fie
     assert "runtime-only-secret" not in str(identity)
 
 
+def test_restricted_identity_uses_effective_agent_endpoint(restricted_service):
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    creds = {"provider": "openai", "model": "gpt-4.1-mini", "base_url": "https://configured.invalid/v1"}
+    agent = FakeAgent()
+    agent.provider = "openai"
+    agent.model = "gpt-4.1-mini"
+    agent.base_url = "https://effective.invalid/v1"
+    identity = restricted._identity(adapter, "helper", creds, {}, agent=agent,
+                                    _api_server=api_server, work_class="context_gather",
+                                    envelope="input_only_v1")
+    assert identity["endpoint_identity"] == "https://effective.invalid"
+    assert identity["endpoint_identity"] != "https://configured.invalid"
+
+
+def test_generic_identity_route_revision_preserves_legacy_digest(restricted_service):
+    import hashlib
+    from gateway.platforms import api_server, api_server_restricted_runs as restricted
+    _, adapter = restricted_service
+    raw = {"provider": "openai", "model": "gpt-4.1-mini", "base_url": "https://provider.invalid/v1",
+           "api_mode": "chat_completions", "enabled": True, "restricted_tool_free": True}
+    keys = ("provider", "model", "base_url", "api_mode", "request_overrides", "fallback_providers", "auth_type")
+    payload = {key: raw.get(key) for key in keys}
+    expected = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                         default=str).encode()).hexdigest()
+    identity = restricted._identity(adapter, "helper", raw, raw, _api_server=api_server)
+    assert identity["route_revision"] == expected
+
+
 def test_restricted_route_identity_strips_url_userinfo_path_query_and_fragment(restricted_service):
     from gateway.platforms import api_server, api_server_restricted_runs as restricted
     _, adapter = restricted_service
@@ -1123,3 +1159,158 @@ async def test_stale_restricted_run_is_interrupted_not_falsely_stopped(restricte
             other._response_store.close()
     finally:
         release.set()
+
+
+def test_checked_restricted_identity_endpoints_are_advertised_and_registered(restricted_service):
+    _, adapter = restricted_service
+    from gateway.platforms import api_server
+
+    paths = {(method, path) for method, path, _ in adapter._http_route_table()}
+    assert ("POST", "/v1/restricted-runs/resolve") in paths
+    assert ("POST", "/v1/restricted-runs/identity-checked") in paths
+    advertised = {name: {"method": method, "path": path}
+                  for name, (method, path) in api_server._CAPABILITY_ENDPOINTS}
+    assert advertised["restricted_run_identity_resolve"] == {
+        "method": "POST", "path": "/v1/restricted-runs/resolve"}
+    assert advertised["restricted_run_identity_checked"] == {
+        "method": "POST", "path": "/v1/restricted-runs/identity-checked"}
+    assert api_server._RESTRICTED_IDENTITY_CONTRACT["version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_restricted_identity_resolution_is_nonexecuting_and_checked_admission_matches(
+        restricted_service, monkeypatch):
+    client, adapter = restricted_service
+    observed = _route_mocks(monkeypatch)
+    resolve_body = {key: REQUEST[key] for key in (
+        "delegation_profile_id", "work_class", "capability_envelope")}
+    resolved = await client.post("/v1/restricted-runs/resolve", json=resolve_body, headers=RESTRICTED_AUTH)
+    assert resolved.status == 200
+    identity = (await resolved.json())["identity"]
+    assert identity["hermes_delegation_profile_id"] == REQUEST["delegation_profile_id"]
+    assert identity["resolved_provider"] == "provider-test"
+    assert identity["resolved_model"] == "model-test"
+    assert identity["work_class"] == REQUEST["work_class"]
+    assert identity["capability_envelope"] == REQUEST["capability_envelope"]
+    assert not observed["agent"].started_event.is_set()
+    assert observed["agent"].closed is True
+    assert not adapter._run_idempotency_store._conn.execute(
+        "SELECT 1 FROM run_idempotency").fetchone()
+
+    headers = {**RESTRICTED_AUTH, "Idempotency-Key": "identity-match"}
+    admitted = await client.post("/v1/restricted-runs/identity-checked",
+                                 json={**REQUEST, "expected_identity": identity}, headers=headers)
+    assert admitted.status == 202
+    data = await admitted.json()
+    assert data["resolved_identity"] == identity
+    status = await _terminal_status(client, data["run_id"])
+    assert status["status"] == "completed"
+    replay = await client.post("/v1/restricted-runs/identity-checked",
+                               json={**REQUEST, "expected_identity": identity}, headers=headers)
+    assert replay.status == 202
+    assert (await replay.json())["run_id"] == data["run_id"]
+    changed_identity = {**identity, "resolved_model": "other-model"}
+    conflict = await client.post("/v1/restricted-runs/identity-checked",
+        json={**REQUEST, "expected_identity": changed_identity}, headers=headers)
+    assert conflict.status == 409
+
+
+@pytest.mark.asyncio
+async def test_http_resolve_reports_effective_endpoint_and_rejects_endpoint_drift_before_admission(
+        restricted_service, monkeypatch):
+    client, adapter = restricted_service
+    observed = _route_mocks(monkeypatch)
+
+    def create_effective_agent(_self, creds, reasoning, authority=None, **_kw):
+        config = {**creds, "provider": "provider-test", "model": "model-test",
+                  "base_url": "https://effective-provider.invalid/v2", "enabled_toolsets": [],
+                  "disabled_toolsets": ["all toolsets"], "skip_context_files": True,
+                  "skip_memory": True}
+        agent = FakeAgent(**config)
+        agent.base_url = config["base_url"]
+        observed["agent"] = agent
+        observed["agent_config"] = config
+        return agent
+
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._new_restricted_agent",
+                        create_effective_agent)
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._resolve_restricted_route",
+        lambda *a, **kw: ({"provider": "provider-test", "model": "model-test",
+            "api_key": "resolve-secret", "base_url": "https://configured-provider.invalid/v1",
+            "auth_type": "api_key"}, None,
+            {"provider": "provider-test", "model": "model-test",
+             "base_url": "https://configured-provider.invalid/v1", "auth_type": "api_key"}, None))
+    body = {key: REQUEST[key] for key in (
+        "delegation_profile_id", "work_class", "capability_envelope")}
+    resolved = await client.post("/v1/restricted-runs/resolve", json=body, headers=RESTRICTED_AUTH)
+    assert resolved.status == 200
+    identity = (await resolved.json())["identity"]
+    assert identity["endpoint_identity"] == "https://effective-provider.invalid"
+    assert identity["endpoint_identity"] != "https://configured-provider.invalid"
+    assert observed["agent"].closed is True
+
+    # Checked admission resolves again, but now the constructed runtime agent
+    # points at the stale configured endpoint. Compare against the opaque identity.
+    monkeypatch.setattr("gateway.platforms.api_server_restricted_runs._new_restricted_agent",
+        lambda _self, creds, reasoning, authority=None, **_kw: FakeAgent(**{
+            **creds, "provider": "provider-test", "model": "model-test",
+            "base_url": "https://configured-provider.invalid/v1"}))
+    before = adapter._run_idempotency_store._conn.execute(
+        "SELECT COUNT(*) FROM run_idempotency").fetchone()[0]
+    response = await client.post("/v1/restricted-runs/identity-checked",
+        json={**REQUEST, "expected_identity": identity},
+        headers={**RESTRICTED_AUTH, "Idempotency-Key": "endpoint-drift"})
+    assert response.status == 409
+    assert (await response.json())["error"]["code"] == "restricted_identity_mismatch"
+    assert adapter._run_idempotency_store._conn.execute(
+        "SELECT COUNT(*) FROM run_idempotency").fetchone()[0] == before
+    assert not adapter._active_run_agents
+    assert not adapter._active_run_tasks
+    assert not adapter._run_statuses
+
+
+@pytest.mark.parametrize("field,value", [
+    ("work_class", ["context_gather"]),
+    ("work_class", {"unexpected": "shape"}),
+    ("capability_envelope", ["input_only_v1"]),
+    ("capability_envelope", {"unexpected": "shape"}),
+])
+@pytest.mark.asyncio
+async def test_resolve_malformed_policy_fields_return_400_not_500(restricted_service, field, value):
+    client, adapter = restricted_service
+    response = await client.post("/v1/restricted-runs/resolve",
+        json={"delegation_profile_id": "logical-helper", "work_class": "context_gather",
+              "capability_envelope": "input_only_v1", field: value}, headers=RESTRICTED_AUTH)
+    assert response.status == 400
+    assert (await response.json())["error"]["code"] != "internal_error"
+    assert adapter._run_idempotency_store._conn.execute(
+        "SELECT COUNT(*) FROM run_idempotency").fetchone()[0] == 0
+    assert not adapter._active_run_agents
+
+
+@pytest.mark.parametrize(("field", "wrong"), [
+    ("hermes_delegation_profile_id", "other-profile"),
+    ("resolved_provider", "other-provider"), ("resolved_model", "other-model"),
+    ("effective_api_mode", "other-mode"), ("endpoint_identity", "https://other.invalid"),
+    ("auth_type", "oauth"), ("auth_source_category", "credential_pool"),
+    ("route_revision", "f" * 64), ("work_class", "log_triage"),
+    ("capability_envelope", "hermes_tool_free_v1"), ("source", "other-source"),
+])
+@pytest.mark.asyncio
+async def test_checked_restricted_identity_mismatch_creates_no_run(restricted_service, monkeypatch, field, wrong):
+    client, adapter = restricted_service
+    observed = _route_mocks(monkeypatch)
+    resolve_body = {key: REQUEST[key] for key in (
+        "delegation_profile_id", "work_class", "capability_envelope")}
+    resolved = await client.post("/v1/restricted-runs/resolve", json=resolve_body, headers=AUTH)
+    identity = (await resolved.json())["identity"]
+    wrong = {**identity, field: wrong}
+    response = await client.post("/v1/restricted-runs/identity-checked",
+        json={**REQUEST, "expected_identity": wrong},
+        headers={**AUTH, "Idempotency-Key": "identity-mismatch"})
+    assert response.status == 409
+    assert (await response.json())["error"]["code"] == "restricted_identity_mismatch"
+    assert not adapter._run_idempotency_store._conn.execute(
+        "SELECT 1 FROM run_idempotency").fetchone()
+    assert not adapter._active_run_agents
+    assert not observed["agent"].started_event.is_set()

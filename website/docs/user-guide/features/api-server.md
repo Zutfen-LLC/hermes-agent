@@ -656,6 +656,27 @@ worker remains `stopping` until it actually exits; repeating stop is safe and
 terminal runs return their existing status. A newly rotated bearer for the
 same served profile can recover and stop an older run.
 
+#### Resolved-identity checked admission
+
+For clients that must pin the effective route before submitting input, `POST
+/v1/restricted-runs/resolve` accepts exactly `delegation_profile_id`, `work_class`,
+and `capability_envelope`—no input, provider, endpoint, or credential fields. It
+constructs the effective restricted agent route but does not reserve a run, queue
+work, or invoke the provider; constructed agent resources are closed before returning.
+The response's `identity` object has `version: 1`, the profile, effective
+provider/model/API mode, endpoint origin, auth type/category, route revision, work
+class, and envelope. It contains no credential material.
+
+To bind later admission to that route, POST `/v1/restricted-runs/identity-checked`
+with the ordinary four fields plus `expected_identity` set to the complete `identity`
+object returned by resolve. Hermes resolves and constructs the route again, compares
+the full identity before durable idempotency reservation or queueing, then dispatches
+that same captured agent. A mismatch returns 409 without admitting a run; malformed
+identity returns 400. The expected identity is part of the idempotency fingerprint,
+so changing it on replay conflicts. The original four-field
+`/v1/restricted-runs` contract remains unchanged. Both endpoints accept only the
+restricted bearer or the existing master bearer.
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.

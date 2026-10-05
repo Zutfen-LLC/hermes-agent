@@ -94,6 +94,8 @@ _CAPABILITY_ENDPOINTS = (
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
     ("restricted_runs", ("POST", "/v1/restricted-runs")),
+    ("restricted_run_identity_resolve", ("POST", "/v1/restricted-runs/resolve")),
+    ("restricted_run_identity_checked", ("POST", "/v1/restricted-runs/identity-checked")),
     ("restricted_run_by_key", ("GET", "/v1/restricted-runs/by-key")),
     ("restricted_run_stop_by_key", ("POST", "/v1/restricted-runs/by-key/stop")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
@@ -153,6 +155,7 @@ from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms import api_server_restricted_runs as _restricted_runs
+_RESTRICTED_IDENTITY_CONTRACT = _restricted_runs._RESTRICTED_IDENTITY_CONTRACT
 from gateway.platforms import api_server_provider_credentials as _provider_credentials
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
@@ -1842,6 +1845,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         routes.append(("POST", "/v1/restricted-runs", self._handle_restricted_runs))
+        routes.append(("POST", "/v1/restricted-runs/resolve", self._handle_resolve_restricted_identity))
+        routes.append(("POST", "/v1/restricted-runs/identity-checked", self._handle_identity_checked_restricted_runs))
         routes.append(("GET", "/v1/restricted-runs/by-key", self._handle_restricted_run_by_key))
         routes.append(("POST", "/v1/restricted-runs/by-key/stop", self._handle_stop_restricted_run_by_key))
         if _CRON_AVAILABLE:
@@ -2617,9 +2622,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.exception("[%s] GET /api/model/options failed", self.name)
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
 
-    @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
-        """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
+        """GET /v1/capabilities — scoped discovery never grants control-plane authority."""
+        if self._is_restricted_credential(request):
+            # Ops needs only this static identity contract. Do not expose configured
+            # models, storage/browser state, or unrelated control surfaces to it.
+            return web.json_response({
+                "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
+                "features": {"restricted_run_identity": _RESTRICTED_IDENTITY_CONTRACT},
+                "endpoints": {name: {"method": method, "path": path}
+                    for name, (method, path) in _CAPABILITY_ENDPOINTS
+                    if name in {"restricted_run_identity_resolve", "restricted_run_identity_checked"}},
+            })
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2634,6 +2651,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
+                "restricted_run_identity": _RESTRICTED_IDENTITY_CONTRACT,
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),
                 # Always advertised for feature-detection; enabled follows config.
@@ -4574,6 +4592,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @partial(_admit_api_agent_request, restricted=True)
     async def _handle_restricted_runs(self, request: "web.Request") -> "web.Response":
         return await _restricted_runs._handle_restricted_runs(self, request, _api_server=sys.modules[__name__])
+
+    @partial(_admit_api_agent_request, restricted=True)
+    async def _handle_resolve_restricted_identity(self, request: "web.Request") -> "web.Response":
+        return await _restricted_runs._handle_resolve_restricted_identity(
+            self, request, _api_server=sys.modules[__name__])
+
+    @partial(_admit_api_agent_request, restricted=True)
+    async def _handle_identity_checked_restricted_runs(self, request: "web.Request") -> "web.Response":
+        return await _restricted_runs._handle_identity_checked_restricted_runs(
+            self, request, _api_server=sys.modules[__name__])
 
     async def _handle_restricted_run_by_key(self, request: "web.Request") -> "web.Response":
         return await _restricted_runs._handle_restricted_run_by_key(self, request, _api_server=sys.modules[__name__])
